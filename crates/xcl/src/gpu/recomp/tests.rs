@@ -6868,3 +6868,392 @@ fn fspx_containers_translate_and_compile() {
     println!("FSPX: {ok} / {n} translated and compiled");
     assert_eq!(ok, n);
 }
+
+// ---- lane masks as whole words in partial groups ----
+
+/// What a mask program leaves in s20..s23 for a console wave whose launched lanes are `l`.
+type MaskModel = fn(u64) -> [u32; 4];
+
+type MaskCase = (&'static str, Vec<Vec<u8>>, MaskModel);
+
+fn case(what: &'static str, body: Vec<Vec<u8>>, model: MaskModel) -> MaskCase {
+    (what, body, model)
+}
+
+const M32: u64 = 0xFFFF_FFFF;
+
+/// s_wqm: every 4 bits of the operand with a bit set become 1111.
+fn wqm_bits(x: u64) -> u64 {
+    (0..16).filter(|q| (x >> (4 * q)) & 15 != 0).fold(0, |m, q| m | 15 << (4 * q))
+}
+
+fn ones(x: u64) -> u32 {
+    x.count_ones()
+}
+
+/// s_ff1_i32_b64 / _b32 (the operand zero-extended): the lowest set bit, -1 without one.
+fn ff1(x: u64) -> u32 {
+    if x == 0 { !0 } else { x.trailing_zeros() }
+}
+
+/// s_flbit_i32_b64: zeros above the highest set bit, -1 without one.
+fn flbit64(x: u64) -> u32 {
+    if x == 0 { !0 } else { x.leading_zeros() }
+}
+
+/// Programs that read lane masks as whole words: s_wqm across the 32-lane halves and of SGPR
+/// pairs put together from halves, the inverting SALU forms, counts and scans of EXEC / VCC
+/// halves, SCC of each. Every program starts with VCC = EXEC = the launched lanes and EXEC
+/// saved in s[30:31] (`mask_program`), and leaves four words in s20..s23. The models follow
+/// the RDNA2 ISA definitions on the registers' 64 bits, with the lanes a partial wave did not
+/// launch 0 in EXEC and in a VALU compare's mask; they are not hardware measurements.
+fn mask_cases() -> Vec<MaskCase> {
+    const VCC: u64 = 106;
+    const VCC_HI: u64 = 107;
+    const EXEC: u64 = 126;
+    const EXEC_HI: u64 = 127;
+    const ZERO: u64 = 128;
+    const MINUS1: u64 = 193;
+    let s1 = |n: &str, d: u64, s: u64| ins(n, "ENC_SOP1", &[("SDST", d), ("SSRC0", s)], None);
+    let s2 = |n: &str, d: u64, a: u64, b: u64| ins(n, "ENC_SOP2", &[("SDST", d), ("SSRC0", a), ("SSRC1", b)], None);
+    let sc = |n: &str, a: u64, b: u64| ins(n, "ENC_SOPC", &[("SSRC0", a), ("SSRC1", b)], None);
+    // sN = SCC
+    let scc = |d: u64| ins("S_CSELECT_B32", "ENC_SOP2", &[("SDST", d), ("SSRC0", 129), ("SSRC1", 128)], None);
+    // vcc = the launched lanes for which `imm` <op> lane holds (v2 = lane)
+    let cmp_lane = |n: &str, imm: u64| ins(n, "ENC_VOPC", &[("SRC0", 128 + imm), ("VSRC1", 2)], None);
+    // s_wqm_b64 s[14:15], s[12:13] of a pair built from (lo source, hi source), then SCC, the
+    // result's bits and those of its two words
+    let pair = |lo: u64, hi: u64| {
+        vec![
+            s1("S_MOV_B32", 12, lo),
+            s1("S_MOV_B32", 13, hi),
+            s1("S_WQM_B64", 14, 12),
+            scc(20),
+            s1("S_BCNT1_I32_B64", 21, 14),
+            s1("S_BCNT1_I32_B32", 22, 14),
+            s1("S_BCNT1_I32_B32", 23, 15),
+        ]
+    };
+    fn of_pair(v: u64) -> [u32; 4] {
+        let d = wqm_bits(v);
+        [(d != 0) as u32, ones(d), ones(d & M32), ones(d >> 32)]
+    }
+    // s_wqm_b32 of the high word into the low one of a mask that was `l`: SCC, bits of the
+    // whole mask and of its low word, first lane
+    fn lo_from_hi(l: u64) -> [u32; 4] {
+        let d = wqm_bits(l >> 32);
+        let v = d | (l >> 32) << 32;
+        [(d != 0) as u32, ones(v), ones(d), ff1(v)]
+    }
+    vec![
+        case(
+            "s_wqm_b32 vcc_lo, vcc_hi",
+            vec![s1("S_WQM_B32", VCC, VCC_HI), scc(20), s1("S_BCNT1_I32_B64", 21, VCC), s1("S_BCNT1_I32_B32", 22, VCC), s1("S_FF1_I32_B64", 23, VCC)],
+            lo_from_hi,
+        ),
+        case(
+            "s_wqm_b32 vcc_lo, s15 (= vcc_hi)",
+            vec![s1("S_MOV_B32", 15, VCC_HI), s1("S_WQM_B32", VCC, 15), scc(20), s1("S_BCNT1_I32_B64", 21, VCC), s1("S_BCNT1_I32_B32", 22, VCC), s1("S_FF1_I32_B64", 23, VCC)],
+            lo_from_hi,
+        ),
+        case(
+            "s_wqm_b32 exec_lo, vcc_hi",
+            vec![s1("S_WQM_B32", EXEC, VCC_HI), scc(20), s1("S_BCNT1_I32_B64", 21, EXEC), s1("S_BCNT1_I32_B32", 22, EXEC), s1("S_FF1_I32_B64", 23, EXEC)],
+            lo_from_hi,
+        ),
+        case(
+            "s_wqm_b32 vcc_hi, vcc_lo",
+            vec![s1("S_WQM_B32", VCC_HI, VCC), scc(20), s1("S_BCNT1_I32_B64", 21, VCC), s1("S_BCNT1_I32_B32", 22, VCC_HI), s1("S_FF1_I32_B32", 23, VCC_HI)],
+            |l| {
+                let d = wqm_bits(l & M32);
+                [(d != 0) as u32, ones(l & M32) + ones(d), ones(d), ff1(d)]
+            },
+        ),
+        case("s_wqm_b64 of (vcc_hi, vcc_lo)", pair(VCC_HI, VCC), |l| of_pair(l >> 32 | (l & M32) << 32)),
+        case("s_wqm_b64 of (vcc_hi, 0)", pair(VCC_HI, ZERO), |l| of_pair(l >> 32)),
+        case("s_wqm_b64 of (0, vcc_lo)", pair(ZERO, VCC), |l| of_pair((l & M32) << 32)),
+        case("s_wqm_b64 of (vcc_lo, vcc_lo)", pair(VCC, VCC), |l| of_pair(l & M32 | (l & M32) << 32)),
+        case("s_wqm_b64 of (vcc_lo, -1)", pair(VCC, MINUS1), |l| of_pair(l & M32 | M32 << 32)),
+        case("s_wqm_b64 of (vcc_lo, 0x30)", pair(VCC, 128 + 0x30), |l| of_pair(l & M32 | 0x30 << 32)),
+        case("s_wqm_b64 of (0x30, vcc_hi)", pair(128 + 0x30, VCC_HI), |l| of_pair(0x30 | (l >> 32) << 32)),
+        case(
+            "s_wqm_b64 of vcc and of ~vcc",
+            vec![
+                s1("S_WQM_B64", 14, VCC),
+                scc(20),
+                s1("S_BCNT1_I32_B64", 21, 14),
+                s1("S_NOT_B64", 12, VCC),
+                s1("S_WQM_B64", 16, 12),
+                scc(22),
+                s1("S_BCNT1_I32_B64", 23, 16),
+            ],
+            |l| [(l != 0) as u32, ones(wqm_bits(l)), (!l != 0) as u32, ones(wqm_bits(!l))],
+        ),
+        case(
+            "s_not_b64 of vcc",
+            vec![s1("S_NOT_B64", 12, VCC), scc(20), s1("S_BCNT1_I32_B64", 21, 12), s1("S_BCNT0_I32_B64", 22, 12), sc("S_CMP_LG_U64", 12, ZERO), scc(23)],
+            |l| [(!l != 0) as u32, ones(!l), 64 - ones(!l), (!l != 0) as u32],
+        ),
+        case(
+            "bits of s_orn2 0, vcc / s_nand vcc, exec / s_nor vcc, 0 / s_xnor vcc, vcc",
+            vec![
+                s2("S_ORN2_B64", 12, ZERO, VCC),
+                s1("S_BCNT1_I32_B64", 20, 12),
+                s2("S_NAND_B64", 12, VCC, EXEC),
+                s1("S_BCNT1_I32_B64", 21, 12),
+                s2("S_NOR_B64", 12, VCC, ZERO),
+                s1("S_BCNT1_I32_B64", 22, 12),
+                s2("S_XNOR_B64", 12, VCC, VCC),
+                s1("S_BCNT1_I32_B64", 23, 12),
+            ],
+            |l| [ones(!l), ones(!l), ones(!l), 64],
+        ),
+        case(
+            "SCC of s_orn2 0, vcc / s_nand vcc, exec / s_nor vcc, 0 / s_andn2 -1, exec",
+            vec![
+                s2("S_ORN2_B64", 12, ZERO, VCC),
+                scc(20),
+                s2("S_NAND_B64", 12, VCC, EXEC),
+                scc(21),
+                s2("S_NOR_B64", 12, VCC, ZERO),
+                scc(22),
+                s2("S_ANDN2_B64", 12, MINUS1, EXEC),
+                scc(23),
+            ],
+            |l| [(!l != 0) as u32; 4],
+        ),
+        case(
+            "s_andn2_b64 -1, exec: bits, first and last",
+            vec![s2("S_ANDN2_B64", 12, MINUS1, EXEC), s1("S_BCNT1_I32_B64", 20, 12), s1("S_FF1_I32_B64", 21, 12), s1("S_FLBIT_I32_B64", 22, 12), s1("S_FF0_I32_B64", 23, 12)],
+            |l| [ones(!l), ff1(!l), flbit64(!l), ff1(l)],
+        ),
+        case(
+            "s_not_b32 of vcc_hi and of vcc_lo",
+            vec![s1("S_NOT_B32", 13, VCC_HI), scc(20), s1("S_BCNT1_I32_B32", 21, 13), s1("S_NOT_B32", 12, VCC), scc(22), s1("S_FF1_I32_B32", 23, 13)],
+            |l| {
+                let (lo, hi) = (!l & M32, !l >> 32);
+                [(hi != 0) as u32, ones(hi), (lo != 0) as u32, ff1(hi)]
+            },
+        ),
+        case(
+            "s_xor_b64 vcc, vcc, -1",
+            vec![s2("S_XOR_B64", VCC, VCC, MINUS1), scc(20), s1("S_BCNT1_I32_B64", 21, VCC), s1("S_MOV_B32", 22, 251), sc("S_CMP_EQ_U64", VCC, EXEC), scc(23)],
+            |l| [(!l != 0) as u32, ones(!l), (!l == 0) as u32, 0],
+        ),
+        case(
+            "if / else: s_and_saveexec_b64, s_andn2_b64 exec",
+            vec![
+                cmp_lane("V_CMP_GT_U32", 5), // lanes 0..4
+                s1("S_AND_SAVEEXEC_B64", 12, VCC),
+                scc(20),
+                s1("S_BCNT1_I32_B64", 21, EXEC),
+                s2("S_ANDN2_B64", EXEC, 12, EXEC),
+                scc(22),
+                s1("S_BCNT1_I32_B64", 23, EXEC),
+            ],
+            |l| {
+                let (t, e) = (l & 31, l & !31);
+                [(t != 0) as u32, ones(t), (e != 0) as u32, ones(e)]
+            },
+        ),
+        case(
+            "counts and scans of exec's halves",
+            vec![s1("S_BCNT1_I32_B32", 20, EXEC), s1("S_BCNT1_I32_B32", 21, EXEC_HI), s1("S_FF1_I32_B32", 22, EXEC_HI), s1("S_FF0_I32_B64", 23, EXEC)],
+            |l| [ones(l & M32), ones(l >> 32), ff1(l >> 32), ff1(!l)],
+        ),
+        case(
+            "scans of the halves of a vcc without its first lanes",
+            vec![cmp_lane("V_CMP_LE_U32", 3), s1("S_FF1_I32_B64", 20, VCC), s1("S_FF1_I32_B32", 21, VCC_HI), s1("S_BCNT1_I32_B32", 22, VCC_HI), s1("S_FLBIT_I32_B64", 23, VCC)],
+            |l| {
+                let m = l & !7;
+                [ff1(m), ff1(m >> 32), ones(m >> 32), flbit64(m)]
+            },
+        ),
+        case(
+            "s_bcnt0 / s_flbit of exec, s_ff0 of exec_hi",
+            vec![s1("S_BCNT0_I32_B64", 20, EXEC), scc(21), s1("S_FLBIT_I32_B64", 22, EXEC), s1("S_FF0_I32_B32", 23, EXEC_HI)],
+            |l| [64 - ones(l), (l != !0) as u32, flbit64(l), ff1(!l >> 32)],
+        ),
+        case(
+            "SCC of 32-bit ops and compares on the halves, execz",
+            vec![s2("S_AND_B32", 12, VCC_HI, EXEC_HI), scc(20), sc("S_CMP_EQ_U32", VCC_HI, MINUS1), scc(21), sc("S_CMP_EQ_U64", VCC, EXEC), scc(22), s1("S_MOV_B32", 23, 252)],
+            |l| [(l >> 32 != 0) as u32, (l >> 32 == M32) as u32, 1, (l == 0) as u32],
+        ),
+        case(
+            "s_bitcmp of exec at lanes 39, 19 and 63",
+            vec![
+                sc("S_BITCMP1_B64", EXEC, 128 + 39),
+                scc(20),
+                sc("S_BITCMP1_B64", EXEC, 128 + 19),
+                scc(21),
+                sc("S_BITCMP0_B64", EXEC, 128 + 63),
+                scc(22),
+                sc("S_BITCMP1_B32", EXEC_HI, 128 + 7),
+                scc(23),
+            ],
+            |l| [(l >> 39 & 1) as u32, (l >> 19 & 1) as u32, (l >> 63 & 1 == 0) as u32, (l >> 39 & 1) as u32],
+        ),
+    ]
+}
+
+/// The same for programs that turn on, in EXEC, lanes the wave did not launch, and then run
+/// VALU code: on the console those lanes exist and execute it (an integer compare of a
+/// register with itself is true in them whatever they hold; `v_mov` writes them), here they
+/// do not. s20..s22 = bits of VCC after `v_cmp_eq_u32 vcc, v0, v0` with EXEC = s_wqm(EXEC),
+/// ~EXEC and -1 (s_or_saveexec); s23 = lane 63 of a VGPR written with EXEC = -1.
+fn mask_cases_in_lanes_not_launched() -> Vec<MaskCase> {
+    let s1 = |n: &str, d: u64, s: u64| ins(n, "ENC_SOP1", &[("SDST", d), ("SSRC0", s)], None);
+    let all = || ins("V_CMP_EQ_U32", "ENC_VOPC", &[("SRC0", V), ("VSRC1", 0)], None);
+    let back = || s1("S_MOV_B64", 126, 30);
+    vec![case(
+        "VALU code in lanes EXEC turns on but the wave did not launch",
+        vec![
+            s1("S_WQM_B64", 126, 126),
+            all(),
+            s1("S_BCNT1_I32_B64", 20, 106),
+            back(),
+            s1("S_NOT_B64", 126, 126),
+            all(),
+            s1("S_BCNT1_I32_B64", 21, 106),
+            back(),
+            s1("S_OR_SAVEEXEC_B64", 12, 193),
+            all(),
+            s1("S_BCNT1_I32_B64", 22, 106),
+            ins("V_MOV_B32", "ENC_VOP1", &[("VDST", 9), ("SRC0", 135)], None),
+            back(),
+            ins("V_READLANE_B32", "ENC_VOP3", &[("VDST", 23), ("SRC0", V + 9), ("SRC1", 128 + 63)], None),
+        ],
+        |l| [ones(wqm_bits(l)), ones(!l), 64, 7],
+    )]
+}
+
+/// A wave64 compute program around `body`: v0 = thread index in the group (from the thread
+/// id's components, s1 = x and s2 = x · y of the group), v2 = lane, VCC = EXEC = the launched
+/// lanes, EXEC saved in s[30:31] and put back before each thread stores s20..s23 at
+/// s0 + 16 · thread.
+fn mask_program(body: &[Vec<u8>]) -> Vec<u8> {
+    let mut parts = vec![
+        ins("V_MAD_U32_U24", "ENC_VOP3", &[("VDST", 20), ("SRC0", V + 1), ("SRC1", 1), ("SRC2", V)], None),
+        ins("V_MAD_U32_U24", "ENC_VOP3", &[("VDST", 0), ("SRC0", V + 2), ("SRC1", 2), ("SRC2", V + 20)], None),
+        ins("V_AND_B32", "ENC_VOP2", &[("VDST", 2), ("SRC0", 255), ("VSRC1", 0)], Some(63)),
+        ins("S_MOV_B64", "ENC_SOP1", &[("SDST", 30), ("SSRC0", 126)], None),
+        ins("V_CMP_EQ_U32", "ENC_VOPC", &[("SRC0", V), ("VSRC1", 0)], None),
+    ];
+    parts.extend(body.iter().cloned());
+    parts.push(ins("S_MOV_B64", "ENC_SOP1", &[("SDST", 126), ("SSRC0", 30)], None));
+    for k in 0..4 {
+        parts.push(ins("V_MOV_B32", "ENC_VOP1", &[("VDST", 24 + k), ("SRC0", 20 + k)], None));
+    }
+    parts.extend([
+        ins("V_LSHLREV_B32", "ENC_VOP2", &[("VDST", 30), ("SRC0", 132), ("VSRC1", 0)], None),
+        ins("V_ADD_NC_U32", "ENC_VOP2", &[("VDST", 30), ("SRC0", 0), ("VSRC1", 30)], None),
+        ins("V_MOV_B32", "ENC_VOP1", &[("VDST", 31), ("SRC0", 128)], None),
+        ins("GLOBAL_STORE_DWORDX4", "ENC_FLAT_GLBL", &[("ADDR", 30), ("DATA", 24), ("SADDR", 0x7D)], None),
+    ]);
+    program_of(&parts)
+}
+
+/// Group sizes of the mask tests: a full wave, one partial wave ending in the upper half on
+/// and off a quad edge (40, 42) and in the lower half (20, 10), a full wave followed by a
+/// half one (96: the counter-paired form where the GPU has 32-lane waves only).
+const MASK_GROUPS: [u32; 6] = [64, 40, 42, 20, 10, 96];
+
+fn mask_options(dims: [u32; 3]) -> Options {
+    let cs = super::CsInterface { threads: dims, user_sgprs: 4, tgid: [true, false, false], tg_size: false, tid_components: 3 };
+    Options { mode: Mode::Compute(cs), wave64: true, ..Default::default() }
+}
+
+/// Runs each case in groups of each of `groups`' dimensions and returns one line per console
+/// wave whose threads did not all store the model's words.
+fn mask_mismatches(cases: &[MaskCase], groups: &[[u32; 3]]) -> Vec<String> {
+    let base = 0x100usize;
+    let mut bad = Vec::new();
+    for (what, body, model) in cases {
+        let code = mask_program(body);
+        for &dims in groups {
+            let threads = dims.iter().product::<u32>();
+            let t = translate(&code, &on_gpu(mask_options(dims))).unwrap();
+            assert!(t.complete(), "{what}: {:?}", t.unsupported_why);
+            let dxil = super::dxc::compile(&t.hlsl, "main", "cs_6_6", &[]).unwrap_or_else(|e| panic!("{what}: {e}"));
+            let mut mem = vec![0xDEAD_BEEFu32; (base + threads as usize * 16) / 4];
+            mem[..base / 4].fill(0);
+            let out = runner::dispatch(&dxil, [1, 1, 1], &[base as u32, dims[0], dims[0] * dims[1]], &mem).unwrap_or_else(|e| panic!("{what}, {dims:?}: {e}"));
+            for w in 0..threads.div_ceil(64) {
+                let n = (threads - w * 64).min(64);
+                let want = model(if n == 64 { !0 } else { (1u64 << n) - 1 });
+                let mut got: Vec<[u32; 4]> = (w * 64..w * 64 + n).map(|tid| out[base / 4 + tid as usize * 4..][..4].try_into().unwrap()).collect();
+                got.dedup();
+                if got != [want] {
+                    bad.push(format!("{what} | group {dims:?} wave {w} ({n} lanes) | want {want:x?} | got {got:x?}"));
+                }
+            }
+        }
+    }
+    bad
+}
+
+/// Lane masks read as whole words in full and partial wave64 groups (`mask_cases`,
+/// `MASK_GROUPS`). Natively on 64-lane waves, split otherwise; every thread of a wave stores
+/// the same words.
+#[test]
+fn gpu_wave64_masks_as_words_in_partial_groups() {
+    if !gpu_ready() {
+        return;
+    }
+    let bad = mask_mismatches(&mask_cases(), &MASK_GROUPS.map(|n| [n, 1, 1]));
+    for line in &bad {
+        println!("MISMATCH {line}");
+    }
+    assert!(bad.is_empty(), "{} waves differ from the ISA model", bad.len());
+}
+
+/// The same in 2-D and 3-D groups of 40, 42, 20, 10 and 96 threads, where the GPU need not
+/// form its waves from consecutive thread indices (docs/wave64-on-wave32.md, "Lane
+/// numbering") and the console does: the partial wave is still the group's last threads.
+#[test]
+fn gpu_wave64_masks_as_words_in_partial_2d_3d_groups() {
+    if !gpu_ready() {
+        return;
+    }
+    let bad = mask_mismatches(&mask_cases(), &[[8, 5, 1], [5, 8, 1], [4, 5, 2], [6, 7, 1], [5, 4, 1], [2, 5, 1], [8, 12, 1], [4, 4, 6]]);
+    for line in &bad {
+        println!("MISMATCH {line}");
+    }
+    assert!(bad.is_empty(), "{} waves differ from the ISA model", bad.len());
+}
+
+/// `mask_cases_in_lanes_not_launched`: what docs/wave64-on-wave32.md lists as not exact
+/// ("Lanes the PC did not launch, inside a wave"), measured for compute groups.
+#[test]
+#[ignore]
+fn gpu_wave64_valu_code_in_lanes_not_launched() {
+    if !gpu_ready() {
+        return;
+    }
+    let bad = mask_mismatches(&mask_cases_in_lanes_not_launched(), &MASK_GROUPS.map(|n| [n, 1, 1]));
+    for line in &bad {
+        println!("MISMATCH {line}");
+    }
+    assert!(bad.is_empty(), "{} waves differ from the ISA model", bad.len());
+}
+
+/// Split form: a mask of `mask_cases` that scalar code reads as a word is exchanged between
+/// the halves (`x64_masks`); only a first compare whose VCC the program never reads stays
+/// in its half.
+#[test]
+fn split_wave64_masks_read_as_words_are_exchanged() {
+    for (what, body, _) in mask_cases() {
+        let code = mask_program(&body);
+        // a body that does not read VCC, or writes it first, leaves the first compare's mask dead
+        let whole = !crate::gpu::rdna2::decode(&body[0], 0).is_ok_and(|d| d.inst.name.starts_with("V_CMP_")) && !what.contains("exec's halves") && !what.contains("of exec") && !what.contains("-1, exec:");
+        let compares = 1 + body.iter().filter(|b| crate::gpu::rdna2::decode(b, 0).is_ok_and(|d| d.inst.name.starts_with("V_CMP_"))).count();
+        for threads in [64, 40, 96] {
+            let t = translate(&code, &Options { split_wave64: true, ..mask_options([threads, 1, 1]) }).unwrap();
+            assert!(t.complete(), "{what}: {:?}", t.unsupported_why);
+            let (exchanged, local) = (t.hlsl.matches("= xcl_x_ballot(and(").count(), t.hlsl.matches("= xcl_x_ballot_local(and(").count());
+            assert_eq!(exchanged + local, compares, "{what}, {threads} threads");
+            // `XCL_X64_ALL_MASKS` (for comparison) exchanges that one too
+            assert_eq!(local, if whole || std::env::var_os("XCL_X64_ALL_MASKS").is_some() { 0 } else { 1 }, "{what}, {threads} threads");
+        }
+    }
+}
