@@ -768,8 +768,8 @@ impl Pipelines {
         }
     }
 
-    /// The compute pipeline of `c` (made and released).
-    fn make(&self, c: &recomp::pso::Compiled) {
+    /// The compute pipeline of `c` (made and released). Err: the HRESULT it was refused with.
+    fn make(&self, c: &recomp::pso::Compiled) -> Result<(), crate::util::HRESULT> {
         use windows::Win32::Graphics::Direct3D12::*;
         let key: Vec<u32> = c.samplers.iter().flat_map(|(w, cmp)| w.iter().copied().chain([*cmp as u32])).collect();
         let rs = {
@@ -783,7 +783,7 @@ impl Pipelines {
                     }
                     Err(_) => {
                         self.refused.fetch_add(1, Ordering::Relaxed);
-                        return;
+                        return Err(crate::util::E_INVALIDARG);
                     }
                 },
             }
@@ -804,14 +804,34 @@ impl Pipelines {
         *self.running.0.lock().unwrap() -= 1;
         self.running.1.notify_one();
         drop(std::mem::ManuallyDrop::into_inner(desc.pRootSignature));
-        let done = match r {
+        let done = match &r {
             Ok(_) => self.made.fetch_add(1, Ordering::Relaxed) + 1,
             Err(_) => self.refused.fetch_add(1, Ordering::Relaxed) + 1,
         };
         if done % 25 == 0 {
             eprintln!("  pipelines: {} made, {} refused", self.made.load(Ordering::Relaxed), self.refused.load(Ordering::Relaxed));
         }
+        r.map(|_| ()).map_err(|e| e.code().0)
     }
+}
+
+/// What `--pipelines` does with a compiled compute program: makes its pipeline, or says why not.
+type MakePipeline<'a> = &'a dyn Fn(&recomp::pso::Compiled) -> Result<(), crate::util::HRESULT>;
+
+/// A compute program for `--precompile`: translated and compiled as a title's pipeline does
+/// (`pso::console_to_dxil_in`, into the caches), its pipeline made by `make` (`--pipelines`).
+/// A pipeline the driver refuses with E_OUTOFMEMORY in the heap-window form is built in the
+/// switch form at run time (`real::with_switch_fallback`): that form is translated, compiled
+/// and made here too, or the title would wait for its DXC and driver compiles at the first
+/// bind. Ok(true): the switch form's pipeline was made.
+fn precompile_compute(blob: &[u8], split: bool, windows: u32, make: Option<MakePipeline>) -> Result<bool, String> {
+    let c = recomp::pso::console_to_dxil_in(blob, recomp::pso::Stage::Compute, 0, split, windows)?;
+    let Some(make) = make else { return Ok(false) };
+    if make(&c) != Err(crate::util::E_OUTOFMEMORY) || windows & recomp::HEAP_WINDOWS == 0 {
+        return Ok(false);
+    }
+    let c = recomp::pso::console_to_dxil_in(blob, recomp::pso::Stage::Compute, 0, split, windows & !recomp::HEAP_WINDOWS)?;
+    Ok(make(&c).is_ok())
 }
 
 fn precompile(input: &Input, limit: usize, windows: u32, split: Option<bool>, only: Option<&str>, pipelines: bool, t0: std::time::Instant) -> i32 {
@@ -830,6 +850,8 @@ fn precompile(input: &Input, limit: usize, windows: u32, split: Option<bool>, on
     let n = input.len().min(limit);
     let next = AtomicUsize::new(0);
     let (done, compiled, cached, failed, skipped) = (AtomicUsize::new(0), AtomicUsize::new(0), AtomicUsize::new(0), AtomicUsize::new(0), AtomicUsize::new(0));
+    // pipelines made in the switch form after the driver refused the heap-window form
+    let switch_form = AtomicUsize::new(0);
     let errors: Mutex<Vec<String>> = Mutex::new(Vec::new());
     // the compiles run on the DXC pool; these threads translate and keep it fed
     let threads = recomp::dxc::compile_threads() + 2;
@@ -864,11 +886,10 @@ fn precompile(input: &Input, limit: usize, windows: u32, split: Option<bool>, on
                 // a compute program as a title's pipeline translates it (`pso::console_to_dxil_in`):
                 // into the translation cache too, so the title does not translate it again
                 if sh.fssm.iter().any(|f| matches!(recomp::interface(&blob, &sh, f), Some(recomp::Mode::Compute(_)))) {
-                    match recomp::pso::console_to_dxil_in(&blob, recomp::pso::Stage::Compute, 0, split, windows) {
-                        Ok(c) => {
-                            if let Some(p) = pipelines {
-                                p.make(&c);
-                            }
+                    let make = pipelines.map(|p| move |c: &recomp::pso::Compiled| p.make(c));
+                    match precompile_compute(&blob, split, windows, make.as_ref().map(|m| m as MakePipeline)) {
+                        Ok(again) => {
+                            switch_form.fetch_add(again as usize, Ordering::Relaxed);
                             compiled.fetch_add(1, Ordering::Relaxed)
                         }
                         Err(e) => {
@@ -938,7 +959,12 @@ fn precompile(input: &Input, limit: usize, windows: u32, split: Option<bool>, on
         t0.elapsed().as_secs_f64()
     );
     if let Some(p) = pipelines {
-        println!("pipelines made on the GPU {}, refused {}", p.made.load(Ordering::Relaxed), p.refused.load(Ordering::Relaxed));
+        println!(
+            "pipelines made on the GPU {}, refused {} ({} of those made in the switch form instead)",
+            p.made.load(Ordering::Relaxed),
+            p.refused.load(Ordering::Relaxed),
+            switch_form.into_inner()
+        );
     }
     for e in errors.into_inner().unwrap() {
         println!("  {e}");
@@ -1256,6 +1282,48 @@ mod tests {
         assert_eq!(order.len(), 3);
         let cov = coverage(&a, &order, &[1, 3]);
         assert_eq!(cov, vec![(1, 0), (3, 2)]);
+    }
+
+    /// `--precompile --pipelines`: a compute pipeline the driver refuses with E_OUTOFMEMORY in the
+    /// heap-window form is made again from the switch form, the translation the title asks
+    /// for after the same refusal (`pso::in_switch_form`). Another refusal, or a pipeline that is
+    /// in the switch form already, is left alone.
+    #[test]
+    fn precompile_makes_the_switch_form_of_a_refused_heap_window_pipeline() {
+        use crate::util::{E_INVALIDARG, E_OUTOFMEMORY, HRESULT};
+        if recomp::dxc::location().is_err() {
+            recomp::runner::skip_test("no DXC");
+            return;
+        }
+        // a load through s[2:3]: the window of a memory access is what the two forms differ in
+        let mut code = rdna2::encode("S_LOAD_DWORD", "ENC_SMEM", &[("SDATA", 8), ("SBASE", 1), ("OFFSET", 0)], None).unwrap();
+        code.extend(rdna2::encode("S_ENDPGM", "ENC_SOPP", &[], None).unwrap());
+        let mut f = fssm(&code, &[(6, 0)]);
+        // the CS stage descriptor: COMPUTE_PGM_RSRC2 (4 user SGPRs), numthreads (64, 1, 1)
+        for (k, x) in [4u32 << 1, 64, 1, 1].into_iter().enumerate() {
+            f[0x138 + 4 * k..0x13C + 4 * k].copy_from_slice(&x.to_le_bytes());
+        }
+        let blob = sample(5, &[f]);
+        let heap = 4 | recomp::HEAP_WINDOWS;
+        let dxil = |windows: u32| recomp::pso::console_to_dxil_in(&blob, recomp::pso::Stage::Compute, 0, false, windows).unwrap().dxil;
+        assert_ne!(dxil(heap), dxil(4), "the two forms are different programs");
+        // the DXIL of every pipeline `make` was asked for, refused as `refusals` say
+        let run = |windows: u32, refusals: &[HRESULT]| {
+            let seen = std::cell::RefCell::new(Vec::new());
+            let make = |c: &recomp::pso::Compiled| {
+                let k = seen.borrow().len();
+                seen.borrow_mut().push(c.dxil.clone());
+                refusals.get(k).map_or(Ok(()), |&hr| Err(hr))
+            };
+            let again = precompile_compute(&blob, false, windows, Some(&make)).unwrap();
+            (again, seen.into_inner())
+        };
+        assert_eq!(run(heap, &[]), (false, vec![dxil(heap)]), "a pipeline the driver takes is made once");
+        assert_eq!(run(heap, &[E_OUTOFMEMORY]), (true, vec![dxil(heap), dxil(4)]), "refused: the switch form's pipeline is made");
+        assert_eq!(run(heap, &[E_OUTOFMEMORY, E_OUTOFMEMORY]), (false, vec![dxil(heap), dxil(4)]), "the switch form refused too");
+        assert_eq!(run(heap, &[E_INVALIDARG]), (false, vec![dxil(heap)]), "another refusal: the title does not fall back either");
+        assert_eq!(run(4, &[E_OUTOFMEMORY]), (false, vec![dxil(4)]), "already the switch form");
+        assert_eq!(precompile_compute(&blob, false, heap, None), Ok(false), "without --pipelines: compiled only");
     }
 
     /// Real data check (skipped unless XCL_SAMPLE_RPF points at an RPF9 shader pack).
