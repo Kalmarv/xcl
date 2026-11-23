@@ -2829,6 +2829,7 @@ fn gpu_mesh_mode_reads_memory_windows() {
     };
     assert_eq!(positions(2), vec![[-1.0, -1.0, 0.0, 1.0], [-1.0, 1.0, 0.0, 1.0], [0.0, -1.0, 0.0, 1.0]], "the vertex table from window 1");
     assert_eq!(positions(1)[0], [9.0; 4], "one window: window 0 at the same offset (the old MS / GS translation)");
+    assert_eq!(positions(2 | super::HEAP_WINDOWS), positions(2), "heap windows: the same vertex table");
 }
 
 /// Memory above 4 GiB: two UMA windows 4 GiB apart; every access kind picks its window from
@@ -3059,6 +3060,309 @@ fn gpu_sparse_vram_descriptors_buffers_and_xmem() {
         crate::hle::kernelx::XMemFreeDefault(in_a as *mut _, gfx_attrs);
         crate::hle::kernelx::XMemFreeDefault(in_b as *mut _, gfx_attrs);
         assert!(u.free(arg_table) && u.free(out_buf) && u.free(io_buf) && u.free(res_buf));
+    }
+}
+
+/// The switch over root UAVs and the heap windows (`Options::heap_windows`) are two ways to the
+/// same memory: one program with every kind of access the windows' accessors have – scalar
+/// loads of 1..8 dwords, bounds-checked scalar buffer loads, 1..4-dword and sub-dword buffer
+/// loads and stores, 1 / 2 / 4-dword and byte global stores, 32- and 64-bit atomics – in four
+/// windows, each lane's 64-bit address in window `lane & 3` (so one wave indexes all four),
+/// leaves the same registers and the same memory in both forms.
+#[test]
+fn gpu_window_forms_agree_on_every_access_kind() {
+    if !gpu_ready() {
+        return;
+    }
+    let arena = crate::gpu::uma::Uma::with_windows(4, 1 << 20).unwrap();
+    let w: [u64; 4] = std::array::from_fn(|k| arena.window(k).0 as u64);
+    // the first 64 KiB of every window: all the program touches
+    const WORDS: usize = 0x1_0000 / 4;
+    let window = |k: usize| unsafe { std::slice::from_raw_parts_mut(w[k] as *mut u32, WORDS) };
+    let seeded = |k: usize, i: usize| {
+        let mut x = (k as u32 + 1).wrapping_mul(0x9E37_79B9) ^ (i as u32).wrapping_mul(0x85EB_CA6B);
+        x ^= x >> 15;
+        x.wrapping_mul(0x2C1B_3C6D) ^ (x >> 12)
+    };
+    let glbl = |n: &'static str, f: &[(&str, u64)]| encode(n, "ENC_FLAT_GLBL", f, None).unwrap_or_else(|x| panic!("{n}: {x}"));
+    let mubuf = |n: &'static str, f: &[(&str, u64)]| encode(n, "ENC_MUBUF", f, None).unwrap_or_else(|x| panic!("{n}: {x}"));
+    let smem = |n: &'static str, f: &[(&str, u64)]| encode(n, "ENC_SMEM", f, None).unwrap_or_else(|x| panic!("{n}: {x}"));
+    let mut code = Vec::new();
+    // s[2:3] → window 2
+    code.extend(smem("S_LOAD_DWORDX2", &[("SDATA", 20), ("SBASE", 1), ("OFFSET", 0)]));
+    code.extend(smem("S_LOAD_DWORDX8", &[("SDATA", 40), ("SBASE", 1), ("OFFSET", 0x20), ("SOFFSET", 125)]));
+    // V# s[8:11] in window 1 (stride 4, 64 records): the last four of the X8 are out of range
+    code.extend(smem("S_BUFFER_LOAD_DWORD", &[("SDATA", 60), ("SBASE", 4), ("OFFSET", 8)]));
+    code.extend(smem("S_BUFFER_LOAD_DWORDX4", &[("SDATA", 48), ("SBASE", 4), ("OFFSET", 4)]));
+    code.extend(smem("S_BUFFER_LOAD_DWORDX8", &[("SDATA", 52), ("SBASE", 4), ("OFFSET", 0xF0), ("SOFFSET", 125)]));
+    code.extend(mubuf("BUFFER_LOAD_DWORD", &[("VDATA", 1), ("VADDR", 0), ("SRSRC", 2), ("SOFFSET", 128), ("IDXEN", 1)]));
+    // V# s[12:15] in window 3 (stride 16): record `lane`
+    code.extend(mubuf("BUFFER_LOAD_DWORDX4", &[("VDATA", 10), ("VADDR", 0), ("SRSRC", 3), ("SOFFSET", 128), ("IDXEN", 1)]));
+    code.extend(mubuf("BUFFER_LOAD_DWORDX3", &[("VDATA", 14), ("VADDR", 0), ("SRSRC", 3), ("SOFFSET", 128), ("IDXEN", 1)]));
+    code.extend(mubuf("BUFFER_LOAD_DWORDX2", &[("VDATA", 17), ("VADDR", 0), ("SRSRC", 3), ("SOFFSET", 128), ("IDXEN", 1)]));
+    code.extend(mubuf("BUFFER_STORE_DWORD", &[("VDATA", 30), ("VADDR", 0), ("SRSRC", 3), ("SOFFSET", 128), ("IDXEN", 1)]));
+    code.extend(mubuf("BUFFER_ATOMIC_UMAX", &[("VDATA", 19), ("VADDR", 0), ("SRSRC", 3), ("SOFFSET", 128), ("IDXEN", 1), ("OFFSET", 4), ("GLC", 1)]));
+    // V# s[24:27], raw bytes in window 2: a short at 2 · lane, a byte at 0x80 + lane (lanes share dwords)
+    code.extend(mubuf("BUFFER_STORE_SHORT", &[("VDATA", 34), ("VADDR", 2), ("SRSRC", 6), ("SOFFSET", 128), ("OFFEN", 1)]));
+    code.extend(mubuf("BUFFER_STORE_BYTE", &[("VDATA", 36), ("VADDR", 3), ("SRSRC", 6), ("SOFFSET", 128), ("OFFEN", 1)]));
+    code.extend(mubuf("BUFFER_LOAD_USHORT", &[("VDATA", 45), ("VADDR", 2), ("SRSRC", 6), ("SOFFSET", 128), ("OFFEN", 1)]));
+    code.extend(mubuf("BUFFER_LOAD_SSHORT", &[("VDATA", 46), ("VADDR", 2), ("SRSRC", 6), ("SOFFSET", 128), ("OFFEN", 1)]));
+    code.extend(mubuf("BUFFER_LOAD_UBYTE", &[("VDATA", 47), ("VADDR", 3), ("SRSRC", 6), ("SOFFSET", 128), ("OFFEN", 1)]));
+    code.extend(mubuf("BUFFER_LOAD_SBYTE", &[("VDATA", 48), ("VADDR", 3), ("SRSRC", 6), ("SOFFSET", 128), ("OFFEN", 1)]));
+    // v[4:5]: the lane's own 128 bytes, in window lane & 3
+    let own = |n: &'static str, f: &[(&str, u64)]| {
+        let mut fields = vec![("ADDR", 4), ("SADDR", 0x7D)];
+        fields.extend_from_slice(f);
+        glbl(n, &fields)
+    };
+    code.extend(own("GLOBAL_LOAD_DWORD", &[("VDST", 50), ("OFFSET", 0)]));
+    code.extend(own("GLOBAL_LOAD_UBYTE", &[("VDST", 51), ("OFFSET", 1)]));
+    code.extend(own("GLOBAL_LOAD_SBYTE", &[("VDST", 52), ("OFFSET", 2)]));
+    code.extend(own("GLOBAL_LOAD_USHORT", &[("VDST", 53), ("OFFSET", 2)]));
+    code.extend(own("GLOBAL_STORE_DWORD", &[("DATA", 30), ("OFFSET", 8)]));
+    code.extend(own("GLOBAL_STORE_DWORDX2", &[("DATA", 31), ("OFFSET", 16)]));
+    code.extend(own("GLOBAL_STORE_DWORDX4", &[("DATA", 24), ("OFFSET", 32)]));
+    code.extend(own("GLOBAL_STORE_BYTE", &[("DATA", 36), ("OFFSET", 49)]));
+    code.extend(own("GLOBAL_ATOMIC_ADD", &[("VDST", 54), ("DATA", 31), ("OFFSET", 52), ("GLC", 1)]));
+    code.extend(own("GLOBAL_ATOMIC_SUB", &[("VDST", 55), ("DATA", 35), ("OFFSET", 56), ("GLC", 1)]));
+    code.extend(own("GLOBAL_ATOMIC_SMAX", &[("VDST", 56), ("DATA", 33), ("OFFSET", 60), ("GLC", 1)]));
+    code.extend(own("GLOBAL_ATOMIC_FMAX", &[("VDST", 57), ("DATA", 32), ("OFFSET", 64), ("GLC", 1)]));
+    code.extend(own("GLOBAL_ATOMIC_FMIN", &[("VDST", 58), ("DATA", 32), ("OFFSET", 68), ("GLC", 1)]));
+    code.extend(own("GLOBAL_ATOMIC_INC", &[("DATA", 21), ("OFFSET", 72)]));
+    code.extend(own("GLOBAL_ATOMIC_DEC", &[("DATA", 21), ("OFFSET", 76)]));
+    code.extend(own("GLOBAL_ATOMIC_CSUB", &[("DATA", 35), ("OFFSET", 80)]));
+    code.extend(own("GLOBAL_ATOMIC_ADD_X2", &[("DATA", 38), ("OFFSET", 88)]));
+    code.extend(own("GLOBAL_ATOMIC_INC_X2", &[("DATA", 38), ("OFFSET", 96)]));
+    code.extend(own("GLOBAL_ATOMIC_FCMPSWAP_X2", &[("VDST", 62), ("DATA", 24), ("OFFSET", 104), ("GLC", 1)]));
+    // s[16:17] + v7: 16 bytes a lane in window 0
+    code.extend(glbl("GLOBAL_ATOMIC_ADD", &[("VDST", 64), ("ADDR", 7), ("DATA", 31), ("SADDR", 16), ("OFFSET", 0), ("GLC", 1)]));
+    code.extend(glbl("GLOBAL_LOAD_DWORD", &[("VDST", 65), ("ADDR", 7), ("SADDR", 16), ("OFFSET", 4)]));
+    code.extend(encode("S_ENDPGM", "ENC_SOPP", &[], None).unwrap());
+
+    let hi = |a: u64| (a >> 32) as u32;
+    let own_at = |l: usize| w[l & 3] + 0x8000 + 0x80 * l as u64;
+    let mut st = KernelState::default();
+    st.sgpr[2..4].copy_from_slice(&[(w[2] + 0x1000) as u32, hi(w[2])]);
+    st.sgpr[8..12].copy_from_slice(&[(w[1] + 0x2000) as u32, hi(w[1]) & 0xFFFF | 4 << 16, 64, 0]);
+    st.sgpr[12..16].copy_from_slice(&[(w[3] + 0x3000) as u32, hi(w[3]) & 0xFFFF | 16 << 16, 64, 0]);
+    st.sgpr[16..18].copy_from_slice(&[(w[0] + 0x7000) as u32, hi(w[0])]);
+    st.sgpr[24..28].copy_from_slice(&[(w[2] + 0x6000) as u32, hi(w[2]) & 0xFFFF, 0x200, 0]);
+    for (l, r) in st.vgpr.iter_mut().enumerate() {
+        let l32 = l as u32;
+        r[0] = l32;
+        r[2] = 2 * l32;
+        r[3] = 0x80 + l32;
+        r[4] = own_at(l) as u32;
+        r[5] = hi(own_at(l));
+        r[7] = 16 * l32;
+        r[21] = 5 + l32;
+        for (k, v) in r[24..28].iter_mut().enumerate() {
+            *v = 0xD000_0000 | l32 << 8 | k as u32;
+        }
+        r[30] = 0xA000_0000 | l32;
+        r[31] = 0x1_0001 * (l32 + 1);
+        r[32] = f(l as f32 - 20.5);
+        r[33] = (l as i32 - 30) as u32;
+        r[34] = 0xAB00 + l32;
+        r[35] = 3;
+        r[36] = 0x90 + l32;
+        r[38] = 0xFFFF_FFF0 + l32; // the low dword of the 64-bit add carries
+        r[39] = 1;
+    }
+    // registers, then the four windows' first 64 KiB
+    let run = |heap: bool| -> (Vec<u32>, Vec<Vec<u32>>, Vec<u32>) {
+        for k in 0..4 {
+            for (i, x) in window(k).iter_mut().enumerate() {
+                *x = seeded(k, i);
+            }
+        }
+        let t = translate(&code, &on_gpu(Options { mem_windows: 4, heap_windows: heap, ..Default::default() })).unwrap();
+        assert!(t.complete(), "{:?}", t.unsupported_why);
+        assert_eq!(t.hlsl.contains("switch (xcl_w)"), !heap);
+        assert_eq!(t.hlsl.contains("ResourceDescriptorHeap[NonUniformResourceIndex(0u + (xcl_w"), heap);
+        let dxil = super::dxc::compile(&t.hlsl, "main", "cs_6_6", &[]).map_err(|e| format!("{e}\n{}", t.hlsl)).unwrap();
+        let r = runner::run_in_arena(&dxil, &st, &arena).unwrap();
+        (r.sgpr, r.vgpr, (0..4).flat_map(|k| window(k).to_vec()).collect())
+    };
+    let (sgpr, vgpr, mem) = run(false);
+    // the switch form read and wrote where it should have (each window has its own contents)
+    assert_eq!((sgpr[20], sgpr[21]), (seeded(2, 0x1000 / 4), seeded(2, 0x1004 / 4)), "s_load from window 2");
+    assert_eq!(sgpr[48..52], std::array::from_fn::<u32, 4, _>(|i| seeded(1, 0x2004 / 4 + i)), "s_buffer_load from window 1");
+    assert_eq!(sgpr[56..60], [0; 4], "s_buffer_load past the last record");
+    for l in 0..64usize {
+        let at = |a: u64| ((a - w[l & 3]) / 4) as usize + (l & 3) * WORDS;
+        assert_eq!(vgpr[l][1], seeded(1, 0x2000 / 4 + l), "lane {l}: buffer_load from window 1");
+        assert_eq!(vgpr[l][10], seeded(3, 0x3000 / 4 + 4 * l), "lane {l}: buffer_load_dwordx4 from window 3");
+        assert_eq!(vgpr[l][50], seeded(l & 3, (0x8000 + 0x80 * l) / 4), "lane {l}: global_load from window {}", l & 3);
+        assert_eq!(mem[at(own_at(l) + 8)], 0xA000_0000 | l as u32, "lane {l}: global_store into window {}", l & 3);
+        assert_eq!(mem[at(own_at(l) + 52)], seeded(l & 3, (0x8000 + 0x80 * l + 52) / 4).wrapping_add(0x1_0001 * (l as u32 + 1)), "lane {l}: global_atomic_add in window {}", l & 3);
+        assert_eq!(mem[3 * WORDS + 0x3000 / 4 + 4 * l], 0xA000_0000 | l as u32, "lane {l}: buffer_store into window 3");
+    }
+    let (heap_sgpr, heap_vgpr, heap_mem) = run(true);
+    for (s, (a, b)) in sgpr.iter().zip(&heap_sgpr).enumerate() {
+        assert_eq!(a, b, "s{s}: switch {a:#x}, heap {b:#x}");
+    }
+    for l in 0..64 {
+        for (v, (a, b)) in vgpr[l].iter().zip(&heap_vgpr[l]).enumerate() {
+            assert_eq!(a, b, "lane {l} v{v}: switch {a:#x}, heap {b:#x}");
+        }
+    }
+    for (i, (a, b)) in mem.iter().zip(&heap_mem).enumerate() {
+        assert_eq!(a, b, "window {} + {:#x}: switch {a:#x}, heap {b:#x}", i / WORDS, 4 * (i % WORDS));
+    }
+}
+
+/// The runtime's windows in both forms, with the descriptors where a title writes them: V#s in
+/// a console descriptor heap (window 0, a 32-bit address) name buffers in windows 0, 1 and 2
+/// (sparse) and 3 (coherent); the program loads each V# from the heap, reads every buffer,
+/// adds to a counter through a 64-bit pointer it also loaded from title memory, and stores
+/// into windows 1, 2 and 3. Heap windows read through the views `open_uma` made
+/// (`console_heap::set_window_views`), the switch through the root UAVs: same results.
+#[test]
+fn gpu_runtime_windows_agree_in_both_forms() {
+    use windows::core::Interface;
+    use windows::Win32::Graphics::Direct3D12::*;
+
+    if !gpu_ready() {
+        return;
+    }
+    crate::hle::d3d12x::real::init().expect("real D3D12.X backend");
+    let u = crate::gpu::uma::get().expect("UMA");
+    assert_eq!(u.shader_windows(), 4);
+    if !crate::gpu::recomp::pso::heap_windows() {
+        println!("no heap windows (XCL_HEAP_WINDOWS=0, or no shared heap) – skipping");
+        return;
+    }
+    let windows = crate::hle::d3d12x::real::uma_window_vas();
+    let shared = crate::hle::d3d12x::console_heap::global_heap().expect("the shared heap");
+    let p = prog(&[
+        ("S_MOV_B32", "ENC_SOP1", &[("SDST", 5), ("SSRC0", 128)], None), // s[4:5]: the heap, a 32-bit address
+        ("S_LOAD_DWORDX4", "ENC_SMEM", &[("SDATA", 8), ("SBASE", 2), ("OFFSET", 0)], None), // V# in window 0
+        ("S_LOAD_DWORDX4", "ENC_SMEM", &[("SDATA", 12), ("SBASE", 2), ("OFFSET", 32)], None), // V# in window 1
+        ("S_LOAD_DWORDX4", "ENC_SMEM", &[("SDATA", 16), ("SBASE", 2), ("OFFSET", 64)], None), // V# in window 2
+        ("S_LOAD_DWORDX4", "ENC_SMEM", &[("SDATA", 20), ("SBASE", 2), ("OFFSET", 96)], None), // V# in window 3
+        ("S_LOAD_DWORDX4", "ENC_SMEM", &[("SDATA", 24), ("SBASE", 2), ("OFFSET", 128)], None), // V# out, window 3
+        ("S_LOAD_DWORDX4", "ENC_SMEM", &[("SDATA", 28), ("SBASE", 2), ("OFFSET", 160)], None), // V# out, window 1
+        ("S_LOAD_DWORDX4", "ENC_SMEM", &[("SDATA", 32), ("SBASE", 2), ("OFFSET", 192)], None), // V# out, window 2
+        ("S_LOAD_DWORDX2", "ENC_SMEM", &[("SDATA", 36), ("SBASE", 2), ("OFFSET", 224)], None), // the counters' address, window 2
+        ("BUFFER_LOAD_DWORD", "ENC_MUBUF", &[("VDATA", 1), ("VADDR", 0), ("SRSRC", 2), ("SOFFSET", 128), ("IDXEN", 1)], None),
+        ("BUFFER_LOAD_DWORD", "ENC_MUBUF", &[("VDATA", 2), ("VADDR", 0), ("SRSRC", 3), ("SOFFSET", 128), ("IDXEN", 1)], None),
+        ("BUFFER_LOAD_DWORD", "ENC_MUBUF", &[("VDATA", 3), ("VADDR", 0), ("SRSRC", 4), ("SOFFSET", 128), ("IDXEN", 1)], None),
+        ("BUFFER_LOAD_DWORD", "ENC_MUBUF", &[("VDATA", 4), ("VADDR", 0), ("SRSRC", 5), ("SOFFSET", 128), ("IDXEN", 1)], None),
+        ("V_ADD_NC_U32", "ENC_VOP2", &[("VDST", 5), ("SRC0", V + 1), ("VSRC1", 2)], None),
+        ("V_ADD_NC_U32", "ENC_VOP2", &[("VDST", 5), ("SRC0", V + 3), ("VSRC1", 5)], None),
+        ("V_ADD_NC_U32", "ENC_VOP2", &[("VDST", 5), ("SRC0", V + 4), ("VSRC1", 5)], None), // the four loads
+        ("V_XOR_B32", "ENC_VOP2", &[("VDST", 6), ("SRC0", V + 2), ("VSRC1", 3)], None),
+        ("V_LSHLREV_B32", "ENC_VOP2", &[("VDST", 9), ("SRC0", 130), ("VSRC1", 0)], None), // 4 · thread
+        ("GLOBAL_ATOMIC_ADD", "ENC_FLAT_GLBL", &[("VDST", 10), ("ADDR", 9), ("DATA", 5), ("SADDR", 36), ("OFFSET", 0), ("GLC", 1)], None),
+        ("V_ADD_NC_U32", "ENC_VOP2", &[("VDST", 11), ("SRC0", V + 10), ("VSRC1", 5)], None), // + the counter before
+        ("BUFFER_STORE_DWORD", "ENC_MUBUF", &[("VDATA", 11), ("VADDR", 0), ("SRSRC", 6), ("SOFFSET", 128), ("IDXEN", 1)], None),
+        ("BUFFER_STORE_DWORD", "ENC_MUBUF", &[("VDATA", 6), ("VADDR", 0), ("SRSRC", 7), ("SOFFSET", 128), ("IDXEN", 1)], None),
+        ("BUFFER_STORE_DWORD", "ENC_MUBUF", &[("VDATA", 6), ("VADDR", 0), ("SRSRC", 8), ("SOFFSET", 128), ("IDXEN", 1)], None),
+    ]);
+    let input = |k: usize, l: usize| [1000, 20_000, 300_000, 4_000_000][k] + (2 * k as u32 + 1) * l as u32;
+    // what the GPU left: out (window 3), the two stores (windows 1, 2), the counters (window 2)
+    let run = |heap: bool| -> [Vec<u32>; 4] {
+        unsafe {
+            let heap_obj = 0xD1FF_5EA7usize + heap as usize;
+            assert!(crate::hle::d3d12x::console_heap::register(heap_obj, 8, 0x1000, 0x5000, 32, false, false, true));
+            let heap_va = crate::hle::d3d12x::console_heap::start(heap_obj).unwrap() as usize;
+            assert_eq!(u.window_of(heap_va), Some(0), "the descriptor heap is in window 0");
+            let sparse = |k: usize| crate::hle::d3d12x::sparse::alloc_in(k, 0x1_0000, 0x1_0000).unwrap_or_else(|| panic!("no room in window {k}")).0;
+            let coherent = || u.alloc(0x1_0000, 256).unwrap() as usize;
+            let (in0, in1, in2, in3) = (sparse(0), sparse(1), sparse(2), coherent());
+            let (out3, out1, out2, counters) = (coherent(), sparse(1), sparse(2), sparse(2));
+            let (io_buf, res_buf) = (coherent(), coherent());
+            for (k, a) in [in0, in1, in2, in3, out3, out1, out2, counters].into_iter().enumerate() {
+                assert_eq!(u.window_of(a), Some([0, 1, 2, 3, 3, 1, 2, 2][k]), "buffer {k} at {a:#x}");
+            }
+            for l in 0..64usize {
+                for (k, a) in [in0, in1, in2, in3].into_iter().enumerate() {
+                    *((a + 4 * l) as *mut u32) = input(k, l);
+                }
+                *((counters + 4 * l) as *mut u32) = 50 + l as u32;
+            }
+            let vsharp = |addr: usize| -> [u32; 4] { [addr as u32, (((addr >> 32) as u32) & 0xFFFF) | (4 << 16), 64, 0] };
+            for (k, a) in [in0, in1, in2, in3, out3, out1, out2].into_iter().enumerate() {
+                let slot = crate::hle::d3d12x::console_heap::slot(heap_va as u64 + 32 * k as u64).unwrap();
+                crate::hle::d3d12x::console_heap::write(&slot, &vsharp(a));
+            }
+            let slot = crate::hle::d3d12x::console_heap::slot(heap_va as u64 + 32 * 7).unwrap();
+            crate::hle::d3d12x::console_heap::write(&slot, &[counters as u32, (counters >> 32) as u32]);
+
+            let cs = super::CsInterface { threads: [64, 1, 1], user_sgprs: 6, ..Default::default() };
+            let t = translate(&p, &on_gpu(Options { mode: Mode::Compute(cs), mem_windows: 4, heap_windows: heap, ..Default::default() })).unwrap();
+            assert!(t.complete(), "{:?}", t.unsupported_why);
+            assert_eq!(t.hlsl.contains("switch (xcl_w)"), !heap);
+            let dxil = super::dxc::compile(&t.hlsl, "main", "cs_6_6", &[]).map_err(|e| format!("{e}\n{}", t.hlsl)).unwrap();
+
+            let dev_raw = crate::hle::d3d12x::real::device_raw();
+            let dev = ID3D12Device::from_raw_borrowed(&dev_raw).expect("device").clone();
+            let rs = crate::gpu::recomp::pso::abi_root_signature(&dev, false).expect("ABI root signature");
+            let pso: ID3D12PipelineState = dev
+                .CreateComputePipelineState(&D3D12_COMPUTE_PIPELINE_STATE_DESC {
+                    pRootSignature: std::mem::ManuallyDrop::new(Some(rs.clone())),
+                    CS: D3D12_SHADER_BYTECODE { pShaderBytecode: dxil.as_ptr() as *const _, BytecodeLength: dxil.len() },
+                    ..Default::default()
+                })
+                .expect("CreateComputePipelineState");
+            let queue: ID3D12CommandQueue = dev.CreateCommandQueue(&D3D12_COMMAND_QUEUE_DESC::default()).unwrap();
+            let alloc: ID3D12CommandAllocator = dev.CreateCommandAllocator(D3D12_COMMAND_LIST_TYPE_DIRECT).unwrap();
+            let list: ID3D12GraphicsCommandList = dev.CreateCommandList(0, D3D12_COMMAND_LIST_TYPE_DIRECT, &alloc, Some(&pso)).unwrap();
+            let fence: ID3D12Fence = dev.CreateFence(0, D3D12_FENCE_FLAG_NONE).unwrap();
+
+            let mut io = vec![0u32; crate::gpu::recomp::KERNEL_SGPRS];
+            io[4] = (heap_va - u.base()) as u32;
+            io[5] = 0xDEAD_BEEF; // the program clears it
+            std::ptr::copy_nonoverlapping(io.as_ptr() as *const u8, io_buf as *mut u8, io.len() * 4);
+
+            list.SetDescriptorHeaps(&[Some(shared.clone())]);
+            list.SetComputeRootSignature(&rs);
+            list.SetComputeRootUnorderedAccessView(0, crate::hle::d3d12x::real::uma_va_of(io_buf).unwrap());
+            list.SetComputeRootUnorderedAccessView(1, crate::hle::d3d12x::real::uma_va_of(res_buf).unwrap());
+            for (k, &va) in windows.iter().enumerate() {
+                list.SetComputeRootUnorderedAccessView(2 + k as u32, va);
+            }
+            list.Dispatch(1, 1, 1);
+            list.Close().unwrap();
+            queue.ExecuteCommandLists(&[Some(list.cast::<ID3D12CommandList>().unwrap())]);
+            queue.Signal(&fence, 1).unwrap();
+            if fence.GetCompletedValue() < 1 {
+                let ev = windows::Win32::System::Threading::CreateEventW(None, false, false, None).unwrap();
+                fence.SetEventOnCompletion(1, ev).unwrap();
+                windows::Win32::System::Threading::WaitForSingleObject(ev, 5000);
+                let _ = windows::Win32::Foundation::CloseHandle(ev);
+            }
+            assert_eq!(fence.GetCompletedValue(), 1, "the dispatch finished");
+            // what the GPU wrote into the sparse windows is in video memory: bring it to the CPU's view
+            for a in [out1, out2, counters] {
+                crate::hle::d3d12x::sparse::readback_now(a, 256);
+            }
+            let got = [out3, out1, out2, counters].map(|a| std::slice::from_raw_parts(a as *const u32, 64).to_vec());
+
+            crate::hle::d3d12x::console_heap::unregister(heap_obj);
+            for a in [in0, in1, in2, out1, out2, counters] {
+                assert!(crate::hle::d3d12x::sparse::free(a));
+            }
+            for a in [in3, out3, io_buf, res_buf] {
+                assert!(u.free(a));
+            }
+            got
+        }
+    };
+    let switch = run(false);
+    for l in 0..64usize {
+        let sum: u32 = (0..4).map(|k| input(k, l)).sum();
+        assert_eq!(switch[0][l], sum + 50 + l as u32, "lane {l}: the four windows' loads and the counter before, into window 3");
+        assert_eq!(switch[1][l], input(1, l) ^ input(2, l), "lane {l}: the store into window 1");
+        assert_eq!(switch[2][l], input(1, l) ^ input(2, l), "lane {l}: the store into window 2");
+        assert_eq!(switch[3][l], sum + 50 + l as u32, "lane {l}: the counter in window 2");
+    }
+    let heap = run(true);
+    for (what, (a, b)) in ["out in window 3", "store in window 1", "store in window 2", "counters in window 2"].iter().zip(switch.iter().zip(&heap)) {
+        for l in 0..64 {
+            assert_eq!(a[l], b[l], "{what}, lane {l}: switch {:#x}, heap {:#x}", a[l], b[l]);
+        }
     }
 }
 
@@ -3931,8 +4235,10 @@ fn gpu_bvh64_intersect_ray_across_memory_windows_and_grazing() {
     code.extend(mimg("IMAGE_BVH_INTERSECT_RAY", 108, 40, 3));
     code.extend(encode("S_ENDPGM", "ENC_SOPP", &[], None).unwrap());
 
-    let t = translate(&code, &on_gpu(Options { mem_windows: 2, ..Default::default() })).unwrap();
-    let dxil = super::dxc::compile(&t.hlsl, "main", "cs_6_6", &[]).map_err(|e| format!("{e}\n{}", t.hlsl)).unwrap();
+    let compiled = |heap: bool| {
+        let t = translate(&code, &on_gpu(Options { mem_windows: 2, heap_windows: heap, ..Default::default() })).unwrap();
+        super::dxc::compile(&t.hlsl, "main", "cs_6_6", &[]).map_err(|e| format!("{e}\n{}", t.hlsl)).unwrap()
+    };
 
     let mut st = KernelState::default();
     st.sgpr[8..12].copy_from_slice(&crate::gpu::desc::bvh_words(0, true));
@@ -3958,7 +4264,9 @@ fn gpu_bvh64_intersect_ray_across_memory_windows_and_grazing() {
         r[40] = 5; // relative root box32 at bvh_addr
         put_ray(r, 41);
     }
-    let res = runner::run_in_arena(&dxil, &st, &arena).unwrap();
+    let res = runner::run_in_arena(&compiled(false), &st, &arena).unwrap();
+    // the nodes through the heap windows: the same results in every lane
+    assert_eq!(runner::run_in_arena(&compiled(true), &st, &arena).unwrap().vgpr, res.vgpr, "heap windows");
     const F: u32 = u32::MAX;
     for l in 0..64usize {
         let v = &res.vgpr[l];
