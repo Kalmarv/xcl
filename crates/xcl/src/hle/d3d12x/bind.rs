@@ -299,6 +299,7 @@ unsafe fn draw_rects(this: *mut c_void, list: &ID3D12GraphicsCommandList, vertic
     if N.fetch_add(1, Ordering::Relaxed) == 0 {
         crate::xlog_info!("D3D12.X: rect lists are drawn as two triangles a rectangle, the fourth corner made on the CPU");
     }
+    super::rect_stats::note_cpu_expanded();
     true
 }
 
@@ -358,7 +359,11 @@ unsafe fn graphics_bound(this: *mut c_void) -> Option<ID3D12GraphicsCommandList>
     let list = ID3D12GraphicsCommandList::from_raw_borrowed(&this)?.clone();
     let pso = with(this, |s| s.pso);
     // a pipeline still being built in the background is waited for (its stand-in draws nothing)
-    if !super::real::is_translated_graphics(super::pso_async::resolve_wait(pso)) {
+    let real = super::pso_async::resolve_wait(pso);
+    if super::list_x::rect_list_set(this) {
+        super::rect_stats::note_draw(pso, DRAW_ARGS.with(|d| d.get().0));
+    }
+    if !super::real::is_translated_graphics(real) {
         count(DRAWS_PC);
         if super::present::trace_frame() {
             // which pipelines draw without a translation (first 12 distinct)

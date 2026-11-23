@@ -124,6 +124,9 @@ pub struct D3d12Stats {
     /// DXIL cache and compiler statistics.
     #[serde(default)]
     pub dxil_cache: crate::gpu::recomp::dxc::CacheStats,
+    /// how the title's rect lists reach XCL (`rect_stats`)
+    #[serde(default)]
+    pub rect_lists: super::rect_stats::RectListStats,
 }
 
 static ADAPTER: Mutex<String> = Mutex::new(String::new());
@@ -303,6 +306,7 @@ pub fn stats() -> D3d12Stats {
         translation_errors: TRANSLATE_ERRORS.lock().map(|e| e.clone()).unwrap_or_default(),
         background_pipelines: super::pso_async::counts(),
         dxil_cache: crate::gpu::recomp::dxc::cache_stats(),
+        rect_lists: super::rect_stats::snapshot(),
     }
 }
 

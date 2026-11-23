@@ -268,6 +268,11 @@ pub(super) fn rect_list_state(list: *mut c_void) -> Option<Vec<(u32, (u64, u32, 
     b.rect_list.then(|| b.vertex_titles.iter().map(|(&k, &v)| (k, v, b.vertex_buffers.get(&k).copied())).collect())
 }
 
+/// Whether `list` draws rect lists now (topology 17 set).
+pub(super) fn rect_list_set(list: *mut c_void) -> bool {
+    LISTS.lock().unwrap().as_ref().and_then(|g| g.get(&(list as usize))).is_some_and(|l| l.bindings.rect_list)
+}
+
 /// `pc_va` for other modules.
 pub(super) fn pc_va_of(va: u64) -> u64 {
     pc_va(va)
@@ -428,6 +433,7 @@ pub(super) unsafe extern "system" fn ia_set_topology_x(this: *mut c_void, t: u32
         if new {
             crate::xlog_warn!("D3D12.X: IASetPrimitiveTopology({t}) – a console topology the PC does not have{}", if t == RECT_LIST { ": rect lists are drawn as triangle lists (each rect's first half only)" } else { "" });
         }
+        super::rect_stats::note_console_topology(t);
     }
     let rect = t == RECT_LIST;
     let t = if t == RECT_LIST { windows::Win32::Graphics::Direct3D::D3D_PRIMITIVE_TOPOLOGY_TRIANGLELIST.0 as u32 } else { t };
