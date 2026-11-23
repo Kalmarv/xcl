@@ -204,6 +204,8 @@ struct State {
     /// fence signalled on title queues so `queue` waits before copying GPU writes back to CPU
     rb_fence: ID3D12Fence,
     rb_value: u64,
+    /// title queue → a fence it signals after its submitted work, and the value last signalled
+    after_title: FxHashMap<usize, (ID3D12Fence, u64)>,
     /// (window start, reserved buffer) of each sparse window
     windows: Vec<(usize, ID3D12Resource)>,
     /// video-memory pool heaps (None: given back, its index free for the next one)
@@ -518,6 +520,7 @@ pub unsafe fn init(dev: &ID3D12Device) -> Vec<(usize, usize, u64)> {
             event,
             rb_fence,
             rb_value: 0,
+            after_title: FxHashMap::default(),
             windows,
             pools: Vec::new(),
             free: Vec::new(),
@@ -750,6 +753,21 @@ impl State {
             self.map_tiles(&r, b, &tiles);
         }
         self.signal();
+    }
+
+    /// XCL's queue waits for what the title's `queue` has submitted so far (a fence of that
+    /// queue's own: values signalled on several queues would complete out of order).
+    unsafe fn after(&mut self, queue: &ID3D12CommandQueue) {
+        let q = queue.as_raw() as usize;
+        if !self.after_title.contains_key(&q) {
+            let Ok(f) = self.dev.CreateFence(0, D3D12_FENCE_FLAG_NONE) else { return };
+            self.after_title.insert(q, (f, 0));
+        }
+        let Some((f, v)) = self.after_title.get_mut(&q) else { return };
+        *v += 1;
+        if queue.Signal(&*f, *v).is_ok() {
+            let _ = self.queue.Wait(&*f, *v);
+        }
     }
 
     #[inline]
@@ -1388,6 +1406,11 @@ pub unsafe fn before_execute(queue: &ID3D12CommandQueue, dirty: &[usize], page: 
     PHASES[1].fetch_add((t_scanned - t_locked).as_micros() as u64, Ordering::Relaxed);
     PHASES[3].fetch_add((zero_runs.len() + dirty_runs.len()) as u64, Ordering::Relaxed);
     // Submit tile clears before CPU writes so overlapping CopyBufferRegion destinations have no WAW hazard.
+    // a window is one buffer: writing it while the title's work on it is in flight on its queue
+    // makes two writers on two queues (D3D12 allows one; the debug layer's error 1047)
+    if !zero_runs.is_empty() || !dirty_runs.is_empty() {
+        s.after(queue);
+    }
     if !zero_runs.is_empty() {
         s.upload_zeros(&zero_runs);
     }
@@ -1652,6 +1675,7 @@ mod tests {
                 event,
                 rb_fence,
                 rb_value: 0,
+                after_title: FxHashMap::default(),
                 windows: vec![(base, reserved)],
                 pools: Vec::new(),
                 free: Vec::new(),
