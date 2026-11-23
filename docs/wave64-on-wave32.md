@@ -278,6 +278,73 @@ Spill slots of lanes that were not launched are also still lost in the native fo
 64-lane waves, which keep the HLSL as it was), and in the 32-lane form for slots ≥ 32 when the
 driver picks 64 lanes.
 
+## Compute groups that are not whole waves
+
+Not about the split form only: every GPU and both wave sizes.
+
+A console wave always has its 64 lanes (a wave32 program's: 32). A compute group of 40
+threads is one wave64 with lanes 0..39 launched and lanes 40..63 inactive in EXEC – but
+there: `v_writelane` writes them whatever EXEC is, and code that turns them on in EXEC
+(`s_or_saveexec_b64 s, -1` around whole-wave code, `s_mov_b64 exec, -1`, `s_not_b64 exec,
+exec`, `s_wqm_b64 exec, exec`) runs in them – its compares set their mask bits, its writes
+reach them, and a later `v_readlane` or DPP step reads them back. A PC group of 40 threads
+has no such lanes. Measured on an RTX 5070 Ti before this (split form, the same with
+`XCL_X64_ALL_MASKS=1` and `XCL_WAVE64_SPIN=1`; expected values from the ISA's definition, not
+from a console):
+
+| group | `s_not_b64 exec, exec`, then bits of `v_cmp_eq_u32 vcc, v0, v0` | `s_or_saveexec_b64 s, -1`, then the same | `v_mov` under EXEC = -1, `v_readlane` of lane 63 |
+|---|---|---|---|
+| 40 | 24 expected, 0 measured | 64, 40 | 7, 7 (an undefined read that happened to be right) |
+| 42 | 22, 0 | 64, 42 | 7, 7 (same) |
+| 20 | 44, 0 | 64, 20 | 7, 0 |
+| 10 | 54, 0 | 64, 10 | 7, 0 |
+| 96, second wave | 32, 0 | 64, 32 | 7, 0 |
+
+For compute the lanes can simply be launched: the group is declared as whole console waves
+(`[numthreads(64, 1, 1)]` for 40 threads, 1-D whatever the console's shape) and EXEC starts
+as the ballot of `thread index < 40`. The padding lanes are then real lanes, inactive as on
+the console, and nothing else in the translation changes. Thread ids come from the thread
+index as in the split form (`xcl_x_thread`); on a GPU with 64-lane waves a padded group takes
+its threads the way 2-D / 3-D groups already do (each wave the next 64 from a groupshared
+counter), so the lanes the console launches are the first of the last wave. TG_SIZE keeps
+counting the console's waves (the padded group has as many), the group ids are the PC's, the
+dispatch counts are the title's, LDS is the group's as before.
+
+Only a program that can tell gets the padded group (`partial_waves.rs`), every other one
+keeps its group and its HLSL byte for byte. A program can tell when
+- it has a `v_writelane` to a lane the last wave may not launch (a lane from an SGPR: any), or
+- EXEC may get a bit outside the launched lanes. A forward pass follows the SGPRs as words
+  known to lie inside the last wave's launched lanes, as a low and as a high word: EXEC at
+  the start, VALU masks (inside EXEC), constants by their bits, AND with such a word, OR /
+  XOR of two, `s_andn2` of one, the saveexec / wrexec forms, moves and selects; anything
+  else (an argument, a load, an inverted mask) may have any bit. An indirect jump pads.
+
+The compiler's if / else / loop code keeps EXEC inside the launched lanes
+(`partial_waves::tests`), so ordinary programs are not padded. Wrong in the safe direction:
+a padded program is exact, it only runs up to 63 more (inactive) threads per group, and in
+the split form exchanges with a half that may be all padding. `XCL_CS_PAD_ALL=1` pads every
+group that is not whole waves, `XCL_NO_CS_PAD=1` none (both bypass the shader caches);
+`Options::pad_waves` in tests. A group whose padded size would pass D3D12's 1 024 threads
+keeps its size.
+
+Tests on the RTX 5070 Ti (split form, also with `XCL_X64_ALL_MASKS=1` and
+`XCL_WAVE64_SPIN=1`): `gpu_wave64_valu_code_in_lanes_not_launched` and
+`gpu_wave32_valu_code_in_lanes_not_launched` (the table's programs and `v_writelane` to
+lanes the wave did not launch, in 1-D, 2-D and 3-D groups; with `PadWaves::Never` they must
+fail),
+`gpu_padded_compute_groups_look_the_same_to_the_program` (thread ids, group id, TG_SIZE,
+lane numbers, the launched-lane count, LDS across `s_barrier` and one atomic per thread:
+the same padded or not), `gpu_wave64_masks_as_words_in_partial_groups` /
+`…_2d_3d_groups` (24 mask programs – `s_wqm`, the inverting SALU forms, `s_bcnt1` /
+`s_ff1` / `s_flbit` of mask halves – padded and not), and on the CPU
+`compute_groups_are_padded_only_where_the_program_can_tell`.
+
+Not covered: mesh and geometry programs (their thread count is the vertex / primitive
+budget, the launched lanes are known only at run time), VS / PS (above), the retail pack's
+compute programs (not counted: how many are padded is unknown), and a wave64 program's
+padded group on 64-lane hardware (its thread-counter form ran here only for wave32 programs,
+in 32-lane waves).
+
 ## Relation to earlier work
 
 * **PR #33** (ElHombreAlex, draft): first wave64 → wave32 "rendezvous" through groupshared

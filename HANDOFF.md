@@ -1725,6 +1725,22 @@ of the title (it writes to address 0 after a failed D3D12 call: `call 0x14068c76
   forms test run on both); the three GPU tests pass, also with `XCL_SPLIT_WAVE64=1`; XDefiant and Minecraft run with
   and without `XCL_SPLIT_WAVE64=1` (the forced split form starts with a cold shader cache: XDefiant black while compiling).
 
+## Compute groups that are not whole waves (2026-11-23)
+- A console wave has all its lanes; a 40-thread group's lanes 40..63 are inactive but there: `v_writelane` writes
+  them, whole-wave code (`s_or_saveexec_b64 s, -1`), `s_not_b64 exec`, `s_wqm_b64 exec` run in them. A PC group of
+  40 threads has none: on the 5070 Ti `s_or_saveexec -1` + `v_cmp` gave 40 mask bits for 64, `s_not exec` + `v_cmp`
+  0 for 24 (groups 40 / 42 / 20 / 10 / 96; every GPU and wave size, not the split form's doing).
+- `partial_waves.rs`: a program that can tell (a `v_writelane` to a lane the last wave may not launch, or EXEC that
+  may leave the launched lanes – forward pass over the SGPRs) gets its group padded to whole console waves
+  (`Em::cs_pad`: `[numthreads(64, 1, 1)]`, EXEC = ballot(thread index < 40), thread ids from the index; natively
+  through the 2-D / 3-D groups' thread counter). Every other program keeps its HLSL byte for byte. TG_SIZE, group
+  ids, LDS and the dispatch counts are unchanged. `XCL_CS_PAD_ALL=1` / `XCL_NO_CS_PAD=1` for comparison.
+- Tests: `gpu_wave64_valu_code_in_lanes_not_launched`, `gpu_wave32_valu_code_in_lanes_not_launched`,
+  `gpu_padded_compute_groups_look_the_same_to_the_program`, `gpu_wave64_masks_as_words_in_partial_groups` (+ 2-D /
+  3-D), `partial_waves::tests`, `compute_groups_are_padded_only_where_the_program_can_tell`. RTX 5070 Ti only.
+- Not covered: mesh / geometry programs, VS / PS (the section above), a count over the retail pack's compute programs,
+  a run on 64-lane hardware. `docs/wave64-on-wave32.md`, "Compute groups that are not whole waves".
+
 ## Retail game bring-up, 2026-11-23
 
 Runs 45 s without a crash (later update below); what it shows was not looked at yet. **Always run it with `XCL_NETWORK=0`**: its crash reporter sends a minidump
