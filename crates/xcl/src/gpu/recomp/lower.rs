@@ -380,6 +380,14 @@ impl<'a, I: Ir> Lower<'a, I> {
                 self.write_scc(b, new);
                 return Ok(());
             }
+            if op == "CSELECT" && (sd == EXEC || reads_mask) {
+                // `s_cselect_b64 s, exec, 0`: the lane's bit of the source SCC picks
+                let (a, c) = (self.src_bit(b, s0)?, self.src_bit(b, s1)?);
+                let scc = self.read_scc(b);
+                let v = self.ir.select(scc, a, c);
+                self.write_bit(b, sd, v);
+                return Ok(());
+            }
             if bitwise && (sd == EXEC || reads_mask) {
                 let a = self.src_bit(b, s0)?;
                 let v = match op {
@@ -437,6 +445,19 @@ impl<'a, I: Ir> Lower<'a, I> {
                 let scc = if carry { self.ir.icmp(Cmp::Ult, v, a) } else { self.ir.icmp(Cmp::Ult, a, c) };
                 self.write_num(b, sd, v);
                 self.write_scc(b, scc);
+            }
+            "S_CSELECT_B32" => {
+                let (a, c) = (self.src(b, d, s0)?, self.src(b, d, s1)?);
+                let scc = self.read_scc(b);
+                let v = self.ir.select(scc, a, c);
+                self.write_num(b, sd, v);
+            }
+            "S_CSELECT_B64" => {
+                let ((al, ah), (cl, ch)) = (self.src64(b, d, s0)?, self.src64(b, d, s1)?);
+                let scc = self.read_scc(b);
+                let (lo, hi) = (self.ir.select(scc, al, cl), self.ir.select(scc, ah, ch));
+                self.write_num(b, sd, lo);
+                self.write_num(b, sd + 1, hi);
             }
             "S_ADDC_U32" | "S_SUBB_U32" => {
                 // with SCC as the carry in / borrow in, and the carry / borrow out in SCC
@@ -1314,13 +1335,15 @@ impl<I: Ir> Lower<'_, I> {
     /// operands are read as numbers (a mask read whole is refused, as everywhere), the mask a
     /// VALU reads lane by lane (`v_cndmask_b32`'s selector, a carry-in) as a number holding only
     /// this lane's bit, and a mask it writes (a compare, a carry-out) comes back as this lane's
-    /// bit of the ballot it makes. Instructions writing EXEC are not taken.
+    /// bit of the ballot it makes. Of the instructions writing EXEC, only `v_cmpx_*` is taken.
     fn bridge(&mut self, b: usize, d: &Decoded, in_store_block: bool) -> R<()> {
         let name = d.inst.name;
         let (whole, written) = super::x64_masks::uses(d);
         let (_, explicit_w) = rdna2::sgpr_uses(d);
         let writes = explicit_w.iter().fold(written, |m, &r| m | 1u128 << r);
-        if writes & (3 << 126) != 0 || name.starts_with("V_CMPX") {
+        // `v_cmpx_*`: EXEC goes in as this lane's bit and comes back as its bit of the result
+        let cmpx = name.starts_with("V_CMPX");
+        if writes & (3 << 126) != 0 && !cmpx {
             return Err("writes EXEC".into());
         }
         if name == "S_BARRIER" && self.partial[b] {
@@ -1338,14 +1361,20 @@ impl<I: Ir> Lower<'_, I> {
         let operand = |input: bool, ty: &str| d.ienc.operands.iter().any(|o| o.input == input && o.output != input && o.ty == ty);
         let mut inputs: Vec<(Var, I::V)> = Vec::new();
         // SGPRs read whole: numbers (EXEC included, which holds a mask here: refused)
-        for r in (0..128u8).filter(|&r| whole >> r & 1 != 0 && r != 125) {
+        for r in (0..128u8).filter(|&r| whole >> r & 1 != 0 && r != 125 && !(cmpx && r >= EXEC)) {
             let v = self.read_num(b, r)?;
             inputs.push((Var::S(r), v));
         }
         // a mask read lane by lane: a number with only this lane's bit
         let vop3 = d.enc.name.starts_with("ENC_VOP3") || d.enc.name.starts_with("VOP3");
-        if matches!(name, "V_CNDMASK_B32" | "V_ADD_CO_CI_U32" | "V_SUB_CO_CI_U32" | "V_SUBREV_CO_CI_U32") {
-            let m = if vop3 { rdna2::field_value(d.enc, &d.words, "SRC2").unwrap_or(0) } else { VCC as u64 };
+        let lane_mask = if cmpx {
+            Some(EXEC as u64)
+        } else if matches!(name, "V_CNDMASK_B32" | "V_ADD_CO_CI_U32" | "V_SUB_CO_CI_U32" | "V_SUBREV_CO_CI_U32") {
+            Some(if vop3 { rdna2::field_value(d.enc, &d.words, "SRC2").unwrap_or(0) } else { VCC as u64 })
+        } else {
+            None
+        };
+        if let Some(m) = lane_mask {
             if m > 127 {
                 return Err(format!("{name}: mask operand {m}"));
             }
@@ -1394,7 +1423,7 @@ impl<I: Ir> Lower<'_, I> {
         if writes_scc {
             outputs.push(Var::Scc);
         }
-        let guard = if in_store_block || !self.guarded.contains(&d.pc) { self.ir.boolean(true) } else { self.read_bit(b, EXEC)? };
+        let guard = if cmpx || in_store_block || !self.guarded.contains(&d.pc) { self.ir.boolean(true) } else { self.read_bit(b, EXEC)? };
         let vals = self.ir.foreign(d, guard, &inputs, &outputs)?;
         for (&var, &v) in outputs.iter().zip(&vals) {
             match var {
@@ -1837,8 +1866,8 @@ pub(crate) mod tests {
     }
 
     pub(crate) type I = (&'static str, &'static str, &'static [(&'static str, u64)]);
-    const V: u64 = 256;
-    const ENDPGM: I = ("S_ENDPGM", "ENC_SOPP", &[("SIMM16", 0)]);
+    pub(crate) const V: u64 = 256;
+    pub(crate) const ENDPGM: I = ("S_ENDPGM", "ENC_SOPP", &[("SIMM16", 0)]);
 
     // wave32 programs shared by the CPU tests and the comparison with the HLSL path
     pub(crate) const STRAIGHT: &[I] = &[
@@ -2332,6 +2361,36 @@ pub(crate) mod tests {
         }
         rdna2::resolve_far_jumps(&mut out);
         out
+    }
+
+    /// `s_wqm` of a mask sets every lane of a quad with a bit; `s_cselect` picks a mask or a
+    /// number by SCC.
+    #[test]
+    fn whole_quad_mode_and_conditional_selects() {
+        let lines: &[I] = &[
+            // vcc = lane 5 only; s0 = wqm(vcc) = lanes 4–7
+            ("V_CMP_EQ_U32", "ENC_VOPC", &[("SRC0", 133), ("VSRC1", 0)]),
+            ("S_WQM_B32", "ENC_SOP1", &[("SDST", 0), ("SSRC0", 106)]),
+            ("V_CNDMASK_B32", "ENC_VOP3", &[("VDST", 1), ("SRC0", 128), ("SRC1", 129), ("SRC2", 0)]),
+            // scc = (0 == 0): s1 = s0 (a mask), s2 = 5
+            ("S_CMP_EQ_U32", "ENC_SOPC", &[("SSRC0", 128), ("SSRC1", 128)]),
+            ("S_CSELECT_B32", "ENC_SOP2", &[("SDST", 1), ("SSRC0", 0), ("SSRC1", 128)]),
+            ("S_CSELECT_B32", "ENC_SOP2", &[("SDST", 2), ("SSRC0", 133), ("SSRC1", 135)]),
+            ("V_CNDMASK_B32", "ENC_VOP3", &[("VDST", 2), ("SRC0", 128), ("SRC1", 129), ("SRC2", 1)]),
+            // scc = (0 == 1): s3 = 7, s4 = no lanes
+            ("S_CMP_EQ_U32", "ENC_SOPC", &[("SSRC0", 128), ("SSRC1", 129)]),
+            ("S_CSELECT_B32", "ENC_SOP2", &[("SDST", 3), ("SSRC0", 133), ("SSRC1", 135)]),
+            ("S_CSELECT_B32", "ENC_SOP2", &[("SDST", 4), ("SSRC0", 0), ("SSRC1", 128)]),
+            ("V_CNDMASK_B32", "ENC_VOP3", &[("VDST", 3), ("SRC0", 128), ("SRC1", 129), ("SRC2", 4)]),
+            ENDPGM,
+        ];
+        let (s, v) = state(32);
+        let (s, v) = run(lines, false, &s, &v);
+        assert_eq!((s[2], s[3]), (5, 7));
+        for (l, regs) in v.iter().enumerate() {
+            let quad = (4..8).contains(&l) as u32;
+            assert_eq!((regs[1], regs[2], regs[3]), (quad, quad, 0), "lane {l}");
+        }
     }
 
     /// `s_addc_u32` / `s_subb_u32` take SCC as the carry / borrow in and leave theirs in SCC.

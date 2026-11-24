@@ -414,6 +414,25 @@ impl<I: Ir> Lower<'_, I> {
         let name = d.inst.name;
         let fv = |f: &str| rdna2::field_value(d.enc, &d.words, f).unwrap_or(0);
         let (s0, sd) = (fv("SSRC0"), fv("SDST") as u8);
+        // `s_wqm` of a mask (`s_wqm_b64 exec, exec`): a lane's bit is set when any lane of its
+        // quad has its bit; the quad is in the lane's own half of the mask
+        let wqm = if self.wave64 { "S_WQM_B64" } else { "S_WQM_B32" };
+        if name == wqm {
+            let Some((r, false)) = self.mask_reg(b, s0) else { return Err(format!("unsupported {name} of a number")) };
+            let [lo, hi] = self.mask_words(b, r, true)?;
+            let lane = self.lane();
+            let (c32, c28, f) = (self.c(32), self.c(28), self.c(0xF));
+            let upper = self.ir.icmp(Cmp::Uge, lane, c32);
+            let w = self.ir.select(upper, hi, lo);
+            let q = self.ir.bin(Bin::And, lane, c28);
+            let w = self.ir.bin(Bin::LShr, w, q);
+            let w = self.ir.bin(Bin::And, w, f);
+            let z = self.c(0);
+            let bit = self.ir.icmp(Cmp::Ne, w, z);
+            self.write_bit(b, sd, bit);
+            self.write_scc(b, bit);
+            return Ok(true);
+        }
         let (ones, count) = match name {
             "S_BCNT1_I32_B32" | "S_BCNT1_I32_B64" => (true, true),
             "S_BCNT0_I32_B32" | "S_BCNT0_I32_B64" => (false, true),

@@ -65,6 +65,14 @@ impl DxilIr {
         }
     }
 
+    /// `Lw`'s entry block jumps to the first `Ir` block, as `kernel.rs` ends it, then `Lw::finish`.
+    fn finish(mut self, numthreads: [u32; 3], hw: u32) -> Result<crate::gpu::dxil::kernel::Kernel, String> {
+        let first = *self.blocks.first().ok_or("no blocks")?;
+        self.lw.s.m.set_block(Block(0));
+        self.lw.s.m.br(first);
+        self.lw.finish(numthreads, hw)
+    }
+
     fn bytes(&mut self, dword: Value) -> Value {
         let four = self.lw.s.m.i32c(4);
         self.lw.s.m.bin(BinOp::Mul, dword, four)
@@ -92,7 +100,8 @@ impl Sink for DxilIr {
 
 impl Ir for DxilIr {
     fn new_block(&mut self) -> usize {
-        let b = if self.blocks.is_empty() { self.lw.s.m.entry_block() } else { self.lw.s.m.new_block() };
+        // not `Block(0)`: `Lw` keeps writing there (static samplers, scratch) until `finish`
+        let b = self.lw.s.m.new_block();
         self.blocks.push(b);
         self.tails.push(b);
         self.blocks.len() - 1
@@ -248,7 +257,7 @@ impl Ir for DxilIr {
 pub fn kernel(insts: &[Decoded], wave64: bool) -> Result<(Vec<u8>, Vec<u8>), String> {
     let (ir, stale) = lower::lower_kernel(insts, wave64, DxilIr::new(insts, wave64, &Entry::Kernel))?;
     let lanes = if wave64 { 64 } else { 32 };
-    Ok((ir.lw.finish([lanes, 1, 1], lanes)?.dxil, stale))
+    Ok((ir.finish([lanes, 1, 1], lanes)?.dxil, stale))
 }
 
 /// `compute` from the program's code (decoded, far jumps resolved).
@@ -284,7 +293,7 @@ pub fn survey_compute_code(code: &[u8], cs: &super::CsInterface, wave64: bool) -
 /// A compute program in its per-lane form, as a signed DXIL container.
 pub fn compute(insts: &[Decoded], cs: &super::CsInterface, wave64: bool) -> Result<Vec<u8>, String> {
     let ir = lower::lower_compute(insts, cs, wave64, DxilIr::new(insts, wave64, &Entry::Compute(cs.clone())))?;
-    Ok(ir.lw.finish(cs.threads, if wave64 { 64 } else { 32 })?.dxil)
+    Ok(ir.finish(cs.threads, if wave64 { 64 } else { 32 })?.dxil)
 }
 
 
@@ -318,7 +327,7 @@ pub fn compute_with(code: &[u8], cs: &super::CsInterface, o: KernelOptions) -> R
         .stack_size(256 << 20)
         .spawn(move || {
             let ir = lower::lower_compute(&insts, &cs, o.wave64, DxilIr::with(&insts, o, &Entry::Compute(cs.clone())))?;
-            ir.lw.finish(cs.threads, if o.wave64 { 64 } else { 32 })
+            ir.finish(cs.threads, if o.wave64 { 64 } else { 32 })
         })
         .map_err(|e| format!("per-lane thread: {e}"))?
         .join()
@@ -339,6 +348,35 @@ mod tests {
             return false;
         }
         true
+    }
+
+    /// An instruction lowered by #1426 that writes to `Lw`'s entry block after the program's
+    /// blocks are written (scratch) gives a container, and runs.
+    #[test]
+    fn a_bridged_instruction_may_write_to_the_entry_block() {
+        // scratch through #1426's lowering: its array is allocated in `Lw`'s entry block once
+        // the program's blocks are written (an "instruction after a terminator" before)
+        let lines: &[I] = &[
+            ("V_MOV_B32", "ENC_VOP1", &[("VDST", 1), ("SRC0", V)]),
+            ("SCRATCH_STORE_DWORD", "ENC_FLAT_SCRATCH", &[("ADDR", 2), ("DATA", 1), ("SADDR", 0x7F)]),
+            ("SCRATCH_LOAD_DWORD", "ENC_FLAT_SCRATCH", &[("VDST", 3), ("ADDR", 2), ("SADDR", 0x7F)]),
+            ENDPGM,
+        ];
+        let dxil = super::kernel(&decode(lines), false).map(|r| r.0);
+        let dxil = dxil.unwrap_or_else(|e| panic!("{e}"));
+        if !gpu() {
+            return;
+        }
+        let (s, v) = state(32);
+        let mut st = runner::KernelState::default();
+        st.sgpr.copy_from_slice(&s);
+        for (l, regs) in v.iter().enumerate() {
+            st.vgpr[l][..regs.len()].copy_from_slice(regs);
+        }
+        let out = runner::run(&dxil, &st, &[]).unwrap();
+        for l in 0..32 {
+            assert_eq!(out.vgpr[l][3], l as u32, "lane {l}");
+        }
     }
 
     /// The per-lane form as real DXIL on the GPU agrees with the lowering run on the CPU (and so
