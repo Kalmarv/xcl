@@ -14,6 +14,8 @@ pub mod container;
 mod dominance;
 pub mod dxop;
 #[cfg(test)]
+mod fixture_tests;
+#[cfg(test)]
 pub(crate) mod fixtures;
 mod meta;
 pub mod module;
