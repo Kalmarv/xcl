@@ -352,6 +352,14 @@ impl<'a, I: Ir> Lower<'a, I> {
         if self.wave_salu(b, d)? {
             return Ok(());
         }
+        if name == "S_GETPC_B64" {
+            // the address after it, as the program's offset (#1426's `s_getpc_b64`): read only by
+            // the far jump `resolve_far_jumps` resolved
+            let (lo, hi) = (self.ir.int((d.pc + d.len as u64) as u32), self.ir.int(0));
+            self.write_num(b, sd, lo);
+            self.write_num(b, sd + 1, hi);
+            return Ok(());
+        }
         let width = if self.wave64 { "_B64" } else { "_B32" };
         // mask-width ops: on lane bits when they write EXEC, are a saveexec, or read a mask
         if let Some(base) = name.strip_suffix(width) {
@@ -429,6 +437,25 @@ impl<'a, I: Ir> Lower<'a, I> {
                 let scc = if carry { self.ir.icmp(Cmp::Ult, v, a) } else { self.ir.icmp(Cmp::Ult, a, c) };
                 self.write_num(b, sd, v);
                 self.write_scc(b, scc);
+            }
+            "S_ADDC_U32" | "S_SUBB_U32" => {
+                // with SCC as the carry in / borrow in, and the carry / borrow out in SCC
+                let (a, c) = (self.src(b, d, s0)?, self.src(b, d, s1)?);
+                let cin = self.read_scc(b);
+                let cin = self.ir.zext(cin);
+                let (v, out) = if name == "S_ADDC_U32" {
+                    let t = self.ir.bin(Bin::Add, a, c);
+                    let v = self.ir.bin(Bin::Add, t, cin);
+                    let (c1, c2) = (self.ir.icmp(Cmp::Ult, t, a), self.ir.icmp(Cmp::Ult, v, t));
+                    (v, self.ir.bin(Bin::Or, c1, c2))
+                } else {
+                    let t = self.ir.bin(Bin::Sub, a, c);
+                    let v = self.ir.bin(Bin::Sub, t, cin);
+                    let (b1, b2) = (self.ir.icmp(Cmp::Ult, a, c), self.ir.icmp(Cmp::Ult, t, cin));
+                    (v, self.ir.bin(Bin::Or, b1, b2))
+                };
+                self.write_num(b, sd, v);
+                self.write_scc(b, out);
             }
             "S_ADD_I32" | "S_SUB_I32" => {
                 let (a, c) = (self.src(b, d, s0)?, self.src(b, d, s1)?);
@@ -1106,7 +1133,7 @@ fn lower_with<I: Ir>(insts: &[Decoded], stage: Stage, wave64: bool, mut ir: I, s
         for i in block.insts.clone() {
             let d = &insts[i];
             let name = d.inst.name;
-            if i == last && (name.starts_with("S_CBRANCH") || name == "S_BRANCH" || name.starts_with("S_ENDPGM")) {
+            if i == last && (name.starts_with("S_CBRANCH") || name == "S_BRANCH" || name.starts_with("S_ENDPGM") || d.far_target.is_some()) {
                 break;
             }
             if let Some(&(_, s, c)) = split.next_if(|x| x.0 == i) {
@@ -2303,7 +2330,55 @@ pub(crate) mod tests {
             off += d.len;
             out.push(d);
         }
+        rdna2::resolve_far_jumps(&mut out);
         out
+    }
+
+    /// `s_addc_u32` / `s_subb_u32` take SCC as the carry / borrow in and leave theirs in SCC.
+    #[test]
+    fn add_with_carry_and_subtract_with_borrow() {
+        let lines: &[I] = &[
+            ("S_MOV_B32", "ENC_SOP1", &[("SDST", 0), ("SSRC0", 255), ("LITERAL", 0xFFFF_FFFF)]),
+            ("S_ADD_U32", "ENC_SOP2", &[("SDST", 1), ("SSRC0", 0), ("SSRC1", 129)]),
+            ("S_ADDC_U32", "ENC_SOP2", &[("SDST", 2), ("SSRC0", 128), ("SSRC1", 128)]),
+            ("S_ADDC_U32", "ENC_SOP2", &[("SDST", 5), ("SSRC0", 0), ("SSRC1", 128)]),
+            ("S_SUB_U32", "ENC_SOP2", &[("SDST", 3), ("SSRC0", 128), ("SSRC1", 129)]),
+            ("S_SUBB_U32", "ENC_SOP2", &[("SDST", 4), ("SSRC0", 133), ("SSRC1", 129)]),
+            ("S_SUBB_U32", "ENC_SOP2", &[("SDST", 6), ("SSRC0", 133), ("SSRC1", 129)]),
+            ENDPGM,
+        ];
+        let (s, v) = state(32);
+        let (s, _) = run(lines, false, &s, &v);
+        // 0xFFFFFFFF + 1 = 0 carry 1; 0 + 0 + 1 = 1; 0xFFFFFFFF + 0 + 0 = 0xFFFFFFFF
+        assert_eq!((s[1], s[2], s[5]), (0, 1, 0xFFFF_FFFF));
+        // 0 - 1 = 0xFFFFFFFF borrow 1; 5 - 1 - 1 = 3; 5 - 1 - 0 = 4
+        assert_eq!((s[3], s[4], s[6]), (0xFFFF_FFFF, 3, 4));
+    }
+
+    /// A far jump (`s_getpc_b64`, a constant added, `s_setpc_b64`, as a retail program jumps
+    /// over a long `then` block) is a plain jump: the lanes skip the instructions it jumps over.
+    #[test]
+    fn a_far_jump_skips_what_it_jumps_over() {
+        let far: &[I] = &[
+            ("V_MOV_B32", "ENC_VOP1", &[("VDST", 1), ("SRC0", 135)]),
+            ("S_GETPC_B64", "ENC_SOP1", &[("SDST", 2)]),
+            ("S_ADD_U32", "ENC_SOP2", &[("SDST", 2), ("SSRC0", 2), ("SSRC1", 255), ("LITERAL", 32)]),
+            ("S_ADDC_U32", "ENC_SOP2", &[("SDST", 3), ("SSRC0", 3), ("SSRC1", 128)]),
+            ("S_SETPC_B64", "ENC_SOP1", &[("SSRC0", 2)]),
+            ("V_MOV_B32", "ENC_VOP1", &[("VDST", 1), ("SRC0", 136)]),
+            ("V_MOV_B32", "ENC_VOP1", &[("VDST", 1), ("SRC0", 137)]),
+            ("V_MOV_B32", "ENC_VOP1", &[("VDST", 1), ("SRC0", 138)]),
+            ("V_MOV_B32", "ENC_VOP1", &[("VDST", 1), ("SRC0", 139)]),
+            ("V_ADD_NC_U32", "ENC_VOP2", &[("VDST", 2), ("SRC0", V + 1), ("VSRC1", 0)]),
+            ENDPGM,
+        ];
+        let (s, v) = state(32);
+        let (s, v) = run(far, false, &s, &v);
+        // the address it computed: after `s_getpc_b64` (8) plus 32, past the four moves
+        assert_eq!((s[2], s[3]), (40, 0));
+        for (l, regs) in v.iter().enumerate() {
+            assert_eq!((regs[1], regs[2]), (7, 7 + l as u32), "lane {l}");
+        }
     }
 
     /// The kernel run on the CPU: initial (sgpr, vgpr[lane]) → final ones.
