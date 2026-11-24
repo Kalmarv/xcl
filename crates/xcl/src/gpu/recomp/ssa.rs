@@ -24,6 +24,8 @@ pub enum Var {
     M(u8),
     V(u16),
     Scc,
+    /// whether this lane ran analysis block n since the head of its region (`i1`; `Lower::repair`)
+    Ran(u32),
 }
 
 /// What the construction needs from the module builder.

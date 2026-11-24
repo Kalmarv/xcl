@@ -95,7 +95,7 @@ impl DxilIr {
 
     fn ty(&mut self, var: Var) -> crate::gpu::dxil::module::Ty {
         match var {
-            Var::M(_) | Var::Scc => self.lw.s.m.i1(),
+            Var::M(_) | Var::Scc | Var::Ran(_) => self.lw.s.m.i1(),
             Var::S(_) | Var::V(_) => self.lw.s.m.i32(),
         }
     }
@@ -254,7 +254,7 @@ impl Ir for DxilIr {
             Var::S(r) => r as u32,
             Var::V(n) => VAR_VGPR + n as u32,
             Var::Scc => VAR_SCC,
-            Var::M(_) => unreachable!("a lane-bit view is not a register"),
+            Var::M(_) | Var::Ran(_) => unreachable!("a lane-bit view is not a register"),
         };
         for &(v, x) in inputs {
             self.lw.wr(var(v), x);
@@ -475,10 +475,14 @@ mod tests {
             return;
         }
         let run = coalesced_run(false);
+        let (two, none) = (two_arms(false, BELOW_16), two_arms(false, NO_LANE));
         for (name, lines) in [
             ("straight", STRAIGHT),
             ("skipped if", SKIPPED_IF),
             ("region diamond", REGION_DIAMOND),
+            ("two arms", &two[..]),
+            ("two arms, no lane", &none[..]),
+            ("SCC in an arm", SCC_IN_ARM),
             ("leaving loop", LEAVING_LOOP),
             ("uniform loop", UNIFORM_LOOP),
             ("memory", MEMORY),

@@ -93,7 +93,7 @@ impl<I: Ir> Lower<'_, I> {
     }
 
     /// The lowest set bit of the 64-bit (lo, hi), `none` if none.
-    fn first_set(&mut self, [lo, hi]: [I::V; 2], none: u32) -> I::V {
+    pub(super) fn first_set(&mut self, [lo, hi]: [I::V; 2], none: u32) -> I::V {
         let z = self.ir.int(0);
         let (cl, ch) = (self.ctz(lo), self.ctz(hi));
         let c32 = self.ir.int(32);

@@ -177,6 +177,17 @@ struct Lower<'a, I: Ir> {
     /// per IR block of the program: its analysis block, and whether it is a coalesced run's
     /// block (only the lanes with their EXEC bit enter it)
     place: Vec<Option<(usize, bool)>>,
+    /// the stale-value repair (`repair`): per analysis block some lanes skip, the nearest one
+    /// every lane passes that dominates it (the head of its region); per analysis block, the
+    /// ones whose region it heads; the registers (and SCC) written in a block some lanes skip;
+    /// the ones a read may see at the start of each analysis block (`live_in`)
+    region_head: Vec<Option<usize>>,
+    heads: Vec<Vec<usize>>,
+    region_vars: Vec<Var>,
+    live: Vec<u128>,
+    /// the values a join broadcast (its IR block, the value), and the refusal of one it could not
+    repaired: HashSet<(usize, I::V)>,
+    unrepaired: std::collections::HashMap<I::V, &'static str>,
     /// the IR block each mask bit was written in, and the mask bits read (block, value)
     def_block: std::collections::HashMap<I::V, usize>,
     lane_uses: Vec<(usize, I::V)>,
@@ -384,7 +395,15 @@ impl<'a, I: Ir> Lower<'a, I> {
 
     fn write_scc(&mut self, b: usize, v: I::V) {
         let v = self.own(b, v, true);
+        self.in_region(b, Var::Scc);
         self.ssa.write(b, Var::Scc, v);
+    }
+
+    /// `var` written in IR block b: a join may have to repair it (`repair`).
+    fn in_region(&mut self, b: usize, var: Var) {
+        if self.partial[b] && !self.graphics && !self.region_vars.contains(&var) {
+            self.region_vars.push(var);
+        }
     }
 
     fn read_scc(&mut self, b: usize) -> I::V {
@@ -395,6 +414,7 @@ impl<'a, I: Ir> Lower<'a, I> {
 
     fn write_num(&mut self, b: usize, r: u8, v: I::V) {
         let v = self.own(b, v, false);
+        self.in_region(b, Var::S(r));
         self.ssa.write(b, Var::S(r), v);
         self.ssa.write(b, Var::M(r), self.bit_marker);
         if self.wave64 && r > 0 {
@@ -1001,8 +1021,23 @@ impl<'a, I: Ir> Lower<'a, I> {
     /// The hardware's whole-wave write left the absent lanes' bits 0 there; this lane kept its
     /// own older one. EXEC is not concerned: an absent lane's bit is 0 in both. Unless that
     /// block dominates c and c is in every loop it is in: then every lane reading in c passed
-    /// the write, in the same pass as the wave's last one.
+    /// the write, in the same pass as the wave's last one. Or a join broadcast it (`repair`).
     fn stale(&self, c: usize, v: I::V) -> bool {
+        self.each_stale(c, v, |_, _| true)
+    }
+
+    /// The values that make v stale in c (`stale`), with their IR blocks.
+    fn stale_leaves(&self, c: usize, v: I::V) -> Vec<(I::V, usize)> {
+        let mut out = Vec::new();
+        self.each_stale(c, v, |x, b| {
+            out.push((x, b));
+            false
+        });
+        out
+    }
+
+    /// `f` of each value that makes v stale in c and its IR block, until `f` is true; whether it was.
+    fn each_stale(&self, c: usize, v: I::V, mut f: impl FnMut(I::V, usize) -> bool) -> bool {
         let mut seen = HashSet::new();
         let mut work = vec![v];
         while let Some(v) = work.pop() {
@@ -1014,7 +1049,7 @@ impl<'a, I: Ir> Lower<'a, I> {
                 Some(ops) => work.extend_from_slice(ops),
                 None => {
                     if let Some(&b) = self.def_block.get(&v) {
-                        if self.def_owner[b] != self.use_owner[c] && self.partial[b] && !self.passed(b, c) {
+                        if self.def_owner[b] != self.use_owner[c] && self.partial[b] && !self.passed(b, c) && !self.repaired.contains(&(c, v)) && f(v, b) {
                             return true;
                         }
                     }
@@ -1022,6 +1057,99 @@ impl<'a, I: Ir> Lower<'a, I> {
             }
         }
         false
+    }
+
+    /// At the start of analysis block b. Where every lane meets again (b is not `partial`, its
+    /// phis are complete) after a block some lanes skipped (`partial` predecessor): the SGPRs and
+    /// SCC written in such blocks are repaired (`repair`). Then the region flags (`Var::Ran`): a
+    /// region's head clears those of its blocks, a block some lanes skip sets its own.
+    fn enter(&mut self, b: usize, sealed: bool, preds: &[usize]) {
+        let ib = blk(b);
+        if sealed && !self.partial[ib] && preds.iter().any(|&p| self.partial[p]) {
+            for var in self.region_vars.clone() {
+                let bit = match var {
+                    Var::S(r) => r as u32,
+                    _ => LIVE_SCC,
+                };
+                if self.live[b] >> bit & 1 != 0 {
+                    self.repair(ib, var);
+                }
+            }
+        }
+        if !self.heads[b].is_empty() {
+            let f = self.ir.boolean(false);
+            for w in self.heads[b].clone() {
+                self.ssa.write(ib, Var::Ran(w as u32), f);
+            }
+        }
+        if self.region_head[b].is_some() {
+            let t = self.ir.boolean(true);
+            self.ssa.write(ib, Var::Ran(b as u32), t);
+        }
+    }
+
+    /// `var` at the join j. The console's write of an SGPR (or SCC) reached the whole wave; a lane
+    /// that skipped the block w writing it kept its own older value. When w is the only such
+    /// block and every lane that ran w is here (`ran_at`), every lane takes the value of the first
+    /// lane that ran w; when none did, each keeps its own, as the console's wave skipped w. A
+    /// value two such blocks wrote is refused by name.
+    fn repair(&mut self, j: usize, var: Var) {
+        let v = self.read(j, var);
+        if var != Var::Scc && (self.ssa.resolve_value(v) == self.num_marker || self.reaches(v, self.num_marker)) {
+            return; // a mask on some way here
+        }
+        let leaves = self.stale_leaves(j, v);
+        let (x, w) = match leaves[..] {
+            [] => return,
+            [one] => one,
+            _ => {
+                for &(x, _) in &leaves {
+                    self.unrepaired.insert(x, "a scalar value written in more than one block while some lanes were elsewhere, read after they met again");
+                }
+                return;
+            }
+        };
+        let Some(ran) = self.ran_at(j, w) else {
+            return;
+        };
+        let [lo, hi] = self.ir.ballot(ran);
+        let hi = if self.wave64 { hi } else { self.ir.int(0) };
+        let first = self.first_set([lo, hi], 0);
+        let z = self.ir.int(0);
+        let any = self.ir.bin(Bin::Or, lo, hi);
+        let any = self.ir.icmp(Cmp::Ne, any, z);
+        // none ran: the lane's own value (its own lane is here)
+        let lane = self.lane();
+        let from = self.ir.select(any, first, lane);
+        let rep = if var == Var::Scc {
+            let n = self.ir.zext(v);
+            let n = self.ir.read_lane(n, from);
+            self.ir.icmp(Cmp::Ne, n, z)
+        } else {
+            self.num_uses.push(v);
+            self.ir.read_lane(v, from)
+        };
+        self.lane_uses.push((j, v));
+        self.repaired.insert((j, x));
+        self.def_block.entry(rep).or_insert(j);
+        self.ssa.write(j, var, rep);
+    }
+
+    /// The lane's flag of having run IR block w, at the join j, where every lane that ran it
+    /// since the head of its region is: w is a block of the program (not a coalesced run's,
+    /// which not every lane of its block enters), that head dominates j, and j is in every loop
+    /// the head or w is in (a lane that ran w cannot be in a later pass, nor still in a loop).
+    /// j is not `partial`, so every lane past a lane branch that reaches it gets there.
+    fn ran_at(&mut self, j: usize, w: usize) -> Option<I::V> {
+        let (Some((bw, false)), Some((bj, _))) = (self.place[w], self.place[j]) else {
+            return None;
+        };
+        let h = self.region_head[bw]?;
+        let sum = self.sum;
+        if h == bj || !sum.dominates(h, bj) || !sum.body.iter().flatten().all(|inside| !(inside[h] || inside[bw]) || inside[bj]) {
+            return None;
+        }
+        Some(self.read(j, Var::Ran(bw as u32)))
     }
 
     /// Whether every lane that gets to IR block c passed IR block w on the way, in the same pass
@@ -1108,6 +1236,66 @@ fn partial_blocks(sum: &Summary) -> Vec<bool> {
     partial
 }
 
+/// Bit 125 of a `live_in` set (NULL, no register): SCC.
+const LIVE_SCC: u32 = 125;
+
+/// Per analysis block, the SGPRs (bit n: s<n>) and SCC (`LIVE_SCC`) some read may see as they
+/// are at its start: the ones a join repairs (`Lower::repair`; its wave operations stay in the
+/// DXIL when nothing reads the result). A read missed here costs no correctness: it sees the
+/// stale value and is refused.
+fn live_in(insts: &[Decoded], sum: &Summary, end_reads_all: bool) -> Vec<u128> {
+    let scc = 1u128 << LIVE_SCC;
+    let vcc = 3u128 << VCC;
+    let regs = |v: &[u64]| v.iter().fold(0u128, |m, &r| m | 1 << r);
+    let gen_kill: Vec<(u128, u128)> = sum
+        .blocks
+        .iter()
+        .map(|block| {
+            let (mut gen, mut kill) = (0u128, 0u128);
+            for d in insts[block.insts.clone()].iter().rev() {
+                let (whole, written) = super::x64_masks::uses(d);
+                let mut r = whole | regs(&rdna2::sgpr_uses(d).0);
+                let mut w = written;
+                for o in d.ienc.operands.iter().filter(|o| o.implicit) {
+                    let bits = match o.ty {
+                        "OPR_VCC" => vcc,
+                        "OPR_SSRC_SPECIAL_SCC" => scc,
+                        _ => 0,
+                    };
+                    if o.input {
+                        r |= bits;
+                    }
+                    if o.output && bits == scc {
+                        w |= scc;
+                    }
+                }
+                if d.inst.name.starts_with("S_CBRANCH_VCC") {
+                    r |= vcc;
+                }
+                gen = r | (gen & !w);
+                kill |= w;
+            }
+            (gen, kill)
+        })
+        .collect();
+    let mut live = vec![0u128; sum.blocks.len()];
+    let mut changed = true;
+    while changed {
+        changed = false;
+        for &b in sum.order.iter().rev() {
+            let succ = &sum.blocks[b].succ;
+            let out = if succ.is_empty() && end_reads_all { !0 } else { succ.iter().fold(0, |m, s| m | live[s.0]) };
+            let (gen, kill) = gen_kill[b];
+            let x = gen | (out & !kill);
+            if x != live[b] {
+                live[b] = x;
+                changed = true;
+            }
+        }
+    }
+    live
+}
+
 /// Lowers a kernel-mode program (far jumps resolved) into `ir`, which gets it complete, with
 /// the mask registers whose value at the end may differ from the console's: written in a block
 /// some lanes skipped, so those lanes still hold their own older bits (`stale`). Nothing reads
@@ -1177,7 +1365,27 @@ fn lower_with<I: Ir>(insts: &[Decoded], stage: Stage, wave64: bool, mut ir: I, s
     let mut def_owner: Vec<usize> = (0..count).collect();
     let mut use_owner: Vec<usize> = (0..count).collect();
     let mut place = vec![None; count];
-    for (b, p) in partial_blocks(&sum).into_iter().enumerate() {
+    let pb = partial_blocks(&sum);
+    // a region: the blocks some lanes skip below the nearest dominator every lane passes
+    let region_head: Vec<Option<usize>> = (0..n)
+        .map(|b| {
+            let mut h = b;
+            while pb[h] {
+                if h == 0 || sum.idom[h] == usize::MAX {
+                    return None;
+                }
+                h = sum.idom[h];
+            }
+            (h != b).then_some(h)
+        })
+        .collect();
+    let mut heads = vec![Vec::new(); n];
+    for (b, h) in region_head.iter().enumerate() {
+        if let Some(h) = *h {
+            heads[h].push(b);
+        }
+    }
+    for (b, &p) in pb.iter().enumerate() {
         partial[blk(b)] = p;
         place[blk(b)] = Some((b, false));
         for &(_, s, c) in &splits[b] {
@@ -1240,6 +1448,12 @@ fn lower_with<I: Ir>(insts: &[Decoded], stage: Stage, wave64: bool, mut ir: I, s
         use_owner,
         unguarded: false,
         place,
+        region_head,
+        heads,
+        region_vars: Vec::new(),
+        live: live_in(insts, &sum, kernel),
+        repaired: HashSet::new(),
+        unrepaired: std::collections::HashMap::new(),
         def_block: std::collections::HashMap::new(),
         lane_uses: Vec::new(),
         dpp_src: None,
@@ -1388,6 +1602,9 @@ fn lower_with<I: Ir>(insts: &[Decoded], stage: Stage, wave64: bool, mut ir: I, s
         l.ir.at(ib);
         if !sealed[ib] {
             sealed[ib] = seal_ready(&mut l, &done, ib);
+        }
+        if !graphics {
+            l.enter(b, sealed[ib], &preds[ib]);
         }
         if b == 0 && !pixel {
             // the analysis takes the lanes that start the program as its EXEC (a PS keeps the
@@ -1565,8 +1782,22 @@ impl<I: Ir> Lower<'_, I> {
         if self.bit_uses.iter().any(|&v| self.reaches(v, self.bit_marker)) {
             self.note(Err("a number read as a mask (through a join)".into()))?;
         }
-        if self.lane_uses.iter().any(|&(c, v)| self.stale(c, v)) {
-            self.note(Err("a value written while some lanes were elsewhere, read after they met again".into()))?;
+        // each reason once: a value no join could repair (`repair`) by its own
+        let mut why: Vec<&'static str> = Vec::new();
+        let mut seen = HashSet::new();
+        for &(c, v) in &self.lane_uses {
+            if !seen.insert((c, self.ssa.resolve_value(v))) {
+                continue;
+            }
+            for (x, _) in self.stale_leaves(c, v) {
+                let w = self.unrepaired.get(&x).copied().unwrap_or("a value written while some lanes were elsewhere, read after they met again");
+                if !why.contains(&w) {
+                    why.push(w);
+                }
+            }
+        }
+        for w in why {
+            self.note(Err(w.into()))?;
         }
         stale.sort_unstable();
         stale.dedup();
@@ -1684,7 +1915,7 @@ impl<I: Ir> Lower<'_, I> {
                     let s = self.ir.icmp(Cmp::Ne, v, z);
                     self.write_scc(b, s);
                 }
-                Var::S(_) | Var::M(_) => {}
+                Var::S(_) | Var::M(_) | Var::Ran(_) => {}
             }
         }
         if name.starts_with("V_") && !sw.is_empty() {
@@ -1891,7 +2122,7 @@ pub(crate) mod tests {
             self.blocks[b].0.retain(|(id, _)| *id != old);
         }
         fn undef(&mut self, var: Var) -> u32 {
-            let bit = matches!(var, Var::M(_) | Var::Scc);
+            let bit = matches!(var, Var::M(_) | Var::Scc | Var::Ran(_));
             if let Some(&v) = self.undef.get(&bit) {
                 return v;
             }
@@ -2209,6 +2440,63 @@ pub(crate) mod tests {
         ("V_CNDMASK_B32", "ENC_VOP2", &[("VDST", 3), ("SRC0", 128), ("VSRC1", 0)]),
         ("V_ADD_NC_U32", "ENC_VOP2", &[("VDST", 2), ("SRC0", 4), ("VSRC1", 3)]),
         ("S_OR_B32", "ENC_SOP2", &[("SDST", 126), ("SSRC0", 126), ("SSRC1", 0)]),
+        ENDPGM,
+    ];
+    /// The if / else LLVM emits: `cond` (VCC); s_and_saveexec s0, vcc; s0 ^= exec;
+    /// s_cbranch_execz E; s_mov s4, 5; E: s_or_saveexec s0, s0; exec ^= s0; s_cbranch_execz J;
+    /// v_mov v1, 7; J: exec |= s0; v_add v2, s4, v0. The then arm writes s4, every lane reads it.
+    pub(crate) fn two_arms(wave64: bool, cond: I) -> Vec<I> {
+        let [and_save, xor, or_save, or] = if wave64 {
+            ["S_AND_SAVEEXEC_B64", "S_XOR_B64", "S_OR_SAVEEXEC_B64", "S_OR_B64"]
+        } else {
+            ["S_AND_SAVEEXEC_B32", "S_XOR_B32", "S_OR_SAVEEXEC_B32", "S_OR_B32"]
+        };
+        vec![
+            cond,
+            (and_save, "ENC_SOP1", &[("SDST", 0), ("SSRC0", 106)]),
+            (xor, "ENC_SOP2", &[("SDST", 0), ("SSRC0", 126), ("SSRC1", 0)]),
+            ("S_CBRANCH_EXECZ", "ENC_SOPP", &[("SIMM16", 1)]),
+            ("S_MOV_B32", "ENC_SOP1", &[("SDST", 4), ("SSRC0", 133)]),
+            (or_save, "ENC_SOP1", &[("SDST", 0), ("SSRC0", 0)]),
+            (xor, "ENC_SOP2", &[("SDST", 126), ("SSRC0", 126), ("SSRC1", 0)]),
+            ("S_CBRANCH_EXECZ", "ENC_SOPP", &[("SIMM16", 1)]),
+            ("V_MOV_B32", "ENC_VOP1", &[("VDST", 1), ("SRC0", 135)]),
+            (or, "ENC_SOP2", &[("SDST", 126), ("SSRC0", 126), ("SSRC1", 0)]),
+            ("V_ADD_NC_U32", "ENC_VOP2", &[("VDST", 2), ("SRC0", 4), ("VSRC1", 0)]),
+            ENDPGM,
+        ]
+    }
+    /// `two_arms`' conditions: 16 > v0, 0 > v0 (no lane), 40 > v0, 40 < v0
+    pub(crate) const BELOW_16: I = ("V_CMP_GT_U32", "ENC_VOPC", &[("SRC0", 144), ("VSRC1", 0)]);
+    pub(crate) const NO_LANE: I = ("V_CMP_GT_U32", "ENC_VOPC", &[("SRC0", 128), ("VSRC1", 0)]);
+    pub(crate) const BELOW_40: I = ("V_CMP_GT_U32", "ENC_VOPC", &[("SRC0", 168), ("VSRC1", 0)]);
+    pub(crate) const ABOVE_40: I = ("V_CMP_LT_U32", "ENC_VOPC", &[("SRC0", 168), ("VSRC1", 0)]);
+    /// v_cmp_gt_u32 vcc, 16, v0; s_and_saveexec s0, vcc; s_cbranch_execz J; s_cmp_eq_u32 0, 1;
+    /// J: s_mov exec, s0; s_cselect s5, 1, 2: SCC written in the arm, read after the join
+    pub(crate) const SCC_IN_ARM: &[I] = &[
+        ("V_CMP_GT_U32", "ENC_VOPC", &[("SRC0", 144), ("VSRC1", 0)]),
+        ("S_AND_SAVEEXEC_B32", "ENC_SOP1", &[("SDST", 0), ("SSRC0", 106)]),
+        ("S_CBRANCH_EXECZ", "ENC_SOPP", &[("SIMM16", 1)]),
+        ("S_CMP_EQ_U32", "ENC_SOPC", &[("SSRC0", 128), ("SSRC1", 129)]),
+        ("S_MOV_B32", "ENC_SOP1", &[("SDST", 126), ("SSRC0", 0)]),
+        ("S_CSELECT_B32", "ENC_SOP2", &[("SDST", 5), ("SSRC0", 129), ("SSRC1", 130)]),
+        ENDPGM,
+    ];
+    /// v_cmp_gt_u32 vcc, 16, v0; s_and_saveexec s0, vcc; s_cbranch_execz L; s_mov s4, 5;
+    /// v_cmp_gt_u32 vcc, 8, v0; s_and_saveexec s1, vcc; s_cbranch_execz M; s_mov s4, 9;
+    /// M: exec |= s1; L: exec |= s0; v_add v2, s4, v0: s4 written in two blocks some lanes skip
+    pub(crate) const NESTED_WRITES: &[I] = &[
+        ("V_CMP_GT_U32", "ENC_VOPC", &[("SRC0", 144), ("VSRC1", 0)]),
+        ("S_AND_SAVEEXEC_B32", "ENC_SOP1", &[("SDST", 0), ("SSRC0", 106)]),
+        ("S_CBRANCH_EXECZ", "ENC_SOPP", &[("SIMM16", 6)]),
+        ("S_MOV_B32", "ENC_SOP1", &[("SDST", 4), ("SSRC0", 133)]),
+        ("V_CMP_GT_U32", "ENC_VOPC", &[("SRC0", 136), ("VSRC1", 0)]),
+        ("S_AND_SAVEEXEC_B32", "ENC_SOP1", &[("SDST", 1), ("SSRC0", 106)]),
+        ("S_CBRANCH_EXECZ", "ENC_SOPP", &[("SIMM16", 1)]),
+        ("S_MOV_B32", "ENC_SOP1", &[("SDST", 4), ("SSRC0", 137)]),
+        ("S_OR_B32", "ENC_SOP2", &[("SDST", 126), ("SSRC0", 126), ("SSRC1", 1)]),
+        ("S_OR_B32", "ENC_SOP2", &[("SDST", 126), ("SSRC0", 126), ("SSRC1", 0)]),
+        ("V_ADD_NC_U32", "ENC_VOP2", &[("VDST", 2), ("SRC0", 4), ("VSRC1", 0)]),
         ENDPGM,
     ];
     /// s_mov s0, exec; L: v_add v1, v1, 1; v_cmp_ge_u32 vcc, v1, v0; exec &= ~vcc;
@@ -3367,13 +3655,43 @@ pub(crate) mod tests {
         lines.insert(6, ("V_CNDMASK_B32", "ENC_VOP2", &[("VDST", 3), ("SRC0", 128), ("VSRC1", 0)]));
         let err = lower_kernel(&decode(&lines), false, Interp::default()).err().expect("refused");
         assert!(err.contains("some lanes were elsewhere"), "{err}");
-        // written in the arm some lanes skip, read after the join: refused
-        let mut lines = SKIPPED_IF.to_vec();
-        lines[2] = ("S_CBRANCH_EXECZ", "ENC_SOPP", &[("SIMM16", 2)]);
-        lines.insert(3, ("S_MOV_B32", "ENC_SOP1", &[("SDST", 4), ("SSRC0", 133)]));
-        lines.insert(6, ("V_ADD_NC_U32", "ENC_VOP2", &[("VDST", 3), ("SRC0", 4), ("VSRC1", 1)]));
-        let err = lower_kernel(&decode(&lines), false, Interp::default()).err().expect("refused");
-        assert!(err.contains("some lanes were elsewhere"), "{err}");
+        // (written in an arm some lanes skip, read after the join: the next test)
+    }
+
+    #[test]
+    fn a_join_takes_the_scalar_value_the_lanes_that_ran_an_arm_wrote() {
+        // the then arm (lanes below 16) writes s4; every lane reads it after the join
+        let (s, v) = state(32);
+        let (s2, v2) = run(&two_arms(false, BELOW_16), false, &s, &v);
+        assert_eq!(s2[4], 5);
+        for (l, regs) in v2.iter().enumerate() {
+            assert_eq!((regs[1], regs[2]), (if l < 16 { 0 } else { 7 }, 5 + l as u32), "lane {l}");
+        }
+        // no lane runs it: the console's wave skips it, s4 keeps its value
+        let (s2, v2) = run(&two_arms(false, NO_LANE), false, &s, &v);
+        assert_eq!(s2[4], 0);
+        for (l, regs) in v2.iter().enumerate() {
+            assert_eq!((regs[1], regs[2]), (7, l as u32), "lane {l}");
+        }
+        // wave64: the arm's lanes are 0-39, or 41-63 (the first of them in the upper half)
+        let (s, v) = state(64);
+        for (cond, arm) in [(BELOW_40, 0..40), (ABOVE_40, 41..64)] {
+            let (s2, v2) = run(&two_arms(true, cond), true, &s, &v);
+            assert_eq!(s2[4], 5);
+            for (l, regs) in v2.iter().enumerate() {
+                assert_eq!((regs[1], regs[2]), (if arm.contains(&l) { 0 } else { 7 }, 5 + l as u32), "lane {l}");
+            }
+        }
+        // SCC written in the arm (s_cmp), read after the join (s_cselect)
+        let (s, v) = state(32);
+        let (s2, _) = run(SCC_IN_ARM, false, &s, &v);
+        assert_eq!(s2[5], 2);
+        // two blocks some lanes skip write s4 (an if in an if), read after both joins: refused
+        // by name, in the survey too
+        let err = lower_kernel(&decode(NESTED_WRITES), false, Interp::default()).err().expect("refused");
+        assert!(err.contains("more than one block"), "{err}");
+        let why = survey_compute(&decode(NESTED_WRITES), &compute_cs(), false, Interp::default());
+        assert_eq!(why, ["a scalar value written in more than one block while some lanes were elsewhere, read after they met again"]);
     }
 
     #[test]
@@ -3535,7 +3853,18 @@ pub(crate) mod tests {
             runner::skip_test(if !gpu_waves() { "no GPU with 32-lane waves" } else { "no DXC" });
             return;
         }
-        for (name, lines) in [("straight", STRAIGHT), ("skipped if", SKIPPED_IF), ("region diamond", REGION_DIAMOND), ("leaving loop", LEAVING_LOOP), ("uniform loop", UNIFORM_LOOP), ("memory", MEMORY)] {
+        let (two, none) = (two_arms(false, BELOW_16), two_arms(false, NO_LANE));
+        for (name, lines) in [
+            ("straight", STRAIGHT),
+            ("skipped if", SKIPPED_IF),
+            ("region diamond", REGION_DIAMOND),
+            ("two arms", &two[..]),
+            ("two arms, no lane", &none[..]),
+            ("SCC in an arm", SCC_IN_ARM),
+            ("leaving loop", LEAVING_LOOP),
+            ("uniform loop", UNIFORM_LOOP),
+            ("memory", MEMORY),
+        ] {
             let bytes: Vec<u8> = lines.iter().flat_map(|(n, e, f)| rdna2::encode(n, e, f, None).unwrap()).collect();
             let (s, v) = state(32);
             let mut st = runner::KernelState::default();
@@ -3686,6 +4015,7 @@ pub(crate) mod tests {
             return;
         }
         let reads = lane_reads(true);
+        let (two, upper) = (two_arms(true, BELOW_40), two_arms(true, ABOVE_40));
         // reads across the halves both ways: readlane of lane 41 (the lower half needs the
         // upper's), readfirstlane with EXEC from lane 40 up (the first lane is in the upper
         // half), and a 64-bit compare mask counted as a number
@@ -3708,6 +4038,9 @@ pub(crate) mod tests {
             ("uniform loop", UNIFORM_LOOP),
             ("memory", MEMORY_W64),
             ("lane reads", &reads[..]),
+            // a join's broadcast of s4 from the arm's first lane: one of the upper half for `upper`
+            ("two arms", &two[..]),
+            ("two arms, upper half", &upper[..]),
         ] {
             let insts = decode(lines);
             let (dxil, stale) = lower_dxil::kernel_split(&insts).unwrap_or_else(|e| panic!("{name}: {e}"));
