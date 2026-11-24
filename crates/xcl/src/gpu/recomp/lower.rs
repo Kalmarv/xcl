@@ -221,18 +221,6 @@ fn is_cross_lane(d: &Decoded) -> bool {
         || n.starts_with("DS_PERMUTE")
 }
 
-/// Implicit-derivative image instructions need quad-uniform control flow.
-fn needs_quad_convergence(n: &str) -> bool {
-    n == "IMAGE_GET_LOD"
-        || ((n.starts_with("IMAGE_SAMPLE") || n.starts_with("IMAGE_GATHER"))
-            && !n.contains("_L_")
-            && !n.ends_with("_L")
-            && !n.contains("_LZ")
-            && !n.contains("_D_")
-            && !n.ends_with("_D")
-            && !n.contains("_CD"))
-}
-
 /// Any write to an SGPR, mask (VCC / EXEC / M0), or SCC must run for all lanes outside a
 /// coalesced run (inactive lanes clear their bit in a VALU mask write rather than keeping it).
 fn writes_scalar_or_scc(d: &Decoded) -> bool {
@@ -267,7 +255,7 @@ fn must_branch(d: &Decoded) -> bool {
 }
 
 fn can_coalesce(d: &Decoded, guarded: &HashSet<u64>) -> bool {
-    guarded.contains(&d.pc) && !is_cross_lane(d) && !needs_quad_convergence(d.inst.name) && !writes_scalar_or_scc(d)
+    guarded.contains(&d.pc) && !is_cross_lane(d) && !whole_quad(d.inst.name) && !writes_scalar_or_scc(d)
 }
 
 /// Exclusive end of a block's non-terminator instructions.

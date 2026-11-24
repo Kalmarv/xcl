@@ -404,7 +404,7 @@ pub fn compute_with(code: &[u8], cs: &super::CsInterface, o: KernelOptions) -> R
         .stack_size(256 << 20)
         .spawn(move || {
             let ir = lower::lower_compute(&insts, &cs, o.wave64, DxilIr::with(&insts, o, &Entry::Compute(cs.clone())))?;
-            ir.finish(cs.threads, if o.wave64 { 64 } else { 32 })
+            ir.finish(cs.threads, if o.wave64 && !o.split { 64 } else { 32 })
         })
         .map_err(|e| format!("per-lane thread: {e}"))?
         .join()
@@ -625,6 +625,27 @@ mod tests {
                 let cpu = run_compute_waves(&lines, &cs, wave64, 2, &[100, 0], &mem);
                 assert_eq!(&gpu[..128], &cpu[..128], "{threads:?} wave64 {wave64}");
             }
+        }
+    }
+
+    /// A wave64 program in the split form through `compute_with` (the runtime's path on a GPU
+    /// with 32-lane waves only): 32-lane hardware waves (`WaveSize(32)`, not 64), the console's
+    /// wave64 results (MiguelMachado-dev found `compute_with` passing 64).
+    #[test]
+    fn the_runtime_path_takes_the_split_form() {
+        if !gpu() {
+            return;
+        }
+        for threads in ID_SHAPES {
+            let lines = ids_program(threads, true);
+            let cs = ids_cs(threads);
+            let bytes: Vec<u8> = lines.iter().flat_map(|(n, e, f)| crate::gpu::rdna2::encode(n, e, f, None).unwrap()).collect();
+            let o = super::KernelOptions { wave64: true, split: true, mem_windows: 1, sampler_base: 0 };
+            let k = super::compute_with(&bytes, &cs, o).unwrap_or_else(|e| panic!("{threads:?}: {e}"));
+            let mem = vec![0u32; 256];
+            let gpu = runner::dispatch(&k.dxil, [2, 1, 1], &[100, 0], &mem).unwrap_or_else(|e| panic!("{threads:?}: {e}"));
+            let cpu = run_compute_waves(&lines, &cs, true, 2, &[100, 0], &mem);
+            assert_eq!(&gpu[..128], &cpu[..128], "{threads:?}");
         }
     }
 
