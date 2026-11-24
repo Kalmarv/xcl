@@ -493,6 +493,12 @@ mod tests {
         }
     }
 
+    /// The integer programs of `lower`'s tests, as `f32_programs_on_the_gpu`.
+    #[test]
+    fn integer_programs_on_the_gpu() {
+        programs_on_the_gpu(&[("integer arithmetic", INT_ARITHMETIC, check_int_arithmetic, &[]), ("integer carries", INT_CARRIES, check_int_carries, &[])]);
+    }
+
     /// The f32 programs of `lower`'s tests on the GPU: the HLSL path gives the expected
     /// registers (`check_f32_*`, wave32), and the per-lane DXIL gives the HLSL path's, register
     /// for register (rcp within `f32_close`: HLSL's `rcp` is a fast fdiv). While the per-lane
