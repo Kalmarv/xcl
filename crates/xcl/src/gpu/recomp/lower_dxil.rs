@@ -7,8 +7,11 @@
 //! #1426's translator state (`gpu::dxil::lower::Lw`, built by `Lw::new` and finished by
 //! `Lw::finish`), so its per-entry setup (`setup_lanes_compute`) and its instruction
 //! lowering are reachable from here. A phi the SSA
-//! construction finds trivial has its uses replaced (`Module::replace_all_uses`); the phi itself
-//! stays in its block, unused.
+//! construction finds trivial has its uses replaced (`Module::replace_uses`); the phi itself
+//! stays in its block, unused. The replacements are collected and made in one pass in
+//! `DxilIr::finish`: one pass over the module per trivial phi made the lowering quadratic in
+//! the program's size, and nothing reads an instruction's operands back before then (the
+//! SSA construction resolves a replaced phi itself).
 
 use super::lower::{self, Bin, Cmp, Ir};
 use super::ssa::{Sink, Var};
@@ -17,7 +20,7 @@ use crate::gpu::dxil::lower::Lw;
 use crate::gpu::dxil::module::{BinOp, Block, CastOp, Pred, Value};
 use crate::gpu::dxil::shader::RawUav;
 use crate::gpu::rdna2::Decoded;
-use std::collections::BTreeSet;
+use std::collections::{BTreeSet, HashMap};
 
 struct DxilIr {
     lw: Lw,
@@ -36,6 +39,8 @@ struct DxilIr {
     /// lowering takes `lane()` before `compute_ids`, and in the split form the console lane
     /// is not the hardware lane (the upper half's are 32-63)
     ids: Option<(Value, [Value; 3])>,
+    /// trivial phis → what replaces their uses, made in the module by `finish`
+    replaced: HashMap<Value, Value>,
 }
 
 impl DxilIr {
@@ -85,7 +90,7 @@ impl DxilIr {
         };
         let io = lw.init.io.expect("the I/O buffer");
         let (res, mem) = (lw.res, lw.mems[0]);
-        DxilIr { lw, io, res, mem, blocks: Vec::new(), tails: Vec::new(), cur: 0, lanes_set, ids }
+        DxilIr { lw, io, res, mem, blocks: Vec::new(), tails: Vec::new(), cur: 0, lanes_set, ids, replaced: HashMap::new() }
     }
 
     fn ty(&mut self, var: Var) -> crate::gpu::dxil::module::Ty {
@@ -99,6 +104,8 @@ impl DxilIr {
     /// the lowering's blocks are sealed for `Lw`'s variables (every edge into them is known once
     /// the lowering is done), then `Lw::finish`.
     fn finish(mut self, numthreads: [u32; 3], hw: u32) -> Result<crate::gpu::dxil::kernel::Kernel, String> {
+        // the trivial phis' uses first, as `replace` would have left them
+        self.lw.s.m.replace_uses(&self.replaced);
         let first = *self.blocks.first().ok_or("no blocks")?;
         self.lw.s.m.set_block(Block(0));
         self.lw.br(first);
@@ -127,8 +134,9 @@ impl Sink for DxilIr {
         self.lw.s.m.add_incoming(phi, value, self.tails[pred]);
     }
     fn replace(&mut self, old: Value, new: Value) {
-        // every use of the trivial phi becomes `new`; the phi stays in its block, unused
-        self.lw.s.m.replace_all_uses(old, new);
+        // every use of the trivial phi becomes `new` (in `finish`); the phi stays in its
+        // block, unused
+        self.replaced.insert(old, new);
     }
     fn undef(&mut self, var: Var) -> Value {
         let t = self.ty(var);
