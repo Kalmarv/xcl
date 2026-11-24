@@ -2,9 +2,11 @@
 //! module: `dxil.dll`'s validator says whether a container is valid DXIL, and DXC's listing of
 //! a container is compared with its listing of what it compiles from HLSL for the same program.
 //! The libraries are the ones [`dxc`] loads. D3D12 does not need `dxil.dll` to accept a
-//! container, so nothing here is part of the program.
+//! container, so nothing here is part of the program. A container also runs on the GPU, through
+//! the kernel [`runner`].
 //!
-//! A test starts with `if !check::available() { return; }`.
+//! A test starts with `if !check::available() { return; }`, one that runs on the GPU with
+//! `if !check::gpu_available() { return; }` as well.
 
 use std::collections::BTreeSet;
 use std::ffi::c_void;
@@ -120,6 +122,37 @@ pub fn reference(hlsl: &str, entry: &str, profile: &str, extra: &[&str]) -> Resu
     let container = dxc::compile(hlsl, entry, profile, extra)?;
     let listing = disassemble(&container)?;
     Ok((container, listing))
+}
+
+/// Whether there is a GPU to [`run`] on. When there is none, the calling test is reported as
+/// `SKIPPED <test>: no GPU` and returns.
+pub fn gpu_available() -> bool {
+    if let Err(e) = runner::adapter() {
+        eprintln!("{e}");
+        runner::skip_test("no GPU");
+        return false;
+    }
+    true
+}
+
+/// Run a compute container on the GPU as the kernel runner runs a kernel ([`runner::run_with`]):
+/// XCL's ABI root signature, one thread group, `io` as the first dwords of u0, a zeroed u1,
+/// `textures[i]` at `ResourceDescriptorHeap[2 * i]` (its UAV at `2 * i + 1`) and `samplers[j]`
+/// at `SamplerDescriptorHeap[j]`. Returns u1 (`KERNEL_RES_DWORDS` dwords).
+pub fn run(container: &[u8], io: &[u32], textures: &[runner::TestTexture], samplers: &[runner::TestSampler]) -> Result<Vec<u32>, String> {
+    use super::super::{KERNEL_LANES, KERNEL_SCC_SLOT, KERNEL_SGPRS, KERNEL_VGPRS};
+    // the runner's u0 is the SGPRs, SCC in one of their slots, then each lane's VGPRs
+    let mut dwords = io.to_vec();
+    if dwords.len() > KERNEL_SGPRS + KERNEL_LANES * KERNEL_VGPRS {
+        return Err(format!("{} dwords do not fit u0", dwords.len()));
+    }
+    dwords.resize(KERNEL_SGPRS + KERNEL_LANES * KERNEL_VGPRS, 0);
+    let state = runner::KernelState {
+        sgpr: dwords[..KERNEL_SGPRS].to_vec(),
+        vgpr: dwords[KERNEL_SGPRS..].chunks(KERNEL_VGPRS).map(<[u32]>::to_vec).collect(),
+        scc: dwords[KERNEL_SCC_SLOT],
+    };
+    Ok(runner::run_with(container, &state, &[], textures, samplers)?.raw)
 }
 
 /// What the listings of two containers of one program may differ in.
@@ -290,6 +323,31 @@ define void @main() {
         let (_, other) = reference(&HLSL.replace("a * 3", "a * 5"), "main", "cs_6_6", &[]).unwrap();
         let said = compare(&other, &listing, &[SHADER_HASH]).unwrap_err();
         assert!(said.contains("- ours:      ") && said.contains("mul i32") && said.contains(", 5"), "{said}");
+    }
+
+    /// u0 reaches the program as it was given, past the runner's register slots too, and u1
+    /// comes back.
+    #[test]
+    fn a_dxc_container_runs_on_the_gpu() {
+        if !available() || !gpu_available() {
+            return;
+        }
+        let hlsl = "
+RWByteAddressBuffer io : register(u0);
+RWByteAddressBuffer res : register(u1);
+[numthreads(1, 1, 1)]
+void main() {
+    res.Store4(8, uint4(io.Load(0) * 3 + 1, io.Load(125 * 4), io.Load(128 * 4), io.Load(700 * 4)));
+}
+";
+        let container = dxc::compile(hlsl, "main", "cs_6_6", &[]).unwrap();
+        let mut io = vec![0u32; 701];
+        (io[0], io[125], io[128], io[700]) = (14, 0xDEAD_BEEF, 77, 0x1234_5678);
+        let res = run(&container, &io, &[], &[]).unwrap();
+        assert_eq!(res.len(), crate::gpu::recomp::KERNEL_RES_DWORDS);
+        assert_eq!(res[..7], [0, 0, 43, 0xDEAD_BEEF, 77, 0x1234_5678, 0]);
+        // What D3D12 refuses comes back as the error.
+        assert!(run(b"DXBC", &[], &[], &[]).unwrap_err().contains("CreateComputePipelineState"));
     }
 
     /// What `Differ::Tbaa` and `Differ::Ident` look for is what the DXC in use prints.
