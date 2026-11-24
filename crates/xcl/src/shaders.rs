@@ -1571,7 +1571,13 @@ fn direct_sweep(input: &Input, args: &[String], top: usize, json: bool, t0: std:
                         let time = t.elapsed();
                         if let (true, recomp::Mode::Compute(cs)) = (lanes, &mode) {
                             lanes_tried.fetch_add(1, Ordering::Relaxed);
-                            match recomp::lower_dxil::compute_with(code, cs, o) {
+                            // under the sweep's timeout too (the thread is left to finish)
+                            let (tx, rx) = std::sync::mpsc::channel();
+                            let (c, csc) = (code.to_vec(), cs.clone());
+                            std::thread::spawn(move || {
+                                let _ = tx.send(recomp::lower_dxil::compute_with(&c, &csc, o));
+                            });
+                            match rx.recv_timeout(timeout).unwrap_or_else(|_| Err(format!("timeout: over {} s", timeout.as_secs()))) {
                                 Ok(k) => {
                                     lanes_ok.fetch_add(1, Ordering::Relaxed);
                                     lanes_bytes.fetch_add(k.dxil.len(), Ordering::Relaxed);
