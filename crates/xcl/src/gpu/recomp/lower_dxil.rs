@@ -120,8 +120,13 @@ impl Ir for DxilIr {
     fn group_id(&mut self, k: u32) -> Value {
         self.s.group_id(k)
     }
-    fn thread_id(&mut self, k: u32) -> Value {
-        self.s.thread_id_in_group(k)
+    fn compute_ids(&mut self, threads: [u32; 3]) -> (Value, [Value; 3]) {
+        // 1-D groups only until `Lw::setup_lanes_compute` numbers 2-D / 3-D threads by arrival
+        // (`compute` refuses the others): a 1-D group's waves are its consecutive threads
+        debug_assert!(threads[1] * threads[2] == 1);
+        let flat = self.s.thread_id_in_group(0);
+        let zero = self.s.m.i32c(0);
+        (flat, [flat, zero, zero])
     }
     fn ballot(&mut self, c: Value) -> [Value; 2] {
         let w = self.s.wave_ballot(c);
@@ -194,6 +199,9 @@ pub fn compute_code(code: &[u8], cs: &super::CsInterface, wave64: bool) -> Resul
 
 /// A compute program in its per-lane form, as a signed DXIL container.
 pub fn compute(insts: &[Decoded], cs: &super::CsInterface, wave64: bool) -> Result<Vec<u8>, String> {
+    if cs.threads[1] * cs.threads[2] > 1 {
+        return Err("2-D / 3-D thread group (waits for Lw::setup_lanes_compute)".into());
+    }
     let ir = lower::lower_compute(insts, cs, wave64, DxilIr::new(false))?;
     Ok(ir.s.finish(cs.threads, Some(if wave64 { 64 } else { 32 })))
 }
