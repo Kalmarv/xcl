@@ -103,6 +103,11 @@ pub trait Ir: Sink {
     /// range reads 0 and writes nothing, as D3D12 raw buffers do
     fn mem_load(&mut self, addr: Self::V) -> Self::V;
     fn mem_store(&mut self, addr: Self::V, value: Self::V);
+    /// the 4 GiB memory windows the program addresses: with more than one, `mem_load` /
+    /// `mem_store` (window 0 only) are not used, and memory instructions go to `foreign`
+    fn mem_windows(&self) -> u32 {
+        1
+    }
     fn br(&mut self, target: usize);
     fn br_if(&mut self, c: Self::V, then: usize, otherwise: usize);
     fn ret(&mut self);
@@ -651,6 +656,9 @@ impl<'a, I: Ir> Lower<'a, I> {
     /// `s[sbase] + offset + soffset` (one memory window, as `emit::smem` with `mem_windows` 1).
     fn smem(&mut self, b: usize, d: &Decoded) -> R<()> {
         let name = d.inst.name;
+        if self.ir.mem_windows() > 1 {
+            return Err(format!("unsupported {name}: several memory windows"));
+        }
         let count = match name.strip_prefix("S_LOAD_") {
             Some("DWORD") => 1,
             Some("DWORDX2") => 2,
@@ -690,6 +698,9 @@ impl<'a, I: Ir> Lower<'a, I> {
     /// lowered in a block only those lanes enter (the caller's split).
     fn vmem(&mut self, b: usize, d: &Decoded) -> R<()> {
         let name = d.inst.name;
+        if self.ir.mem_windows() > 1 {
+            return Err(format!("unsupported {name}: several memory windows"));
+        }
         let op = name.trim_start_matches("GLOBAL_").trim_start_matches("FLAT_");
         let (store, count) = match op {
             "LOAD_DWORD" => (false, 1),
