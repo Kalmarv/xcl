@@ -131,6 +131,8 @@ struct Lower<'a, I: Ir> {
     /// a DPP instruction's first source, read from its source lane, and its write enable
     dpp_src: Option<I::V>,
     dpp_en: Option<I::V>,
+    /// survey mode (`survey_compute`): every refusal is noted here and the lowering goes on
+    noted: Option<Vec<String>>,
 }
 
 /// A vector memory store: a side effect inactive lanes must not have.
@@ -844,7 +846,21 @@ pub fn lower_compute<I: Ir>(insts: &[Decoded], cs: &super::CsInterface, wave64: 
     Ok(lower(insts, Stage::Compute(cs), wave64, ir)?.0)
 }
 
-fn lower<I: Ir>(insts: &[Decoded], stage: Stage, wave64: bool, mut ir: I) -> R<(I, Vec<u8>)> {
+fn lower<I: Ir>(insts: &[Decoded], stage: Stage, wave64: bool, ir: I) -> R<(I, Vec<u8>)> {
+    lower_with(insts, stage, wave64, ir, false).map(|(ir, stale, _)| (ir, stale))
+}
+
+/// Survey: every reason the per-lane form refuses a compute program, not only the first. An
+/// instruction it refuses is left out and the lowering goes on, so a later reason may follow
+/// from an earlier one; a program the lane-mask analysis refuses gives that one reason.
+pub fn survey_compute<I: Ir>(insts: &[Decoded], cs: &super::CsInterface, wave64: bool, ir: I) -> Vec<String> {
+    match lower_with(insts, Stage::Compute(cs), wave64, ir, true) {
+        Ok((_, _, noted)) => noted,
+        Err(e) => vec![e],
+    }
+}
+
+fn lower_with<I: Ir>(insts: &[Decoded], stage: Stage, wave64: bool, mut ir: I, survey: bool) -> R<(I, Vec<u8>, Vec<String>)> {
     let kernel = matches!(stage, Stage::Kernel);
     let sum = lane_masks::analyze(insts, wave64).map_err(|e| e.to_string())?;
     let n = sum.blocks.len();
@@ -926,6 +942,7 @@ fn lower<I: Ir>(insts: &[Decoded], stage: Stage, wave64: bool, mut ir: I) -> R<(
         lane_uses: Vec::new(),
         dpp_src: None,
         dpp_en: None,
+        noted: survey.then(Vec::new),
     };
     // the registers the program names, and the ones the runner reads back
     let mut sregs: Vec<u8> = vec![VCC, VCC + 1, 124, EXEC, EXEC + 1];
@@ -1067,35 +1084,46 @@ fn lower<I: Ir>(insts: &[Decoded], stage: Stage, wave64: bool, mut ir: I) -> R<(
                 done[cur] = true;
                 l.ir.at(s);
                 l.ssa.seal(&mut l.ir, s);
-                l.vmem(s, d)?;
+                let r = l.vmem(s, d);
+                l.note_inst(r, s, d)?;
                 l.ir.br(c);
                 done[s] = true;
                 l.ir.at(c);
                 l.ssa.seal(&mut l.ir, c);
                 cur = c;
-            } else if name.starts_with("S_LOAD_") || name.starts_with("S_BUFFER_LOAD_") {
-                l.smem(cur, d)?;
-            } else if name.starts_with("S_") {
-                l.salu(cur, d)?;
-            } else if name.starts_with("V_") {
-                l.valu(cur, d)?;
-            } else if name.starts_with("GLOBAL_") || name.starts_with("FLAT_") {
-                l.vmem(cur, d)?;
-            } else if name == "DS_SWIZZLE_B32" {
-                l.swizzle(cur, d)?;
             } else {
-                return Err(format!("unsupported {name}"));
+                let r = if name.starts_with("S_LOAD_") || name.starts_with("S_BUFFER_LOAD_") {
+                    l.smem(cur, d)
+                } else if name.starts_with("S_") {
+                    l.salu(cur, d)
+                } else if name.starts_with("V_") {
+                    l.valu(cur, d)
+                } else if name.starts_with("GLOBAL_") || name.starts_with("FLAT_") {
+                    l.vmem(cur, d)
+                } else if name == "DS_SWIZZLE_B32" {
+                    l.swizzle(cur, d)
+                } else {
+                    Err(format!("unsupported {name}"))
+                };
+                l.note_inst(r, cur, d)?;
             }
         }
         match block.succ.as_slice() {
             [] => l.ir.br(exit),
             [(t, Edge::Always)] => l.ir.br(blk(*t)),
             [(t, _), (f, _)] if t == f => l.ir.br(blk(*t)),
-            [(t, Edge::Taken), (f, Edge::NotTaken)] => {
-                let c = l.cond(cur, &insts[last])?;
-                l.ir.br_if(c, blk(*t), blk(*f));
+            [(t, Edge::Taken), (f, Edge::NotTaken)] => match l.cond(cur, &insts[last]) {
+                Ok(c) => l.ir.br_if(c, blk(*t), blk(*f)),
+                Err(e) => {
+                    l.note(Err(e))?;
+                    let c = l.ir.boolean(true);
+                    l.ir.br_if(c, blk(*t), blk(*f));
+                }
+            },
+            s => {
+                l.note(Err(format!("block {b}: successors {s:?}")))?;
+                l.ir.br(blk(s[0].0));
             }
-            s => return Err(format!("block {b}: successors {s:?}")),
         }
         done[cur] = true;
         for &(s, _) in &block.succ {
@@ -1201,25 +1229,49 @@ fn lower<I: Ir>(insts: &[Decoded], stage: Stage, wave64: bool, mut ir: I) -> R<(
 impl<I: Ir> Lower<'_, I> {
     /// Every phi is complete: no number may come from a mask, nor a mask bit from a number, nor
     /// a lane read a mask bit it kept from before a write it skipped.
-    fn finish(self, mut stale: Vec<u8>) -> R<(I, Vec<u8>)> {
-        for &v in &self.num_uses {
-            if self.reaches(v, self.num_marker) {
-                return Err("a mask read as a number (through a join)".into());
-            }
+    fn finish(mut self, mut stale: Vec<u8>) -> R<(I, Vec<u8>, Vec<String>)> {
+        if self.num_uses.iter().any(|&v| self.reaches(v, self.num_marker)) {
+            self.note(Err("a mask read as a number (through a join)".into()))?;
         }
-        for &v in &self.bit_uses {
-            if self.reaches(v, self.bit_marker) {
-                return Err("a number read as a mask (through a join)".into());
-            }
+        if self.bit_uses.iter().any(|&v| self.reaches(v, self.bit_marker)) {
+            self.note(Err("a number read as a mask (through a join)".into()))?;
         }
-        for &(c, v) in &self.lane_uses {
-            if self.stale(c, v) {
-                return Err("a value written while some lanes were elsewhere, read after they met again".into());
-            }
+        if self.lane_uses.iter().any(|&(c, v)| self.stale(c, v)) {
+            self.note(Err("a value written while some lanes were elsewhere, read after they met again".into()))?;
         }
         stale.sort_unstable();
         stale.dedup();
-        Ok((self.ir, stale))
+        Ok((self.ir, stale, self.noted.unwrap_or_default()))
+    }
+
+    /// A refused instruction in block b: as `note`, and in survey mode the SGPRs (and, for a
+    /// scalar instruction, SCC) it writes are left as 0 in both views (number and mask bit),
+    /// so that a later read does not report a refusal that only follows from this one.
+    fn note_inst(&mut self, r: R<()>, b: usize, d: &Decoded) -> R<()> {
+        if r.is_err() && self.noted.is_some() {
+            let (z, f) = (self.ir.int(0), self.ir.boolean(false));
+            for s in rdna2::sgpr_uses(d).1 {
+                if s < KERNEL_SGPRS as u64 && s != 125 {
+                    self.ssa.write(b, Var::S(s as u8), z);
+                    self.ssa.write(b, Var::M(s as u8), f);
+                }
+            }
+            if d.inst.name.starts_with("S_") {
+                self.ssa.write(b, Var::Scc, f);
+            }
+        }
+        self.note(r)
+    }
+
+    /// A refusal: the error, or in survey mode noted and passed over.
+    fn note(&mut self, r: R<()>) -> R<()> {
+        match (r, &mut self.noted) {
+            (Err(e), Some(n)) => {
+                n.push(e);
+                Ok(())
+            }
+            (r, _) => r,
+        }
     }
 }
 
@@ -1776,6 +1828,19 @@ pub(crate) mod tests {
         for (l, regs) in v.iter().enumerate() {
             assert_eq!((regs[1], regs[2]), (10, 10 + l as u32), "lane {l}");
         }
+    }
+
+    /// The survey goes on past a refused instruction: both are reported, and a program the
+    /// lowering takes gives none.
+    #[test]
+    fn the_survey_reports_every_refusal() {
+        let mut lines = STRAIGHT.to_vec();
+        lines.insert(2, ("V_ADD_F32", "ENC_VOP2", &[("VDST", 3), ("SRC0", V), ("VSRC1", 1)]));
+        lines.insert(4, ("V_MUL_F32", "ENC_VOP2", &[("VDST", 4), ("SRC0", V), ("VSRC1", 1)]));
+        let cs = compute_cs();
+        assert!(lower_compute(&decode(&lines), &cs, false, Interp::default()).is_err());
+        assert_eq!(survey_compute(&decode(&lines), &cs, false, Interp::default()), ["unsupported V_ADD_F32", "unsupported V_MUL_F32"]);
+        assert!(survey_compute(&decode(STRAIGHT), &cs, false, Interp::default()).is_empty());
     }
 
     #[test]

@@ -198,6 +198,31 @@ pub fn compute_code(code: &[u8], cs: &super::CsInterface, wave64: bool) -> Resul
     compute(&insts, cs, wave64)
 }
 
+/// Survey: every reason the per-lane form refuses a compute program (`lower::survey_compute`).
+pub fn survey_compute_code(code: &[u8], cs: &super::CsInterface, wave64: bool) -> Vec<String> {
+    let mut insts = Vec::new();
+    let mut off = 0usize;
+    while off + 4 <= code.len() {
+        match crate::gpu::rdna2::decode(&code[off..], off as u64) {
+            Ok(d) => {
+                off += d.len;
+                insts.push(d);
+            }
+            Err(e) => return vec![format!("cannot decode ({e:?})")],
+        }
+    }
+    crate::gpu::rdna2::resolve_far_jumps(&mut insts);
+    // a 2-D / 3-D group is noted as `compute` refuses it, and the rest surveyed as a 1-D group
+    // of as many threads (the thread ids differ, the instructions are the same)
+    if cs.threads[1] * cs.threads[2] > 1 {
+        let flat = super::CsInterface { threads: [cs.threads.iter().product(), 1, 1], ..cs.clone() };
+        let mut why = vec!["2-D / 3-D thread group (waits for Lw::setup_lanes_compute)".to_string()];
+        why.extend(lower::survey_compute(&insts, &flat, wave64, DxilIr::new(false)));
+        return why;
+    }
+    lower::survey_compute(&insts, cs, wave64, DxilIr::new(false))
+}
+
 /// A compute program in its per-lane form, as a signed DXIL container.
 pub fn compute(insts: &[Decoded], cs: &super::CsInterface, wave64: bool) -> Result<Vec<u8>, String> {
     if cs.threads[1] * cs.threads[2] > 1 {
