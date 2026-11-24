@@ -2131,6 +2131,13 @@ pub(crate) mod tests {
     }
 
     pub(crate) type I = (&'static str, &'static str, &'static [(&'static str, u64)]);
+    /// A GPU that runs `[WaveSize(32)]` programs, as the per-lane tests need (WARP, the CI
+    /// adapter, has neither 32 nor 64: skipped, as `recomp::tests::gpu_ready` does).
+    pub(crate) fn gpu_waves() -> bool {
+        use super::super::runner;
+        runner::adapter().is_ok() && runner::wave32_supported() == Ok(true)
+    }
+
     pub(crate) const V: u64 = 256;
     pub(crate) const ENDPGM: I = ("S_ENDPGM", "ENC_SOPP", &[("SIMM16", 0)]);
 
@@ -3442,8 +3449,8 @@ pub(crate) mod tests {
     #[test]
     fn the_lowering_agrees_with_the_hlsl_path_on_the_gpu() {
         use super::super::{dxc, runner, translate, Options};
-        if runner::adapter().is_err() || dxc::location().is_err() {
-            runner::skip_test(if runner::adapter().is_err() { "no GPU" } else { "no DXC" });
+        if !gpu_waves() || dxc::location().is_err() {
+            runner::skip_test(if !gpu_waves() { "no GPU with 32-lane waves" } else { "no DXC" });
             return;
         }
         for (name, lines) in [("straight", STRAIGHT), ("skipped if", SKIPPED_IF), ("leaving loop", LEAVING_LOOP), ("uniform loop", UNIFORM_LOOP), ("memory", MEMORY)] {
@@ -3534,8 +3541,8 @@ pub(crate) mod tests {
     #[test]
     fn the_wave64_lowering_agrees_with_the_hlsl_path_on_the_gpu() {
         use super::super::{dxc, runner, translate, Options};
-        if runner::adapter().is_err() || dxc::location().is_err() {
-            runner::skip_test(if runner::adapter().is_err() { "no GPU" } else { "no DXC" });
+        if !gpu_waves() || dxc::location().is_err() {
+            runner::skip_test(if !gpu_waves() { "no GPU with 32-lane waves" } else { "no DXC" });
             return;
         }
         if runner::wave64_supported() != Ok(true) {
@@ -3592,8 +3599,8 @@ pub(crate) mod tests {
     #[test]
     fn the_split_form_agrees_with_the_wave64_lowering_on_the_gpu() {
         use super::super::{lower_dxil, runner};
-        if runner::adapter().is_err() {
-            runner::skip_test("no GPU");
+        if !gpu_waves() {
+            runner::skip_test("no GPU with 32-lane waves");
             return;
         }
         let reads = lane_reads(true);
@@ -3736,8 +3743,8 @@ pub(crate) mod tests {
     #[test]
     fn a_2d_or_3d_group_agrees_with_the_hlsl_path_on_the_gpu() {
         use super::super::{dxc, runner, translate, Mode, Options};
-        if runner::adapter().is_err() || dxc::location().is_err() {
-            runner::skip_test(if runner::adapter().is_err() { "no GPU" } else { "no DXC" });
+        if !gpu_waves() || dxc::location().is_err() {
+            runner::skip_test(if !gpu_waves() { "no GPU with 32-lane waves" } else { "no DXC" });
             return;
         }
         for wave64 in [false, true] {
@@ -3764,8 +3771,8 @@ pub(crate) mod tests {
     #[test]
     fn a_compute_program_agrees_with_the_hlsl_path_on_the_gpu() {
         use super::super::{dxc, runner, translate, Mode, Options};
-        if runner::adapter().is_err() || dxc::location().is_err() {
-            runner::skip_test(if runner::adapter().is_err() { "no GPU" } else { "no DXC" });
+        if !gpu_waves() || dxc::location().is_err() {
+            runner::skip_test(if !gpu_waves() { "no GPU with 32-lane waves" } else { "no DXC" });
             return;
         }
         let bytes: Vec<u8> = COMPUTE.iter().flat_map(|(n, e, f)| rdna2::encode(n, e, f, None).unwrap()).collect();
@@ -4010,8 +4017,8 @@ pub(crate) mod tests {
     #[test]
     fn cross_lane_reads_agree_with_the_hlsl_path_on_the_gpu() {
         use super::super::{dxc, runner};
-        if runner::adapter().is_err() || dxc::location().is_err() {
-            runner::skip_test(if runner::adapter().is_err() { "no GPU" } else { "no DXC" });
+        if !gpu_waves() || dxc::location().is_err() {
+            runner::skip_test(if !gpu_waves() { "no GPU with 32-lane waves" } else { "no DXC" });
             return;
         }
         agrees_with_hlsl("lane reads, wave32", &lane_reads(false), false, &[]);
@@ -4236,8 +4243,8 @@ pub(crate) mod tests {
     #[test]
     fn coalesced_guarded_runs_agree_with_the_hlsl_path_on_the_gpu() {
         use super::super::{dxc, runner, translate, Options};
-        if runner::adapter().is_err() || dxc::location().is_err() {
-            runner::skip_test(if runner::adapter().is_err() { "no GPU" } else { "no DXC" });
+        if !gpu_waves() || dxc::location().is_err() {
+            runner::skip_test(if !gpu_waves() { "no GPU with 32-lane waves" } else { "no DXC" });
             return;
         }
         agrees_with_hlsl("coalesced breaks, wave32", COALESCED_BREAKS, false, &[]);

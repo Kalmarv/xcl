@@ -425,8 +425,8 @@ mod tests {
     use super::super::{dxc, runner, translate, Mode, Options};
 
     fn gpu() -> bool {
-        if runner::adapter().is_err() {
-            runner::skip_test("no GPU");
+        if !gpu_waves() {
+            runner::skip_test("no GPU with 32-lane waves");
             return false;
         }
         true
