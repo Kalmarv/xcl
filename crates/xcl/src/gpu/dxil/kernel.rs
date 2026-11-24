@@ -333,6 +333,11 @@ fn translate_on_this_thread(code: &[u8], o: KernelOptions, entry: Entry) -> Resu
     }
     lw.s.m.set_block(exit);
     lw.seal(exit);
+    // the epilogue uses values of the program's blocks, which were created after `exit`: it goes
+    // into a block of its own after them (only a phi may refer to a later block's value)
+    let tail = lw.block(Some(1));
+    lw.br(tail);
+    lw.s.m.set_block(tail);
     if let (Some(res), true) = (res, kernel) {
         store_registers(&mut lw, res);
     }
