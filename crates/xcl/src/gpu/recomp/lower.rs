@@ -1450,6 +1450,10 @@ impl<I: Ir> Lower<'_, I> {
         const DIFFERS_ON_1426: &[&str] = &[
             // f32 → f16 of a value below the smallest f16 denormal: 0 instead of rounding to it
             "V_CVT_F16_F32",
+            // f16 products round toward zero (`LegacyF32ToF16`) where the console rounds to
+            // nearest even (vladbondarenko97's f16 programs; itsSio is fixing it on `main`)
+            "V_MUL_F16",
+            "V_PK_MUL_F16",
         ];
         if DIFFERS_ON_1426.contains(&name) {
             return Err("its #1426 semantics differ from the console's".into());
