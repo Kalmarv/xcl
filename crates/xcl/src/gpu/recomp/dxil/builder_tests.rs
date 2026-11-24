@@ -10,18 +10,14 @@
 //! Checked with DXC 1.7.2308 (Windows SDK 10.0.26100) and 1.9.2609 (`XCL_DXC_DIR`).
 //! `XCL_DXIL_TEST_DUMP=<folder>` keeps both containers and the text of each fixture.
 
-use std::ffi::c_void;
-
-use windows::core::{Interface, GUID, HRESULT};
-use windows::Win32::Graphics::Direct3D::Dxc::{IDxcAssembler, IDxcUtils, CLSID_DxcAssembler, CLSID_DxcUtils, DXC_CP_UTF8};
 use windows::Win32::Graphics::Direct3D12::{D3D12_FILTER_MIN_MAG_MIP_POINT, D3D12_TEXTURE_ADDRESS_MODE_CLAMP};
 use windows::Win32::Graphics::Dxgi::Common::{DXGI_FORMAT_R32G32B32A32_FLOAT, DXGI_FORMAT_R32_UINT};
 
+use super::assemble::assemble;
 use super::check::{self, Differ};
 use super::dxop::{Component, HeapRes, Shape};
 use super::module::{flags, Binary, Cast, Fcmp, FnAttr, Func, Icmp, Module, Rmw, Ty, Val};
 use super::ops::opcode;
-use crate::gpu::recomp::dxc;
 use crate::gpu::recomp::pso::StaticSampler;
 use crate::gpu::recomp::runner::{self, TestSampler, TestTexture, TexDim};
 
@@ -42,33 +38,6 @@ struct Fixture {
     io: &'static [u32],
     /// the first dword of u1 after it, when the program writes one whatever the adapter
     res: Option<u32>,
-}
-
-/// The container DXC's assembler makes of a module's text (not signed: nothing here reads the
-/// digest). For these tests only: the program's own way to the assembler is not the builder's.
-fn assemble(text: &str) -> Result<Vec<u8>, String> {
-    type CreateInstance = unsafe extern "system" fn(*const GUID, *const GUID, *mut *mut c_void) -> HRESULT;
-    unsafe fn instance<T: Interface>(create: CreateInstance, class: &GUID) -> Result<T, String> {
-        let mut p = std::ptr::null_mut();
-        let hr = create(class, &T::IID, &mut p);
-        if hr.is_err() || p.is_null() {
-            return Err(format!("DxcCreateInstance: {hr:?}"));
-        }
-        Ok(T::from_raw(p))
-    }
-    unsafe {
-        let create = std::mem::transmute::<usize, CreateInstance>(dxc::create_instance().ok_or("no DXC")?);
-        let (utils, assembler): (IDxcUtils, IDxcAssembler) = (instance(create, &CLSID_DxcUtils)?, instance(create, &CLSID_DxcAssembler)?);
-        let blob = utils.CreateBlob(text.as_ptr() as *const c_void, text.len() as u32, DXC_CP_UTF8).map_err(|e| format!("CreateBlob: {e}"))?;
-        let result = assembler.AssembleToContainer(&blob).map_err(|e| format!("AssembleToContainer: {e}"))?;
-        let bytes = |pointer: *mut c_void, size: usize| std::slice::from_raw_parts(pointer as *const u8, size).to_vec();
-        if result.GetStatus().map_err(|e| format!("{e}"))?.is_err() {
-            let said = result.GetErrorBuffer().map_err(|e| format!("{e}"))?;
-            return Err(String::from_utf8_lossy(&bytes(said.GetBufferPointer(), said.GetBufferSize())).to_string());
-        }
-        let container = result.GetResult().map_err(|e| format!("{e}"))?;
-        Ok(bytes(container.GetBufferPointer(), container.GetBufferSize()))
-    }
 }
 
 /// The checks of the module comment.

@@ -268,6 +268,7 @@ pub fn same_listing(wrote: &[u8], assembled: &[u8]) -> Result<(), String> {
 
 #[cfg(test)]
 mod tests {
+    use super::super::assemble::assemble;
     use super::*;
 
     const HLSL: &str = "
@@ -497,24 +498,6 @@ void main() {
         container[program] = 0x65;
         let said = validate(&container).unwrap_err();
         assert!(said.contains("6.5") && said.contains("6.6"), "{said}");
-    }
-
-    /// The container `IDxcAssembler` makes of a listing. Only for the test below: the backend
-    /// has its own way from a module's text to a container.
-    fn assemble(listing: &str) -> Result<Vec<u8>, String> {
-        use windows::Win32::Graphics::Direct3D::Dxc::{CLSID_DxcAssembler, IDxcAssembler, DXC_CP_UTF8};
-        let utils: IDxcUtils = create(dxcompiler()?, &CLSID_DxcUtils)?;
-        let assembler: IDxcAssembler = create(dxcompiler()?, &CLSID_DxcAssembler)?;
-        unsafe {
-            let blob = utils.CreateBlob(listing.as_ptr() as *const c_void, listing.len() as u32, DXC_CP_UTF8).map_err(|e| format!("CreateBlob: {e}"))?;
-            let r = assembler.AssembleToContainer(&blob).map_err(|e| format!("AssembleToContainer: {e}"))?;
-            let status = r.GetStatus().map_err(|e| format!("{e}"))?;
-            if status.is_err() {
-                return Err(failure("AssembleToContainer", &r, status));
-            }
-            let container = r.GetResult().map_err(|e| format!("{e}"))?;
-            Ok(std::slice::from_raw_parts(container.GetBufferPointer() as *const u8, container.GetBufferSize()).to_vec())
-        }
     }
 
     /// DXC's listing of a container, assembled, is a container with the same listing but for
