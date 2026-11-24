@@ -1,7 +1,7 @@
 //! A DXIL module without HLSL: assembled and signed from LLVM IR text (`assemble`).
 //!
 //! Direct DXIL output (opt-in `XCL_RECOMP_DXIL=1`): the LLVM 3.7 bitcode DXIL is stored as, the
-//! DXBC container with its digest, and the table of the DXIL operations.
+//! DXBC container of a compute program with its digest, and the table of the DXIL operations.
 
 pub mod assemble;
 pub mod bitstream;
@@ -100,7 +100,7 @@ mod tests {
     }
 
     /// DXC's listing of a container.
-    fn disassemble(container: &[u8]) -> String {
+    pub(super) fn disassemble(container: &[u8]) -> String {
         use windows::core::{Interface, GUID, HRESULT};
         use windows::Win32::Graphics::Direct3D::Dxc::{DxcBuffer, IDxcBlob, IDxcCompiler3, IDxcResult, CLSID_DxcCompiler};
         type CreateInstance = unsafe extern "system" fn(*const GUID, *const GUID, *mut *mut std::ffi::c_void) -> HRESULT;
