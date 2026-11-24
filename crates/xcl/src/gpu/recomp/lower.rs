@@ -1548,9 +1548,6 @@ impl<I: Ir> Lower<'_, I> {
         Ok((self.ir, stale, self.noted.unwrap_or_default()))
     }
 
-    /// A refused instruction in block b: as `note`, and in survey mode the SGPRs (and, for a
-    /// scalar instruction, SCC) it writes are left as 0 in both views (number and mask bit),
-    /// so that a later read does not report a refusal that only follows from this one.
     /// An instruction this lowering has no semantics of, through `Ir::foreign` (#1426's
     /// per-instruction lowering) with the lane-mask analysis's guard: `true` where EXEC is proven
     /// (or inside a coalesced guarded run's block, `in_guarded_run`), else the lane's EXEC bit. Its SGPR
@@ -1728,10 +1725,20 @@ impl<I: Ir> Lower<'_, I> {
         }
     }
 
+    /// A refused instruction in block b: as `note`, and in survey mode the SGPRs (VCC too where
+    /// it is implicit, and for a scalar instruction SCC) it writes are left as 0 in both views,
+    /// so that a later read does not report a refusal that only follows from this one.
     fn note_inst(&mut self, r: R<()>, b: usize, d: &Decoded) -> R<()> {
         if r.is_err() && self.noted.is_some() {
             let (z, f) = (self.ir.int(0), self.ir.boolean(false));
-            for s in rdna2::sgpr_uses(d).1 {
+            // `sgpr_uses` gives the destinations with a field; VOPC compares and VOP2 carries
+            // write VCC without one
+            let vcc = d.ienc.operands.iter().any(|o| o.output && o.ty == "OPR_VCC");
+            let mut written = rdna2::sgpr_uses(d).1;
+            if vcc {
+                written.extend([VCC as u64, VCC as u64 + 1]);
+            }
+            for s in written {
                 if s < KERNEL_SGPRS as u64 && s != 125 {
                     self.ssa.write(b, Var::S(s as u8), z);
                     self.ssa.write(b, Var::M(s as u8), f);
@@ -3280,6 +3287,13 @@ pub(crate) mod tests {
         assert!(lower_compute(&decode(&lines), &cs, false, Interp::default()).is_err());
         assert_eq!(survey_compute(&decode(&lines), &cs, false, Interp::default()), ["unsupported V_ADD_F32", "unsupported V_MUL_F32"]);
         assert!(survey_compute(&decode(STRAIGHT), &cs, false, Interp::default()).is_empty());
+        // VCC left by the loop lanes leave one by one, then a refused compare writes it (VOPC:
+        // VCC has no field) before v_cndmask reads it: only the compare is reported
+        let mut lines = LEAVING_LOOP.to_vec();
+        lines.insert(6, ("V_CNDMASK_B32", "ENC_VOP2", &[("VDST", 3), ("SRC0", 128), ("VSRC1", 0)]));
+        assert!(survey_compute(&decode(&lines), &cs, false, Interp::default()).iter().any(|r| r.contains("elsewhere")));
+        lines.insert(6, ("V_CMP_GT_F32", "ENC_VOPC", &[("SRC0", 128), ("VSRC1", 0)]));
+        assert_eq!(survey_compute(&decode(&lines), &cs, false, Interp::default()), ["unsupported V_CMP_GT_F32"]);
     }
 
     #[test]
