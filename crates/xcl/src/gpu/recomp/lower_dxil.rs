@@ -456,6 +456,12 @@ mod tests {
         }
     }
 
+    /// The f16 and packed programs of `lower`'s tests, as `f32_programs_on_the_gpu`.
+    #[test]
+    fn f16_programs_on_the_gpu() {
+        programs_on_the_gpu(&[("f16 arithmetic", F16_ARITHMETIC, check_f16_arithmetic, &[]), ("f16 packed", F16_PACKED, check_f16_packed, &[])]);
+    }
+
     /// The per-lane form as real DXIL on the GPU agrees with the lowering run on the CPU (and so
     /// with the HLSL path, which `lower`'s tests compare it with): registers and memory.
     #[test]
