@@ -215,4 +215,82 @@ mod tests {
         let parts: Vec<([u8; 4], &[u8])> = parts.iter().map(|p| (p.fourcc.as_bytes().try_into().unwrap(), &signed[p.offset..p.offset + p.size])).collect();
         assert_eq!(serialize(&parts).unwrap(), signed);
     }
+
+    /// `value` as a bitstream VBR of `width`-bit chunks (the low chunk first, a chunk's top
+    /// bit says another follows), one bool per bit in stream order.
+    fn vbr_bits(mut value: u64, width: u32) -> Vec<bool> {
+        let (mut bits, data) = (Vec::new(), width - 1);
+        loop {
+            let (chunk, more) = (value & ((1 << data) - 1), value >> data != 0);
+            bits.extend((0..data).map(|i| chunk >> i & 1 == 1));
+            bits.push(more);
+            value >>= data;
+            if !more {
+                return bits;
+            }
+        }
+    }
+
+    /// `bytes` with the one place the bit pattern `from` is at replaced by `to` (a bitstream
+    /// is read from each byte's low bit up). `None` unless `from` is there exactly once.
+    fn replace_bits(bytes: &[u8], from: &[bool], to: &[bool]) -> Option<Vec<u8>> {
+        assert_eq!(from.len(), to.len());
+        let bit = |at: usize| bytes[at / 8] >> (at % 8) & 1 == 1;
+        let found: Vec<usize> = (0..(bytes.len() * 8).saturating_sub(from.len())).filter(|&at| from.iter().enumerate().all(|(i, &b)| bit(at + i) == b)).collect();
+        let [at] = found[..] else { return None };
+        let mut out = bytes.to_vec();
+        for (i, &b) in to.iter().enumerate() {
+            out[(at + i) / 8] = out[(at + i) / 8] & !(1 << ((at + i) % 8)) | (b as u8) << ((at + i) % 8);
+        }
+        Some(out)
+    }
+
+    /// What D3D12 wants of the digest, which decides whether XCL needs dxil.dll for DXIL it
+    /// writes itself: a compute pipeline is created, and runs, from a container whose DXIL part
+    /// was changed after DXC and dxil.dll were done with it (the stored constant, in the
+    /// bitcode) and whose digest XCL computed. The validator never saw that program, and the
+    /// `HASH` part still holds the old program's hash. A container with no digest is refused.
+    #[test]
+    fn d3d12_takes_a_program_with_a_digest_of_ours() {
+        if let Err(why) = runner::adapter() {
+            println!("no GPU: {why}");
+            runner::skip_test("no GPU");
+            return;
+        }
+        if dxc::location().is_err() {
+            runner::skip_test("no DXC");
+            return;
+        }
+        let (old, new) = (0x12345678u32, 0x1234a8a7u32);
+        let src = format!("RWByteAddressBuffer mem : register(u2);\n[numthreads(1, 1, 1)] void main() {{ mem.Store(0, {old:#x}u); }}\n");
+        let signed = dxc::compile(&src, "main", "cs_6_6", &[]).unwrap();
+        println!("{}; D3D12 Agility SDK: {:?}; dxcompiler {}", runner::adapter().unwrap(), crate::gpu::agility::loaded(), dxc::toolchain().dxcompiler);
+        let stored = |container: &[u8]| runner::dispatch(container, [1, 1, 1], &[], &[0; 64]).map(|mem| mem[0]);
+        assert_eq!(stored(&signed), Ok(old), "DXC's own container");
+
+        // a constant is a signed VBR (the value doubled) of 8-bit chunks in DXC's constants
+        // block, of 6-bit chunks in a record with no abbreviation
+        let parts = crate::gpu::shader::container_parts(&signed).unwrap();
+        let dxil = parts.iter().find(|p| p.fourcc == "DXIL").unwrap();
+        let (start, end) = (dxil.offset, dxil.offset + dxil.size);
+        let edited = [8, 6].iter().find_map(|&width| replace_bits(&signed[start..end], &vbr_bits(u64::from(old) * 2, width), &vbr_bits(u64::from(new) * 2, width)));
+        let mut changed = signed.clone();
+        changed[start..end].copy_from_slice(&edited.expect("the constant, once in the DXIL part"));
+        let stale = stored(&changed);
+        assert!(stale.is_err(), "a changed program under DXC's digest");
+        repair_digest(&mut changed).unwrap();
+        assert_ne!(changed[4..20], signed[4..20]);
+        assert_eq!(stored(&changed), Ok(new), "a changed program under our digest");
+
+        let mut unsigned = signed.clone();
+        unsigned[4..20].fill(0);
+        let none = stored(&unsigned);
+        assert!(none.is_err(), "no digest");
+        println!("a stale digest: {stale:?}; no digest: {none:?}");
+        // the `BYPASS` digest (hlsl-specs INF-0004): runtimes from Agility SDK 1.615 on take it,
+        // older ones do not, so only reported
+        let mut bypass = changed.clone();
+        bypass[4..20].fill(1);
+        println!("the all-01 bypass digest: {:?}", stored(&bypass).map(|v| v == new));
+    }
 }
