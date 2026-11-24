@@ -3136,6 +3136,27 @@ pub(crate) mod tests {
         out
     }
 
+    #[test]
+    fn complemented_saveexec_replaces_the_previous_uniform_scc() {
+        // ANDN1 with full EXEC and ORN1 with empty EXEC both produce ~s8.
+        // Restoring EXEC with MOV leaves that SCC live for all lanes.
+        const FULL: I = ("S_MOV_B32", "ENC_SOP1", &[("SDST", 126), ("SSRC0", 193)]);
+        const EMPTY: I = ("S_MOV_B32", "ENC_SOP1", &[("SDST", 126), ("SSRC0", 128)]);
+        for (op, exec) in [("S_ANDN1_SAVEEXEC_B32", FULL), ("S_ORN1_SAVEEXEC_B32", EMPTY)] {
+            let insts = decode(&[
+                ("S_CMP_EQ_U32", "ENC_SOPC", &[("SSRC0", 128), ("SSRC1", 128)]),
+                exec,
+                (op, "ENC_SOP1", &[("SDST", 4), ("SSRC0", 8)]),
+                ("S_MOV_B32", "ENC_SOP1", &[("SDST", 126), ("SSRC0", 193)]),
+                ("S_CBRANCH_SCC1", "ENC_SOPP", &[("SIMM16", 1)]),
+                ("V_MOV_B32", "ENC_VOP1", &[("VDST", 1), ("SRC0", 135)]),
+                ENDPGM,
+            ]);
+            let err = lower_kernel(&insts, false, Interp::default()).err().expect("varying mask");
+            assert!(err.contains("any lane of a mask"), "{op}: {err}");
+        }
+    }
+
     /// A branch or a scalar select on whether any lane of a mask is set decides for the whole
     /// wave on the console: with lanes in EXEC that lack the bit (VCC = lanes 0–15, EXEC = all),
     /// each lane deciding by its own bit would differ in lanes 16–31, so the program is refused

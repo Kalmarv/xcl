@@ -529,7 +529,8 @@ impl<'a> Lanes<'a> {
                 // A bitwise scalar instruction can mix a tracked mask and an SGPR
                 // holding a number. The lowering extracts each lane's bit of that
                 // number. Its unknown bits must not turn the result's SCC uniform.
-                if matches!(op, "AND" | "OR" | "XOR" | "ANDN2" | "ORN2" | "ANDN1" | "NAND" | "NOR" | "XNOR")
+                // ANDN1 and ORN1 occur only in the EXEC forms handled above.
+                if matches!(op, "AND" | "OR" | "XOR" | "ANDN2" | "ORN2" | "NAND" | "NOR" | "XNOR")
                     && (sd == Some(EXEC) || (s0 < 128 && a.is_some()) || (s1 < 128 && b.is_some()))
                 {
                     a = Some(self.need(st, d, s0, block)?);
