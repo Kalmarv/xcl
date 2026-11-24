@@ -416,8 +416,9 @@ impl<I: Ir> Lower<'_, I> {
         let (s0, sd) = (fv("SSRC0"), fv("SDST") as u8);
         // `s_wqm` of a mask (`s_wqm_b64 exec, exec`): a lane's bit is set when any lane of its
         // quad has its bit; the quad is in the lane's own half of the mask
+        // (the launch EXEC's, and any in a VS / PS, are `salu`'s)
         let wqm = if self.wave64 { "S_WQM_B64" } else { "S_WQM_B32" };
-        if name == wqm {
+        if name == wqm && !self.graphics && !self.sum.wqm_all.contains(&d.pc) {
             let Some((r, false)) = self.mask_reg(b, s0) else { return Err(format!("unsupported {name} of a number")) };
             let [lo, hi] = self.mask_words(b, r, true)?;
             let lane = self.lane();

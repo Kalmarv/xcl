@@ -173,6 +173,8 @@ struct Lower<'a, I: Ir> {
     dpp_en: Option<I::V>,
     /// survey mode (`survey_compute`): every refusal is noted here and the lowering goes on
     noted: Option<Vec<String>>,
+    /// a VS / PS (`lower_graphics`): `s_wqm` only of the launch EXEC (its quads' helper lanes)
+    graphics: bool,
 }
 
 /// A vector memory store: a side effect inactive lanes must not have.
@@ -1084,6 +1086,7 @@ fn lower_with<I: Ir>(insts: &[Decoded], stage: Stage, wave64: bool, mut ir: I, s
         dpp_src: None,
         dpp_en: None,
         noted: survey.then(Vec::new),
+        graphics,
     };
     // the registers the program names, and the ones the runner reads back
     let mut sregs: Vec<u8> = vec![VCC, VCC + 1, 124, EXEC, EXEC + 1];
