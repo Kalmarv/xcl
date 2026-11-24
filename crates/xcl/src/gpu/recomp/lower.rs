@@ -377,8 +377,22 @@ impl<'a, I: Ir> Lower<'a, I> {
 
     /// SCC, written and read like an SGPR number: a lane that skipped the block writing it
     /// keeps its own older value (`stale`).
-    fn write_scc(&mut self, b: usize, v: I::V) {
+    /// `v` as written in block b: in a block some lanes skip, a value made elsewhere (an older
+    /// mask copied, a shared constant) gets a copy of its own, so `stale` sees the write here.
+    fn own(&mut self, b: usize, v: I::V, bit: bool) -> I::V {
+        let v = match self.def_block.get(&v) {
+            Some(&d) if d != b && self.partial[b] => {
+                let z = if bit { self.ir.boolean(false) } else { self.ir.int(0) };
+                self.ir.bin(Bin::Or, v, z)
+            }
+            _ => v,
+        };
         self.def_block.entry(v).or_insert(b);
+        v
+    }
+
+    fn write_scc(&mut self, b: usize, v: I::V) {
+        let v = self.own(b, v, true);
         self.ssa.write(b, Var::Scc, v);
     }
 
@@ -389,7 +403,7 @@ impl<'a, I: Ir> Lower<'a, I> {
     }
 
     fn write_num(&mut self, b: usize, r: u8, v: I::V) {
-        self.def_block.entry(v).or_insert(b);
+        let v = self.own(b, v, false);
         self.ssa.write(b, Var::S(r), v);
         self.ssa.write(b, Var::M(r), self.bit_marker);
         if self.wave64 && r > 0 {
@@ -399,9 +413,7 @@ impl<'a, I: Ir> Lower<'a, I> {
     }
 
     fn write_bit(&mut self, b: usize, r: u8, bit: I::V) {
-        if r != EXEC {
-            self.def_block.entry(bit).or_insert(b);
-        }
+        let bit = if r != EXEC { self.own(b, bit, true) } else { bit };
         self.ssa.write(b, Var::M(r), bit);
         self.ssa.write(b, Var::S(r), self.num_marker);
         if self.wave64 {
@@ -3774,6 +3786,16 @@ pub(crate) mod tests {
         // a mask written before the lanes split is read after they meet: fine
         let insts = decode(SKIPPED_IF);
         assert_eq!(lower_kernel(&insts, false, Interp::default()).unwrap().1, Vec::<u8>::new());
+        // an older mask copied in the arm some lanes skip (s_mov s4, s0), read after they meet:
+        // the copy is the arm's write, not the older value's (found by MiguelMachado-dev)
+        let mut lines = SKIPPED_IF.to_vec();
+        lines[2] = ("S_CBRANCH_EXECZ", "ENC_SOPP", &[("SIMM16", 2)]);
+        lines.insert(3, ("S_MOV_B32", "ENC_SOP1", &[("SDST", 4), ("SSRC0", 0)]));
+        lines.insert(6, ("V_CNDMASK_B32", "ENC_VOP3", &[("VDST", 3), ("SRC0", 128), ("SRC1", 129), ("SRC2", 4)]));
+        // (s4 holds a mask before the lanes split, so the join is mask against mask)
+        lines.insert(1, ("S_MOV_B32", "ENC_SOP1", &[("SDST", 4), ("SSRC0", 106)]));
+        let err = lower_kernel(&decode(&lines), false, Interp::default()).err().expect("refused");
+        assert!(err.contains("some lanes were elsewhere"), "{err}");
     }
 
     #[test]
