@@ -66,9 +66,13 @@ pub trait Ir: Sink {
     fn zext(&mut self, b: Self::V) -> Self::V;
     /// the console lane of this thread
     fn lane(&mut self) -> Self::V;
-    /// compute: the group's id and the thread's id in its group, component k (x, y, z)
+    /// compute: the group's id, component k (x, y, z)
     fn group_id(&mut self, k: u32) -> Self::V;
-    fn thread_id(&mut self, k: u32) -> Self::V;
+    /// compute, a group of `threads`: this thread's console thread (its flat index in the group)
+    /// and that thread's id (x, y, z). The console forms a wave from consecutive threads, lane l
+    /// the l-th of them, so the flat index is the wave's first thread plus `lane()`; a PC driver
+    /// need not, in 2-D / 3-D groups, so the threads are numbered as the waves arrive
+    fn compute_ids(&mut self, threads: [u32; 3]) -> (Self::V, [Self::V; 3]);
     /// the wave's ballot of `c`: lanes 0–31, 32–63
     fn ballot(&mut self, c: Self::V) -> [Self::V; 2];
     /// `ballot` where only the word of this lane's 32-lane half is used (the other may be
@@ -835,13 +839,8 @@ pub fn lower_kernel<I: Ir>(insts: &[Decoded], wave64: bool, ir: I) -> R<(I, Vec<
     lower(insts, Stage::Kernel, wave64, ir)
 }
 
-/// Lowers a compute program (far jumps resolved) into `ir`. One-dimensional groups only for
-/// now: in a 2-D / 3-D group the PC driver need not give a wave consecutive threads, which the
-/// console does (`emit` reorders them; not done here yet).
+/// Lowers a compute program (far jumps resolved) into `ir`.
 pub fn lower_compute<I: Ir>(insts: &[Decoded], cs: &super::CsInterface, wave64: bool, ir: I) -> R<I> {
-    if cs.threads[1] * cs.threads[2] > 1 {
-        return Err("2-D / 3-D thread group".into());
-    }
     Ok(lower(insts, Stage::Compute(cs), wave64, ir)?.0)
 }
 
@@ -984,6 +983,7 @@ fn lower<I: Ir>(insts: &[Decoded], stage: Stage, wave64: bool, mut ir: I) -> R<(
             l.ir.br(exit);
         }
         Stage::Compute(cs) => {
+            let (flat, tid) = l.ir.compute_ids(cs.threads);
             // system SGPRs after the user data: the enabled group ids, then TG_SIZE
             let mut next = cs.user_sgprs as u8;
             for k in 0..3 {
@@ -997,9 +997,8 @@ fn lower<I: Ir>(insts: &[Decoded], stage: Stage, wave64: bool, mut ir: I) -> R<(
                 // waves in the group (a last partial one counts) | this wave's index << 6
                 let lanes = if wave64 { 64 } else { 32 };
                 let waves = l.ir.int(cs.threads.iter().product::<u32>().div_ceil(lanes));
-                let t = l.ir.thread_id(0);
                 let sh = l.ir.int(lanes.trailing_zeros());
-                let w = l.ir.bin(Bin::LShr, t, sh);
+                let w = l.ir.bin(Bin::LShr, flat, sh);
                 let six = l.ir.int(6);
                 let w = l.ir.bin(Bin::Shl, w, six);
                 let v = l.ir.bin(Bin::Or, waves, w);
@@ -1009,9 +1008,9 @@ fn lower<I: Ir>(insts: &[Decoded], stage: Stage, wave64: bool, mut ir: I) -> R<(
             l.ssa.write(0, Var::Scc, f);
             for &v in &vregs {
                 let x = match v {
-                    0 => l.ir.thread_id(0),
-                    1 if cs.tid_components >= 2 => l.ir.thread_id(1),
-                    2 if cs.tid_components >= 3 => l.ir.thread_id(2),
+                    0 => tid[0],
+                    1 if cs.tid_components >= 2 => tid[1],
+                    2 if cs.tid_components >= 3 => tid[2],
                     _ => l.ir.int(0),
                 };
                 l.ssa.write(0, Var::V(v), x);
@@ -1241,7 +1240,10 @@ pub(crate) mod tests {
         Zext(u32),
         Lane,
         GroupId(u32),
-        ThreadId(u32),
+        /// the flat thread index in the group: the wave's first thread + lane
+        Flat,
+        /// component k of a flat index `v` in a group whose x, y sizes are given
+        ThreadId(u32, u32, [u32; 2]),
         Ballot(u32, usize),
         ReadLane(u32, u32),
         /// as `Ballot` and `ReadLane`, but the lowering may use only its own 32-lane half's part
@@ -1357,8 +1359,10 @@ pub(crate) mod tests {
         fn group_id(&mut self, k: u32) -> u32 {
             self.push(Ins::GroupId(k))
         }
-        fn thread_id(&mut self, k: u32) -> u32 {
-            self.push(Ins::ThreadId(k))
+        fn compute_ids(&mut self, threads: [u32; 3]) -> (u32, [u32; 3]) {
+            let flat = self.push(Ins::Flat);
+            let xy = [threads[0], threads[1]];
+            (flat, [0, 1, 2].map(|k| self.push(Ins::ThreadId(k, flat, xy))))
         }
         fn ballot(&mut self, c: u32) -> [u32; 2] {
             [self.push(Ins::Ballot(c, 0)), self.push(Ins::Ballot(c, 1))]
@@ -1490,7 +1494,12 @@ pub(crate) mod tests {
                                 Ins::Zext(b) => Some(g(b)),
                                 Ins::Lane => Some(lane as u32),
                                 Ins::GroupId(k) => Some(group[*k as usize]),
-                                Ins::ThreadId(k) => Some(if *k == 0 { base + lane as u32 } else { 0 }),
+                                Ins::Flat => Some(base + lane as u32),
+                                Ins::ThreadId(k, v, [x, y]) => Some(match k {
+                                    0 => g(v) % x,
+                                    1 => g(v) / x % y,
+                                    _ => g(v) / (x * y),
+                                }),
                                 Ins::Ballot(..) | Ins::BallotHalf(..) | Ins::ReadLane(..) | Ins::ReadLaneHalf(..) => break,
                                 Ins::CountBits(v) => Some(g(v).count_ones()),
                                 Ins::IoLoad(a) => Some(io[g(a) as usize]),
@@ -1650,17 +1659,66 @@ pub(crate) mod tests {
 
     /// A compute program run on the CPU over `groups` groups (wave32): the memory after.
     pub(crate) fn run_compute(lines: &[I], cs: &crate::gpu::recomp::CsInterface, groups: u32, sgprs: &[u32], mem: &[u32]) -> Vec<u32> {
-        let ir = lower_compute(&decode(lines), cs, false, Interp::default()).unwrap_or_else(|e| panic!("{e}"));
+        run_compute_waves(lines, cs, false, groups, sgprs, mem)
+    }
+
+    /// … in wave32 or wave64: each wave takes the next `lanes` threads of its group, as on the
+    /// console (the last one fewer).
+    pub(crate) fn run_compute_waves(lines: &[I], cs: &crate::gpu::recomp::CsInterface, wave64: bool, groups: u32, sgprs: &[u32], mem: &[u32]) -> Vec<u32> {
+        let ir = lower_compute(&decode(lines), cs, wave64, Interp::default()).unwrap_or_else(|e| panic!("{e}"));
+        let lanes = if wave64 { 64 } else { 32 };
         let mut io = vec![0u32; KERNEL_SGPRS];
         io[..sgprs.len()].copy_from_slice(sgprs);
         let mut res = vec![0u32; KERNEL_SGPRS];
         let mut mem = mem.to_vec();
+        let threads: u32 = cs.threads.iter().product();
         for g in 0..groups {
-            for w in 0..cs.threads[0].div_ceil(32) {
-                ir.run_with(32, w * 32, [g, 0, 0], &io, &mut res, &mut mem);
+            for w in (0..threads).step_by(lanes as usize) {
+                ir.run_with(lanes.min(threads - w) as usize, w, [g, 0, 0], &io, &mut res, &mut mem);
             }
         }
         mem
+    }
+
+    /// 2-D and 3-D groups of 64 threads.
+    pub(crate) const ID_SHAPES: [[u32; 3]; 2] = [[8, 8, 1], [4, 4, 4]];
+
+    /// Each thread of a 64-thread group of an `ID_SHAPES` shape stores its ids and its lane
+    /// (`mbcnt` of EXEC) as `x | y << 8 | z << 16 | lane << 24` at word `group * 64 + flat index`.
+    pub(crate) fn ids_program(threads: [u32; 3], wave64: bool) -> Vec<I> {
+        let mut p: Vec<I> = vec![("S_MUL_I32", "ENC_SOP2", &[("SDST", 3), ("SSRC0", 2), ("SSRC1", 192)])];
+        // v4 = flat index: (y << 3) + x, or (z << 4) + (y << 2) + x
+        if threads[2] == 1 {
+            p.push(("V_LSHL_ADD_U32", "ENC_VOP3", &[("VDST", 4), ("SRC0", V + 1), ("SRC1", 131), ("SRC2", V)]));
+        } else {
+            p.push(("V_LSHL_ADD_U32", "ENC_VOP3", &[("VDST", 4), ("SRC0", V + 1), ("SRC1", 130), ("SRC2", V)]));
+            p.push(("V_LSHL_ADD_U32", "ENC_VOP3", &[("VDST", 4), ("SRC0", V + 2), ("SRC1", 132), ("SRC2", V + 4)]));
+        }
+        // v[8:9] = (group * 64 + flat) * 4; v5 = lane
+        p.extend_from_slice(&[
+            ("V_ADD_NC_U32", "ENC_VOP2", &[("VDST", 4), ("SRC0", 3), ("VSRC1", 4)]),
+            ("V_LSHLREV_B32", "ENC_VOP2", &[("VDST", 8), ("SRC0", 130), ("VSRC1", 4)]),
+            ("V_MOV_B32", "ENC_VOP1", &[("VDST", 9), ("SRC0", 128)]),
+            ("V_MBCNT_LO_U32_B32", "ENC_VOP3", &[("VDST", 5), ("SRC0", 126), ("SRC1", 128)]),
+        ]);
+        if wave64 {
+            p.push(("V_MBCNT_HI_U32_B32", "ENC_VOP3", &[("VDST", 5), ("SRC0", 127), ("SRC1", V + 5)]));
+        }
+        p.push(("V_LSHL_OR_B32", "ENC_VOP3", &[("VDST", 7), ("SRC0", V + 1), ("SRC1", 136), ("SRC2", V)]));
+        if threads[2] > 1 {
+            p.push(("V_LSHL_OR_B32", "ENC_VOP3", &[("VDST", 7), ("SRC0", V + 2), ("SRC1", 144), ("SRC2", V + 7)]));
+        }
+        p.extend_from_slice(&[
+            ("V_LSHL_OR_B32", "ENC_VOP3", &[("VDST", 7), ("SRC0", V + 5), ("SRC1", 152), ("SRC2", V + 7)]),
+            ("GLOBAL_STORE_DWORD", "ENC_FLAT_GLBL", &[("ADDR", 8), ("DATA", 7), ("SADDR", 125), ("OFFSET", 0)]),
+            ENDPGM,
+        ]);
+        p
+    }
+
+    pub(crate) fn ids_cs(threads: [u32; 3]) -> crate::gpu::recomp::CsInterface {
+        let tid_components = if threads[2] > 1 { 3 } else { 2 };
+        crate::gpu::recomp::CsInterface { threads, tid_components, ..compute_cs() }
     }
 
     pub(crate) fn memory_image() -> Vec<u32> {
@@ -1939,9 +1997,52 @@ pub(crate) mod tests {
                 assert_eq!(mem[(64 * g + t) as usize], 3 * t + 100 + g, "group {g} thread {t}");
             }
         }
-        // 2-D groups are not lowered yet
-        let cs = crate::gpu::recomp::CsInterface { threads: [8, 8, 1], ..compute_cs() };
-        assert!(lower_compute(&decode(COMPUTE), &cs, false, Interp::default()).is_err());
+    }
+
+    #[test]
+    fn a_2d_or_3d_group_numbers_its_threads_as_the_console_does() {
+        // a wave takes consecutive threads, lane l the l-th: x fastest, then y, then z
+        for threads in ID_SHAPES {
+            for wave64 in [false, true] {
+                let lanes = if wave64 { 64 } else { 32 };
+                let mem = run_compute_waves(&ids_program(threads, wave64), &ids_cs(threads), wave64, 2, &[100, 0], &[0u32; 256]);
+                for g in 0..2u32 {
+                    for t in 0..64u32 {
+                        let (x, y, z) = (t % threads[0], t / threads[0] % threads[1], t / (threads[0] * threads[1]));
+                        let want = x | y << 8 | z << 16 | (t % lanes) << 24;
+                        assert_eq!(mem[(64 * g + t) as usize], want, "{threads:?} wave64 {wave64}: group {g} thread {t}");
+                    }
+                }
+            }
+        }
+    }
+
+    /// The same through the HLSL path on the GPU, which numbers the threads by arrival.
+    #[test]
+    fn a_2d_or_3d_group_agrees_with_the_hlsl_path_on_the_gpu() {
+        use super::super::{dxc, runner, translate, Mode, Options};
+        if runner::adapter().is_err() || dxc::location().is_err() {
+            runner::skip_test(if runner::adapter().is_err() { "no GPU" } else { "no DXC" });
+            return;
+        }
+        for wave64 in [false, true] {
+            if wave64 && runner::wave64_supported() != Ok(true) {
+                runner::skip_test("no wave64");
+                return;
+            }
+            for threads in ID_SHAPES {
+                let lines = ids_program(threads, wave64);
+                let cs = ids_cs(threads);
+                let bytes: Vec<u8> = lines.iter().flat_map(|(n, e, f)| rdna2::encode(n, e, f, None).unwrap()).collect();
+                let t = translate(&bytes, &Options { mode: Mode::Compute(cs.clone()), wave64, ..Default::default() }).unwrap();
+                assert!(t.complete(), "{:?}", t.unsupported_why);
+                let dxil = dxc::compile(&t.hlsl, "main", "cs_6_6", &[]).unwrap();
+                let mem = vec![0u32; 256];
+                let gpu = runner::dispatch(&dxil, [2, 1, 1], &[100, 0], &mem).unwrap();
+                let cpu = run_compute_waves(&lines, &cs, wave64, 2, &[100, 0], &mem);
+                assert_eq!(&gpu[..128], &cpu[..128], "{threads:?} wave64 {wave64}");
+            }
+        }
     }
 
     /// The compute program through the HLSL path on the GPU and through the lowering on the CPU.
