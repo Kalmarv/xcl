@@ -335,7 +335,7 @@ impl Shader {
     pub fn wave_lane_index(&mut self) -> Value {
         self.require(Feature::WaveOps);
         let i32 = self.m.i32();
-        self.op(111, "waveGetLaneIndex", None, i32, &[], FnAttrs::ReadNone)
+        self.op(111, "waveGetLaneIndex", None, i32, &[], FnAttrs::ReadOnly)
     }
     /// `WaveActiveBallot` → four i32 words (lanes 0-31, 32-63, …).
     pub fn wave_ballot(&mut self, cond: Value) -> [Value; 4] {

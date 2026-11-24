@@ -730,6 +730,17 @@ fn texture_variants_validate() {
 
 // ------------------------------------------------------------------- wave
 
+/// `WaveGetLaneIndex` is declared as DXC 1.9 declares it.
+#[test]
+fn wave_lane_index_is_declared_readonly() {
+    let mut k = kernel();
+    let lane = k.s.wave_lane_index();
+    k.out(0, lane);
+    let dis = validate::disassemble(&k.finish([32, 1, 1])).expect("disassembly");
+    let at = dis.lines().position(|l| l.starts_with("declare i32 @dx.op.waveGetLaneIndex(")).expect("the declaration");
+    assert_eq!(dis.lines().nth(at - 1), Some("; Function Attrs: nounwind readonly"), "{dis}");
+}
+
 #[test]
 fn wave_ops_match_cpu() {
     let mut k = kernel();
