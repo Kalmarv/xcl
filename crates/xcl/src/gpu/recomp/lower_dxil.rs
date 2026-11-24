@@ -32,6 +32,10 @@ struct DxilIr {
     cur: usize,
     /// `compute_ids` set up the lanes (`Lw::lane` is the console lane)
     lanes_set: bool,
+    /// a split compute program's thread ids, set up with its lanes in the constructor: the
+    /// lowering takes `lane()` before `compute_ids`, and in the split form the console lane
+    /// is not the hardware lane (the upper half's are 32-63)
+    ids: Option<(Value, [Value; 3])>,
 }
 
 impl DxilIr {
@@ -41,7 +45,16 @@ impl DxilIr {
         Self::with(insts, KernelOptions { wave64, split: false, mem_windows: 1, sampler_base: 0 }, entry)
     }
 
-    /// The builder state with the runtime's options `o` (memory windows, sampler registers).
+    /// `new` in the split form (two hardware wave32s per console wave64): #1426's `Lw` numbers
+    /// the threads as the hardware waves arrive and lays out the halves' exchange storage; its
+    /// `ballot` / `read_lane_uniform` meet the other half (a group barrier for one console
+    /// wave per group, the spin meet for more).
+    fn split(insts: &[Decoded], entry: &Entry) -> DxilIr {
+        Self::with(insts, KernelOptions { wave64: true, split: true, mem_windows: 1, sampler_base: 0 }, entry)
+    }
+
+    /// The builder state with the runtime's options `o` (memory windows, sampler registers, the
+    /// split form).
     fn with(insts: &[Decoded], o: KernelOptions, entry: &Entry) -> DxilIr {
         // block leaders for the constant-sampler scan: the first instruction, branch targets
         // and the instruction after a branch
@@ -52,10 +65,25 @@ impl DxilIr {
                 leaders.extend(insts.get(i + 1).map(|n| n.pc));
             }
         }
-        let lw = Lw::new(insts, &leaders, o, entry);
+        let mut lw = Lw::new(insts, &leaders, o, entry);
+        // a kernel's lanes in the split form: the console lane each hardware lane stands for,
+        // set up in the entry block (a compute program's come with `compute_ids`)
+        let mut ids = None;
+        let lanes_set = match entry {
+            Entry::Kernel if lw.split => {
+                lw.setup_lanes();
+                true
+            }
+            Entry::Compute(cs) if lw.split => {
+                let lds = lw.lds.is_some();
+                ids = Some(lw.setup_lanes_compute(cs.threads, lds));
+                true
+            }
+            _ => false,
+        };
         let io = lw.init.io.expect("the I/O buffer");
         let (res, mem) = (lw.res, lw.mems[0]);
-        DxilIr { lw, io, res, mem, blocks: Vec::new(), tails: Vec::new(), cur: 0, lanes_set: false }
+        DxilIr { lw, io, res, mem, blocks: Vec::new(), tails: Vec::new(), cur: 0, lanes_set, ids }
     }
 
     fn ty(&mut self, var: Var) -> crate::gpu::dxil::module::Ty {
@@ -65,11 +93,19 @@ impl DxilIr {
         }
     }
 
-    /// `Lw`'s entry block jumps to the first `Ir` block, as `kernel.rs` ends it, then `Lw::finish`.
+    /// The container: `Lw`'s entry block jumps to the first `Ir` block (as `kernel.rs` ends it),
+    /// the lowering's blocks are sealed for `Lw`'s variables (every edge into them is known once
+    /// the lowering is done), then `Lw::finish`.
     fn finish(mut self, numthreads: [u32; 3], hw: u32) -> Result<crate::gpu::dxil::kernel::Kernel, String> {
         let first = *self.blocks.first().ok_or("no blocks")?;
         self.lw.s.m.set_block(Block(0));
-        self.lw.s.m.br(first);
+        self.lw.br(first);
+        for i in 0..self.blocks.len() {
+            let b = self.blocks[i];
+            if !self.lw.ssa.is_sealed(b) {
+                self.lw.seal(b);
+            }
+        }
         self.lw.finish(numthreads, hw)
     }
 
@@ -165,21 +201,36 @@ impl Ir for DxilIr {
     fn compute_ids(&mut self, threads: [u32; 3]) -> (Value, [Value; 3]) {
         // #1426's compute entry: 2-D / 3-D groups numbered as their waves arrive, the counter
         // in the program's top LDS word when it has LDS
+        if let Some(ids) = self.ids {
+            return ids;
+        }
         let lds = self.lw.lds.is_some();
         let ids = self.lw.setup_lanes_compute(threads, lds);
         self.lanes_set = true;
         ids
     }
+    fn whole_needs_exchange(&self) -> bool {
+        self.lw.split
+    }
     fn ballot(&mut self, c: Value) -> [Value; 2] {
+        if self.lw.split {
+            // this half's word from the hardware, the other's through the exchange
+            let (lo, hi) = self.lw.ballot(c);
+            return [lo, hi];
+        }
         let w = self.lw.s.wave_ballot(c);
         [w[0], w[1]]
     }
     // one hardware wave per console wave (native wave64, or wave32): the half-local forms are
-    // the same operations
     fn mem_windows(&self) -> u32 {
         self.lw.mems.len() as u32
     }
+    // the same operations; in the split form only the reader's half is right (`Ir::ballot_half`)
     fn ballot_half(&mut self, c: Value) -> [Value; 2] {
+        if self.lw.split {
+            let w = self.lw.s.wave_ballot(c);
+            return [w[0], w[0]];
+        }
         self.ballot(c)
     }
     /// #1426's semantics of `d` (`Lw::inst_guarded`) in the current block: the inputs are written
@@ -214,9 +265,17 @@ impl Ir for DxilIr {
         Ok(outputs.iter().map(|&v| self.lw.rd(var(v))).collect())
     }
     fn read_lane(&mut self, v: Value, lane: Value) -> Value {
+        if self.lw.split {
+            // the lowering's lane reads take the same lane in every lane (readlane,
+            // readfirstlane, writelane's source)
+            return self.lw.read_lane_uniform(v, lane);
+        }
         self.lw.s.wave_read_lane_at(v, lane)
     }
     fn read_lane_half(&mut self, v: Value, lane: Value) -> Value {
+        if self.lw.split {
+            return self.lw.read_lane_half(v, lane);
+        }
         self.read_lane(v, lane)
     }
     fn count_bits(&mut self, v: Value) -> Value {
@@ -240,11 +299,15 @@ impl Ir for DxilIr {
         let mem = self.mem;
         self.lw.s.raw_store(mem, addr, &[value]);
     }
+    // through `Lw`, which records the edges for its own variables (the split form's exchange
+    // count and dead flag, its temporaries); the lowering's blocks are sealed in `finish`
     fn br(&mut self, target: usize) {
-        self.lw.s.m.br(self.blocks[target]);
+        let b = self.blocks[target];
+        self.lw.br(b);
     }
     fn br_if(&mut self, c: Value, then: usize, otherwise: usize) {
-        self.lw.s.m.cond_br(c, self.blocks[then], self.blocks[otherwise]);
+        let (t, f) = (self.blocks[then], self.blocks[otherwise]);
+        self.lw.cond_br(c, t, f);
     }
     fn ret(&mut self) {
         self.lw.s.m.ret();
@@ -258,6 +321,21 @@ pub fn kernel(insts: &[Decoded], wave64: bool) -> Result<(Vec<u8>, Vec<u8>), Str
     let (ir, stale) = lower::lower_kernel(insts, wave64, DxilIr::new(insts, wave64, &Entry::Kernel))?;
     let lanes = if wave64 { 64 } else { 32 };
     Ok((ir.finish([lanes, 1, 1], lanes)?.dxil, stale))
+}
+
+/// `kernel` in the split form: a wave64 program as two hardware wave32s (`DxilIr::split`).
+/// EXEC at launch must be the whole console wave, as the CPU interpreter and the HLSL path
+/// start it.
+pub fn kernel_split(insts: &[Decoded]) -> Result<(Vec<u8>, Vec<u8>), String> {
+    let (ir, stale) = lower::lower_kernel(insts, true, DxilIr::split(insts, &Entry::Kernel))?;
+    Ok((ir.finish([64, 1, 1], 32)?.dxil, stale))
+}
+
+/// `compute` in the split form: each console wave64 as two hardware wave32s, threads numbered
+/// by arrival (`Lw::setup_lanes_compute`).
+pub fn compute_split(insts: &[Decoded], cs: &super::CsInterface) -> Result<Vec<u8>, String> {
+    let ir = lower::lower_compute(insts, cs, true, DxilIr::split(insts, &Entry::Compute(cs.clone())))?;
+    Ok(ir.finish(cs.threads, 32)?.dxil)
 }
 
 /// `compute` from the program's code (decoded, far jumps resolved).
@@ -304,11 +382,8 @@ pub fn enabled() -> bool {
 }
 
 /// A compute program in its per-lane form with the runtime's options `o` (`pso::direct_compute`):
-/// the container and its static samplers. The split wave64 form is not lowered yet.
+/// the container and its static samplers.
 pub fn compute_with(code: &[u8], cs: &super::CsInterface, o: KernelOptions) -> Result<crate::gpu::dxil::kernel::Kernel, String> {
-    if o.split {
-        return Err("the split wave64 form".into());
-    }
     if o.mem_windows & super::HEAP_WINDOWS != 0 {
         return Err("heap memory windows".into());
     }
@@ -543,14 +618,15 @@ mod tests {
 
     /// With the runtime's four memory windows (`compute_with`), the memory instructions go
     /// through #1426's window switch (blocks of its own in the `Ir` block) and the program
-    /// still gives the CPU lowering's memory; the split wave64 form is refused.
+    /// still gives the CPU lowering's memory; heap memory windows are refused.
     #[test]
     fn a_per_lane_program_with_four_memory_windows_runs_on_the_gpu() {
         let cs = compute_cs();
         let bytes: Vec<u8> = COMPUTE.iter().flat_map(|(n, e, f)| crate::gpu::rdna2::encode(n, e, f, None).unwrap()).collect();
         let o = super::KernelOptions { wave64: false, split: false, mem_windows: 4, sampler_base: 0 };
-        let split = super::compute_with(&bytes, &cs, super::KernelOptions { wave64: true, split: true, ..o }).err().unwrap_or_default();
-        assert!(split.contains("split"), "{split}");
+        let heap = super::KernelOptions { mem_windows: 4 | super::super::HEAP_WINDOWS, ..o };
+        let heap = super::compute_with(&bytes, &cs, heap).err().unwrap_or_default();
+        assert!(heap.contains("heap"), "{heap}");
         if !gpu() {
             return;
         }
