@@ -476,6 +476,7 @@ mod tests {
         }
         let run = coalesced_run(false);
         let (two, none) = (two_arms(false, BELOW_16), two_arms(false, NO_LANE));
+        let (cmp, cmp_none) = (else_compare(false, BELOW_16, BELOW_24), else_compare(false, ALL_LANES, BELOW_24));
         for (name, lines) in [
             ("straight", STRAIGHT),
             ("skipped if", SKIPPED_IF),
@@ -483,6 +484,8 @@ mod tests {
             ("two arms", &two[..]),
             ("two arms, no lane", &none[..]),
             ("SCC in an arm", SCC_IN_ARM),
+            ("else compare", &cmp[..]),
+            ("else compare, no lane", &cmp_none[..]),
             ("leaving loop", LEAVING_LOOP),
             ("uniform loop", UNIFORM_LOOP),
             ("memory", MEMORY),

@@ -179,12 +179,14 @@ struct Lower<'a, I: Ir> {
     place: Vec<Option<(usize, bool)>>,
     /// the stale-value repair (`repair`): per analysis block some lanes skip, the nearest one
     /// every lane passes that dominates it (the head of its region); per analysis block, the
-    /// ones whose region it heads; the registers (and SCC) written in a block some lanes skip;
+    /// ones whose region it heads; the registers, masks and SCC written in a block some lanes skip;
     /// the ones a read may see at the start of each analysis block (`live_in`)
     region_head: Vec<Option<usize>>,
     heads: Vec<Vec<usize>>,
     region_vars: Vec<Var>,
     live: Vec<u128>,
+    /// the mask bits a VALU wrote (`write_lane_bit`)
+    lane_bits: HashSet<I::V>,
     /// the values a join broadcast (its IR block, the value), and the refusal of one it could not
     repaired: HashSet<(usize, I::V)>,
     unrepaired: std::collections::HashMap<I::V, &'static str>,
@@ -424,7 +426,23 @@ impl<'a, I: Ir> Lower<'a, I> {
     }
 
     fn write_bit(&mut self, b: usize, r: u8, bit: I::V) {
+        self.write_mask(b, r, bit, false);
+    }
+
+    /// A VALU's mask (a compare, a carry-out): each lane's own bit, 0 in the lanes not running
+    /// the instruction, as the console's whole-wave write leaves them (`repair`).
+    fn write_lane_bit(&mut self, b: usize, r: u8, bit: I::V) {
+        self.write_mask(b, r, bit, true);
+    }
+
+    fn write_mask(&mut self, b: usize, r: u8, bit: I::V, valu: bool) {
         let bit = if r != EXEC { self.own(b, bit, true) } else { bit };
+        if r != EXEC {
+            self.in_region(b, Var::M(r));
+            if valu {
+                self.lane_bits.insert(bit);
+            }
+        }
         self.ssa.write(b, Var::M(r), bit);
         self.ssa.write(b, Var::S(r), self.num_marker);
         if self.wave64 {
@@ -816,8 +834,11 @@ impl<'a, I: Ir> Lower<'a, I> {
             // the lane's result, 0 in inactive lanes
             let e = self.read_bit(b, EXEC)?;
             let bit = self.ir.bin(Bin::And, c, e);
-            let dst = if x { EXEC } else if vop3 { vdst as u8 } else { VCC };
-            self.write_bit(b, dst, bit);
+            if x {
+                self.write_bit(b, EXEC, bit);
+            } else {
+                self.write_lane_bit(b, if vop3 { vdst as u8 } else { VCC }, bit);
+            }
             return Ok(());
         }
         let v = match name {
@@ -1068,7 +1089,7 @@ impl<'a, I: Ir> Lower<'a, I> {
         if sealed && !self.partial[ib] && preds.iter().any(|&p| self.partial[p]) {
             for var in self.region_vars.clone() {
                 let bit = match var {
-                    Var::S(r) => r as u32,
+                    Var::S(r) | Var::M(r) => r as u32,
                     _ => LIVE_SCC,
                 };
                 if self.live[b] >> bit & 1 != 0 {
@@ -1090,13 +1111,16 @@ impl<'a, I: Ir> Lower<'a, I> {
 
     /// `var` at the join j. The console's write of an SGPR (or SCC) reached the whole wave; a lane
     /// that skipped the block w writing it kept its own older value. When w is the only such
-    /// block and every lane that ran w is here (`ran_at`), every lane takes the value of the first
-    /// lane that ran w; when none did, each keeps its own, as the console's wave skipped w. A
-    /// value two such blocks wrote is refused by name.
+    /// block and every lane that ran w is here (`ran_at`): a number or SCC becomes the value of
+    /// the first lane that ran w, a mask a VALU wrote (`write_lane_bit`) the lane's own bit where
+    /// it ran w and 0 where it did not. When none did, each keeps its own, as the console's wave
+    /// skipped w. A value two such blocks wrote, or a mask a scalar instruction wrote (its bits
+    /// of the lanes elsewhere follow from theirs of other registers), is refused by name.
     fn repair(&mut self, j: usize, var: Var) {
         let v = self.read(j, var);
-        if var != Var::Scc && (self.ssa.resolve_value(v) == self.num_marker || self.reaches(v, self.num_marker)) {
-            return; // a mask on some way here
+        let other = if matches!(var, Var::M(_)) { self.bit_marker } else { self.num_marker };
+        if var != Var::Scc && (self.ssa.resolve_value(v) == other || self.reaches(v, other)) {
+            return; // the other view on some way here
         }
         let leaves = self.stale_leaves(j, v);
         let (x, w) = match leaves[..] {
@@ -1109,25 +1133,35 @@ impl<'a, I: Ir> Lower<'a, I> {
                 return;
             }
         };
+        if matches!(var, Var::M(_)) && !self.lane_bits.contains(&x) {
+            self.unrepaired.insert(x, "a mask a scalar instruction wrote while some lanes were elsewhere, read after they met again");
+            return;
+        }
         let Some(ran) = self.ran_at(j, w) else {
             return;
         };
         let [lo, hi] = self.ir.ballot(ran);
         let hi = if self.wave64 { hi } else { self.ir.int(0) };
-        let first = self.first_set([lo, hi], 0);
         let z = self.ir.int(0);
         let any = self.ir.bin(Bin::Or, lo, hi);
         let any = self.ir.icmp(Cmp::Ne, any, z);
-        // none ran: the lane's own value (its own lane is here)
-        let lane = self.lane();
-        let from = self.ir.select(any, first, lane);
-        let rep = if var == Var::Scc {
-            let n = self.ir.zext(v);
-            let n = self.ir.read_lane(n, from);
-            self.ir.icmp(Cmp::Ne, n, z)
+        let rep = if matches!(var, Var::M(_)) {
+            self.bit_uses.push(v);
+            let own = self.ir.bin(Bin::And, ran, v);
+            self.ir.select(any, own, v)
         } else {
-            self.num_uses.push(v);
-            self.ir.read_lane(v, from)
+            // none ran: the lane's own value (its own lane is here)
+            let first = self.first_set([lo, hi], 0);
+            let lane = self.lane();
+            let from = self.ir.select(any, first, lane);
+            if var == Var::Scc {
+                let n = self.ir.zext(v);
+                let n = self.ir.read_lane(n, from);
+                self.ir.icmp(Cmp::Ne, n, z)
+            } else {
+                self.num_uses.push(v);
+                self.ir.read_lane(v, from)
+            }
         };
         self.lane_uses.push((j, v));
         self.repaired.insert((j, x));
@@ -1452,6 +1486,7 @@ fn lower_with<I: Ir>(insts: &[Decoded], stage: Stage, wave64: bool, mut ir: I, s
         heads,
         region_vars: Vec::new(),
         live: live_in(insts, &sum, kernel),
+        lane_bits: HashSet::new(),
         repaired: HashSet::new(),
         unrepaired: std::collections::HashMap::new(),
         def_block: std::collections::HashMap::new(),
@@ -1939,7 +1974,7 @@ impl<I: Ir> Lower<'_, I> {
             let x = self.ir.bin(Bin::And, x, one);
             let z = self.ir.int(0);
             let bit = self.ir.icmp(Cmp::Ne, x, z);
-            self.write_bit(b, base, bit);
+            self.write_lane_bit(b, base, bit);
         } else {
             for (&var, &v) in outputs.iter().zip(&vals) {
                 if let Var::S(r) = var {
@@ -2466,6 +2501,19 @@ pub(crate) mod tests {
             ENDPGM,
         ]
     }
+    /// `two_arms` with `cmp` (into VCC) in the else arm, and v_cndmask v3, 0, v0 on VCC after
+    /// the join
+    pub(crate) fn else_compare(wave64: bool, cond: I, cmp: I) -> Vec<I> {
+        let mut p = two_arms(wave64, cond);
+        p[7] = ("S_CBRANCH_EXECZ", "ENC_SOPP", &[("SIMM16", 2)]);
+        p.insert(8, cmp);
+        p.insert(p.len() - 1, ("V_CNDMASK_B32", "ENC_VOP2", &[("VDST", 3), ("SRC0", 128), ("VSRC1", 0)]));
+        p
+    }
+    /// `else_compare`'s: 0 <= v0 (every lane), 24 > v0, 48 > v0
+    pub(crate) const ALL_LANES: I = ("V_CMP_LE_U32", "ENC_VOPC", &[("SRC0", 128), ("VSRC1", 0)]);
+    pub(crate) const BELOW_24: I = ("V_CMP_GT_U32", "ENC_VOPC", &[("SRC0", 152), ("VSRC1", 0)]);
+    pub(crate) const BELOW_48: I = ("V_CMP_GT_U32", "ENC_VOPC", &[("SRC0", 176), ("VSRC1", 0)]);
     /// `two_arms`' conditions: 16 > v0, 0 > v0 (no lane), 40 > v0, 40 < v0
     pub(crate) const BELOW_16: I = ("V_CMP_GT_U32", "ENC_VOPC", &[("SRC0", 144), ("VSRC1", 0)]);
     pub(crate) const NO_LANE: I = ("V_CMP_GT_U32", "ENC_VOPC", &[("SRC0", 128), ("VSRC1", 0)]);
@@ -3655,7 +3703,33 @@ pub(crate) mod tests {
         lines.insert(6, ("V_CNDMASK_B32", "ENC_VOP2", &[("VDST", 3), ("SRC0", 128), ("VSRC1", 0)]));
         let err = lower_kernel(&decode(&lines), false, Interp::default()).err().expect("refused");
         assert!(err.contains("some lanes were elsewhere"), "{err}");
-        // (written in an arm some lanes skip, read after the join: the next test)
+        // (written in an arm some lanes skip, read after the join: the next tests)
+    }
+
+    #[test]
+    fn a_join_takes_a_compare_an_arm_made_as_the_console_leaves_it() {
+        // the else arm (lanes 16 and up) compares 24 > v0 into VCC, read after the join: 0 in
+        // the lanes that skipped the arm, as the console's write left them
+        let (s, v) = state(32);
+        let (_, v2) = run(&else_compare(false, BELOW_16, BELOW_24), false, &s, &v);
+        for (l, regs) in v2.iter().enumerate() {
+            assert_eq!(regs[3], if (16..24).contains(&l) { l as u32 } else { 0 }, "lane {l}");
+        }
+        // no lane runs it: VCC stays the condition's (every lane's bit set)
+        let (_, v2) = run(&else_compare(false, ALL_LANES, BELOW_24), false, &s, &v);
+        for (l, regs) in v2.iter().enumerate() {
+            assert_eq!(regs[3], l as u32, "lane {l}");
+        }
+        // wave64: the arm's lanes are 40-63, the compare's 40-47 (all in the upper half)
+        let (s, v) = state(64);
+        let (_, v2) = run(&else_compare(true, BELOW_40, BELOW_48), true, &s, &v);
+        for (l, regs) in v2.iter().enumerate() {
+            assert_eq!(regs[3], if (40..48).contains(&l) { l as u32 } else { 0 }, "lane {l}");
+        }
+        // a scalar instruction's mask in the arm (vcc = exec): refused by name
+        let lines = else_compare(false, BELOW_16, ("S_MOV_B32", "ENC_SOP1", &[("SDST", 106), ("SSRC0", 126)]));
+        let err = lower_kernel(&decode(&lines), false, Interp::default()).err().expect("refused");
+        assert!(err.contains("a scalar instruction wrote"), "{err}");
     }
 
     #[test]
@@ -3854,6 +3928,7 @@ pub(crate) mod tests {
             return;
         }
         let (two, none) = (two_arms(false, BELOW_16), two_arms(false, NO_LANE));
+        let (cmp, cmp_none) = (else_compare(false, BELOW_16, BELOW_24), else_compare(false, ALL_LANES, BELOW_24));
         for (name, lines) in [
             ("straight", STRAIGHT),
             ("skipped if", SKIPPED_IF),
@@ -3861,6 +3936,8 @@ pub(crate) mod tests {
             ("two arms", &two[..]),
             ("two arms, no lane", &none[..]),
             ("SCC in an arm", SCC_IN_ARM),
+            ("else compare", &cmp[..]),
+            ("else compare, no lane", &cmp_none[..]),
             ("leaving loop", LEAVING_LOOP),
             ("uniform loop", UNIFORM_LOOP),
             ("memory", MEMORY),
@@ -4016,6 +4093,7 @@ pub(crate) mod tests {
         }
         let reads = lane_reads(true);
         let (two, upper) = (two_arms(true, BELOW_40), two_arms(true, ABOVE_40));
+        let cmp = else_compare(true, BELOW_40, BELOW_48);
         // reads across the halves both ways: readlane of lane 41 (the lower half needs the
         // upper's), readfirstlane with EXEC from lane 40 up (the first lane is in the upper
         // half), and a 64-bit compare mask counted as a number
@@ -4041,6 +4119,7 @@ pub(crate) mod tests {
             // a join's broadcast of s4 from the arm's first lane: one of the upper half for `upper`
             ("two arms", &two[..]),
             ("two arms, upper half", &upper[..]),
+            ("else compare", &cmp[..]),
         ] {
             let insts = decode(lines);
             let (dxil, stale) = lower_dxil::kernel_split(&insts).unwrap_or_else(|e| panic!("{name}: {e}"));
