@@ -4,8 +4,8 @@
 //! `Ir` maps one to one onto the builder: blocks, phis (`phi_at` / `add_incoming`), integer
 //! ops, compares, `select`, the thread / group / lane ids, `waveActiveBallot`, and raw buffer
 //! loads and stores on the ABI's root UAVs (u0 `io`, u1 `res`, u2 `mem`). A phi the SSA
-//! construction finds trivial keeps its (identical) incoming values instead of being removed:
-//! the builder has no use replacement, and the driver folds such phis.
+//! construction finds trivial has its uses replaced (`Module::replace_all_uses`); the phi itself
+//! stays in its block, unused.
 
 use super::lower::{self, Bin, Cmp, Ir};
 use super::ssa::{Sink, Var};
@@ -54,8 +54,9 @@ impl Sink for DxilIr {
     fn incoming(&mut self, phi: Value, value: Value, pred: usize) {
         self.s.m.add_incoming(phi, value, self.blocks[pred]);
     }
-    fn replace(&mut self, _old: Value, _new: Value) {
-        // kept: its incoming values are all `new` (or itself), which is a valid phi
+    fn replace(&mut self, old: Value, new: Value) {
+        // every use of the trivial phi becomes `new`; the phi stays in its block, unused
+        self.s.m.replace_all_uses(old, new);
     }
     fn undef(&mut self, var: Var) -> Value {
         let t = self.ty(var);
