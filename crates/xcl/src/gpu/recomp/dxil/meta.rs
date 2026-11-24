@@ -1,5 +1,6 @@
-//! What `finish` adds to a built module: its shader flags, derived from what it uses, the
-//! `dx.*` metadata (DXIL 1.6, `cs` 6.6, validator version 1.6), the bitcode, and the container.
+//! What `finish` and `to_text` add to a built module: its shader flags, derived from what it
+//! uses, and the `dx.*` metadata (DXIL 1.6, `cs` 6.6, validator version 1.6); then the bitcode
+//! in its container, or the text.
 //!
 //! The flags follow DXC v1.9.2609 `ShaderFlags::CollectShaderFlags` (lib/DXIL/DxilShaderFlags.cpp)
 //! and `DxilModule::CollectShaderFlagsForModule`, for a validator of version 1.6 (University of
@@ -11,6 +12,7 @@ use super::dxop::ResKind;
 use super::module::{Binary, Cast, Inst, Kind, Module, Refused, Ty, TypeDef, Val};
 use super::number::Sink;
 use super::ops::opcode;
+use super::text::module_text;
 use super::write::{write_module, Metadata};
 
 /// Bits of the shader flags (DXC's `ShaderFlags`), the i64 of the entry point's properties.
@@ -217,14 +219,28 @@ impl Module {
         md
     }
 
-    /// The program as the DXIL container D3D12 takes (`CreateComputePipelineState`), with its
-    /// digest, or why it cannot be written. Nothing here needs `dxil.dll`.
-    pub fn finish(&mut self) -> Result<Vec<u8>, Refused> {
+    /// What both forms of the program are written from: the shader flags, whether it has native
+    /// 16-bit types, and the metadata.
+    fn prepared(&mut self) -> (u64, bool, Metadata) {
         let (shader_flags, native_16) = self.shader_flags();
         if self.numthreads.iter().any(|&n| n == 0) || self.numthreads[0] > 1024 || self.numthreads[1] > 1024 || self.numthreads[2] > 64 || self.numthreads.iter().product::<u32>() > 1024 {
             self.refuse("numthreads", None, format!("numthreads {:?}", self.numthreads));
         }
-        let metadata = self.metadata(shader_flags);
+        (shader_flags, native_16, self.metadata(shader_flags))
+    }
+
+    /// The program as LLVM assembly laid out as DXC's listings are, which DXC's assembler
+    /// (`IDxcAssembler::AssembleToContainer`) makes a container of; or why it cannot be written.
+    /// It is the module [`Module::finish`] writes, and either can follow the other.
+    pub fn to_text(&mut self) -> Result<String, Refused> {
+        let (_, native_16, metadata) = self.prepared();
+        module_text(self, &metadata, native_16)
+    }
+
+    /// The program as the DXIL container D3D12 takes (`CreateComputePipelineState`), with its
+    /// digest, or why it cannot be written. Nothing here needs `dxil.dll`.
+    pub fn finish(&mut self) -> Result<Vec<u8>, Refused> {
+        let (shader_flags, native_16, metadata) = self.prepared();
         let mut w = BitWriter::new();
         // 'BC' 0xC0DE
         w.emit(0xDEC0_4342, 32);

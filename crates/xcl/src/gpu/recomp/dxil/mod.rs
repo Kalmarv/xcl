@@ -2,7 +2,7 @@
 //!
 //! Direct DXIL output (opt-in `XCL_RECOMP_DXIL=1`): a builder of compute programs for the lowering
 //! ([`module::Module`]), which writes one as the LLVM 3.7 bitcode DXIL is stored as, in the DXBC
-//! container with its digest; and the table of the DXIL operations.
+//! container with its digest, or prints it as LLVM assembly; and the table of the DXIL operations.
 
 pub mod assemble;
 pub mod bitstream;
@@ -18,6 +18,7 @@ mod meta;
 pub mod module;
 mod number;
 pub mod ops;
+mod text;
 mod write;
 
 #[cfg(test)]

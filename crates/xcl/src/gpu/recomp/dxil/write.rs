@@ -19,10 +19,10 @@ const VALUE_SYMTAB_BLOCK: u32 = 14;
 const METADATA_BLOCK: u32 = 15;
 const TYPE_BLOCK: u32 = 17;
 
-const TRIPLE: &str = "dxil-ms-dx";
+pub(super) const TRIPLE: &str = "dxil-ms-dx";
 /// DXC's data layouts: with minimum-precision types (the default), and with native 16-bit ones.
-const LAYOUT_MIN_PRECISION: &str = "e-m:e-p:32:32-i1:32-i8:32-i16:32-i32:32-i64:64-f16:32-f32:32-f64:64-n8:16:32:64";
-const LAYOUT_NATIVE_16: &str = "e-m:e-p:32:32-i1:32-i8:8-i16:16-i32:32-i64:64-f16:16-f32:32-f64:64-n8:16:32:64";
+pub(super) const LAYOUT_MIN_PRECISION: &str = "e-m:e-p:32:32-i1:32-i8:32-i16:32-i32:32-i64:64-f16:32-f32:32-f64:64-n8:16:32:64";
+pub(super) const LAYOUT_NATIVE_16: &str = "e-m:e-p:32:32-i1:32-i8:8-i16:16-i32:32-i64:64-f16:16-f32:32-f64:64-n8:16:32:64";
 
 /// The metadata kinds DXC's context has; it writes them all whether or not one is attached.
 const KINDS: [&str; 17] = [
@@ -89,7 +89,7 @@ impl Metadata {
         self.named.push((name, nodes.iter().flatten().copied().collect()));
     }
     /// The constants the metadata names: they are the module's.
-    fn constants(&self) -> Vec<Val> {
+    pub(super) fn constants(&self) -> Vec<Val> {
         let mut seen = HashMap::new();
         let constant = |md: &Md| match md {
             Md::Value(v) if v.is_constant() && seen.insert(*v, ()).is_none() => Some(*v),
