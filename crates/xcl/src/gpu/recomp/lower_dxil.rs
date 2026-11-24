@@ -3,45 +3,62 @@
 //!
 //! `Ir` maps one to one onto the builder: blocks, phis (`phi_at` / `add_incoming`), integer
 //! ops, compares, `select`, the thread / group / lane ids, `waveActiveBallot`, and raw buffer
-//! loads and stores on the ABI's root UAVs (u0 `io`, u1 `res`, u2 `mem`). A phi the SSA
+//! loads and stores on the ABI's root UAVs (u0 `io`, u1 `res`, u2 `mem`). The builder state is
+//! #1426's translator state (`gpu::dxil::lower::Lw`, built by `Lw::new` and finished by
+//! `Lw::finish`), so its per-entry setup (`setup_lanes_compute`) and its instruction
+//! lowering are reachable from here. A phi the SSA
 //! construction finds trivial has its uses replaced (`Module::replace_all_uses`); the phi itself
 //! stays in its block, unused.
 
 use super::lower::{self, Bin, Cmp, Ir};
 use super::ssa::{Sink, Var};
-use crate::gpu::dxil::container::Stage;
+use crate::gpu::dxil::kernel::{Entry, KernelOptions};
+use crate::gpu::dxil::lower::Lw;
 use crate::gpu::dxil::module::{BinOp, Block, CastOp, Pred, Value};
-use crate::gpu::dxil::shader::{RawUav, Shader};
+use crate::gpu::dxil::shader::RawUav;
 use crate::gpu::rdna2::Decoded;
+use std::collections::BTreeSet;
 
 struct DxilIr {
-    s: Shader,
+    lw: Lw,
     io: RawUav,
     res: Option<RawUav>,
     mem: RawUav,
     blocks: Vec<Block>,
+    /// `compute_ids` set up the lanes (`Lw::lane` is the console lane)
+    lanes_set: bool,
 }
 
 impl DxilIr {
-    fn new(kernel: bool) -> DxilIr {
-        let mut s = Shader::new(Stage::Compute, (6, 6));
-        let io = s.raw_uav(0, 0);
-        let res = kernel.then(|| s.raw_uav(1, 0));
-        // compute: other waves may write the memory this one reads (as the HLSL path declares it)
-        let mem = if kernel { s.raw_uav(2, 0) } else { s.raw_uav_coherent(2, 0) };
-        DxilIr { s, io, res, mem, blocks: Vec::new() }
+    /// The builder state for `insts` at `entry` (a kernel or a compute program): one memory
+    /// window; a compute program's is coherent, as the HLSL path declares it.
+    fn new(insts: &[Decoded], wave64: bool, entry: &Entry) -> DxilIr {
+        // block leaders for the constant-sampler scan: the first instruction, branch targets
+        // and the instruction after a branch
+        let mut leaders: BTreeSet<u64> = insts.first().map(|d| d.pc).into_iter().collect();
+        for (i, d) in insts.iter().enumerate() {
+            if let Some(t) = crate::gpu::rdna2::branch_target(d) {
+                leaders.insert(t);
+                leaders.extend(insts.get(i + 1).map(|n| n.pc));
+            }
+        }
+        let o = KernelOptions { wave64, split: false, mem_windows: 1, sampler_base: 0 };
+        let lw = Lw::new(insts, &leaders, o, entry);
+        let io = lw.init.io.expect("the I/O buffer");
+        let (res, mem) = (lw.res, lw.mems[0]);
+        DxilIr { lw, io, res, mem, blocks: Vec::new(), lanes_set: false }
     }
 
     fn ty(&mut self, var: Var) -> crate::gpu::dxil::module::Ty {
         match var {
-            Var::M(_) | Var::Scc => self.s.m.i1(),
-            Var::S(_) | Var::V(_) => self.s.m.i32(),
+            Var::M(_) | Var::Scc => self.lw.s.m.i1(),
+            Var::S(_) | Var::V(_) => self.lw.s.m.i32(),
         }
     }
 
     fn bytes(&mut self, dword: Value) -> Value {
-        let four = self.s.m.i32c(4);
-        self.s.m.bin(BinOp::Mul, dword, four)
+        let four = self.lw.s.m.i32c(4);
+        self.lw.s.m.bin(BinOp::Mul, dword, four)
     }
 }
 
@@ -49,35 +66,35 @@ impl Sink for DxilIr {
     type V = Value;
     fn phi(&mut self, block: usize, var: Var) -> Value {
         let t = self.ty(var);
-        self.s.m.phi_at(self.blocks[block], t)
+        self.lw.s.m.phi_at(self.blocks[block], t)
     }
     fn incoming(&mut self, phi: Value, value: Value, pred: usize) {
-        self.s.m.add_incoming(phi, value, self.blocks[pred]);
+        self.lw.s.m.add_incoming(phi, value, self.blocks[pred]);
     }
     fn replace(&mut self, old: Value, new: Value) {
         // every use of the trivial phi becomes `new`; the phi stays in its block, unused
-        self.s.m.replace_all_uses(old, new);
+        self.lw.s.m.replace_all_uses(old, new);
     }
     fn undef(&mut self, var: Var) -> Value {
         let t = self.ty(var);
-        self.s.m.undef(t)
+        self.lw.s.m.undef(t)
     }
 }
 
 impl Ir for DxilIr {
     fn new_block(&mut self) -> usize {
-        let b = if self.blocks.is_empty() { self.s.m.entry_block() } else { self.s.m.new_block() };
+        let b = if self.blocks.is_empty() { self.lw.s.m.entry_block() } else { self.lw.s.m.new_block() };
         self.blocks.push(b);
         self.blocks.len() - 1
     }
     fn at(&mut self, block: usize) {
-        self.s.m.set_block(self.blocks[block]);
+        self.lw.s.m.set_block(self.blocks[block]);
     }
     fn int(&mut self, v: u32) -> Value {
-        self.s.m.i32c(v)
+        self.lw.s.m.i32c(v)
     }
     fn boolean(&mut self, v: bool) -> Value {
-        self.s.m.i1c(v)
+        self.lw.s.m.i1c(v)
     }
     fn bin(&mut self, op: Bin, a: Value, b: Value) -> Value {
         let op = match op {
@@ -91,7 +108,7 @@ impl Ir for DxilIr {
             Bin::LShr => BinOp::LShr,
             Bin::AShr => BinOp::AShr,
         };
-        self.s.m.bin(op, a, b)
+        self.lw.s.m.bin(op, a, b)
     }
     fn icmp(&mut self, c: Cmp, a: Value, b: Value) -> Value {
         let p = match c {
@@ -106,31 +123,35 @@ impl Ir for DxilIr {
             Cmp::Sgt => Pred::SGt,
             Cmp::Sge => Pred::SGe,
         };
-        self.s.m.cmp(p, a, b)
+        self.lw.s.m.cmp(p, a, b)
     }
     fn select(&mut self, c: Value, a: Value, b: Value) -> Value {
-        self.s.m.select(c, a, b)
+        self.lw.s.m.select(c, a, b)
     }
     fn zext(&mut self, b: Value) -> Value {
-        let t = self.s.m.i32();
-        self.s.m.cast(CastOp::ZExt, b, t)
+        let t = self.lw.s.m.i32();
+        self.lw.s.m.cast(CastOp::ZExt, b, t)
     }
     fn lane(&mut self) -> Value {
-        self.s.wave_lane_index()
+        if self.lanes_set {
+            self.lw.lane
+        } else {
+            self.lw.s.wave_lane_index()
+        }
     }
     fn group_id(&mut self, k: u32) -> Value {
-        self.s.group_id(k)
+        self.lw.s.group_id(k)
     }
     fn compute_ids(&mut self, threads: [u32; 3]) -> (Value, [Value; 3]) {
-        // 1-D groups only until `Lw::setup_lanes_compute` numbers 2-D / 3-D threads by arrival
-        // (`compute` refuses the others): a 1-D group's waves are its consecutive threads
-        debug_assert!(threads[1] * threads[2] == 1);
-        let flat = self.s.thread_id_in_group(0);
-        let zero = self.s.m.i32c(0);
-        (flat, [flat, zero, zero])
+        // #1426's compute entry: 2-D / 3-D groups numbered as their waves arrive, the counter
+        // in the program's top LDS word when it has LDS
+        let lds = self.lw.lds.is_some();
+        let ids = self.lw.setup_lanes_compute(threads, lds);
+        self.lanes_set = true;
+        ids
     }
     fn ballot(&mut self, c: Value) -> [Value; 2] {
-        let w = self.s.wave_ballot(c);
+        let w = self.lw.s.wave_ballot(c);
         [w[0], w[1]]
     }
     // one hardware wave per console wave (native wave64, or wave32): the half-local forms are
@@ -139,40 +160,40 @@ impl Ir for DxilIr {
         self.ballot(c)
     }
     fn read_lane(&mut self, v: Value, lane: Value) -> Value {
-        self.s.wave_read_lane_at(v, lane)
+        self.lw.s.wave_read_lane_at(v, lane)
     }
     fn read_lane_half(&mut self, v: Value, lane: Value) -> Value {
         self.read_lane(v, lane)
     }
     fn count_bits(&mut self, v: Value) -> Value {
-        self.s.bit_count(crate::gpu::dxil::ops::BitCount::Countbits, v)
+        self.lw.s.bit_count(crate::gpu::dxil::ops::BitCount::Countbits, v)
     }
     fn io_load(&mut self, dword: Value) -> Value {
         let a = self.bytes(dword);
         let io = self.io;
-        self.s.raw_load(io, a, 1)[0]
+        self.lw.s.raw_load(io, a, 1)[0]
     }
     fn res_store(&mut self, dword: Value, value: Value) {
         let a = self.bytes(dword);
         let res = self.res.expect("res is bound in kernel mode");
-        self.s.raw_store(res, a, &[value]);
+        self.lw.s.raw_store(res, a, &[value]);
     }
     fn mem_load(&mut self, addr: Value) -> Value {
         let mem = self.mem;
-        self.s.raw_load(mem, addr, 1)[0]
+        self.lw.s.raw_load(mem, addr, 1)[0]
     }
     fn mem_store(&mut self, addr: Value, value: Value) {
         let mem = self.mem;
-        self.s.raw_store(mem, addr, &[value]);
+        self.lw.s.raw_store(mem, addr, &[value]);
     }
     fn br(&mut self, target: usize) {
-        self.s.m.br(self.blocks[target]);
+        self.lw.s.m.br(self.blocks[target]);
     }
     fn br_if(&mut self, c: Value, then: usize, otherwise: usize) {
-        self.s.m.cond_br(c, self.blocks[then], self.blocks[otherwise]);
+        self.lw.s.m.cond_br(c, self.blocks[then], self.blocks[otherwise]);
     }
     fn ret(&mut self) {
-        self.s.m.ret();
+        self.lw.s.m.ret();
     }
 }
 
@@ -180,9 +201,9 @@ impl Ir for DxilIr {
 /// `WaveSize` = the program's wave size), and the masks whose final value may differ from
 /// the console's (`lower::lower_kernel`).
 pub fn kernel(insts: &[Decoded], wave64: bool) -> Result<(Vec<u8>, Vec<u8>), String> {
-    let (ir, stale) = lower::lower_kernel(insts, wave64, DxilIr::new(true))?;
+    let (ir, stale) = lower::lower_kernel(insts, wave64, DxilIr::new(insts, wave64, &Entry::Kernel))?;
     let lanes = if wave64 { 64 } else { 32 };
-    Ok((ir.s.finish([lanes, 1, 1], Some(lanes)), stale))
+    Ok((ir.lw.finish([lanes, 1, 1], lanes)?.dxil, stale))
 }
 
 /// `compute` from the program's code (decoded, far jumps resolved).
@@ -212,24 +233,13 @@ pub fn survey_compute_code(code: &[u8], cs: &super::CsInterface, wave64: bool) -
         }
     }
     crate::gpu::rdna2::resolve_far_jumps(&mut insts);
-    // a 2-D / 3-D group is noted as `compute` refuses it, and the rest surveyed as a 1-D group
-    // of as many threads (the thread ids differ, the instructions are the same)
-    if cs.threads[1] * cs.threads[2] > 1 {
-        let flat = super::CsInterface { threads: [cs.threads.iter().product(), 1, 1], ..cs.clone() };
-        let mut why = vec!["2-D / 3-D thread group (waits for Lw::setup_lanes_compute)".to_string()];
-        why.extend(lower::survey_compute(&insts, &flat, wave64, DxilIr::new(false)));
-        return why;
-    }
-    lower::survey_compute(&insts, cs, wave64, DxilIr::new(false))
+    lower::survey_compute(&insts, cs, wave64, DxilIr::new(&insts, wave64, &Entry::Compute(cs.clone())))
 }
 
 /// A compute program in its per-lane form, as a signed DXIL container.
 pub fn compute(insts: &[Decoded], cs: &super::CsInterface, wave64: bool) -> Result<Vec<u8>, String> {
-    if cs.threads[1] * cs.threads[2] > 1 {
-        return Err("2-D / 3-D thread group (waits for Lw::setup_lanes_compute)".into());
-    }
-    let ir = lower::lower_compute(insts, cs, wave64, DxilIr::new(false))?;
-    Ok(ir.s.finish(cs.threads, Some(if wave64 { 64 } else { 32 })))
+    let ir = lower::lower_compute(insts, cs, wave64, DxilIr::new(insts, wave64, &Entry::Compute(cs.clone())))?;
+    Ok(ir.lw.finish(cs.threads, if wave64 { 64 } else { 32 })?.dxil)
 }
 
 #[cfg(test)]
@@ -358,6 +368,31 @@ mod tests {
                         assert!(same, "{name}, wave{lanes}: lane {l} v{r}: {d:#x} against {h:#x}");
                     }
                 }
+            }
+        }
+    }
+
+    /// 2-D and 3-D groups in the per-lane form: the threads numbered as the waves arrive
+    /// (`Lw::setup_lanes_compute`), each wave's lanes the console's consecutive threads, as the
+    /// lowering run on the CPU has them.
+    #[test]
+    fn a_per_lane_2d_or_3d_group_runs_on_the_gpu() {
+        if !gpu() {
+            return;
+        }
+        for wave64 in [false, true] {
+            if wave64 && runner::wave64_supported() != Ok(true) {
+                runner::skip_test("no wave64");
+                return;
+            }
+            for threads in ID_SHAPES {
+                let lines = ids_program(threads, wave64);
+                let cs = ids_cs(threads);
+                let dxil = super::compute(&decode(&lines), &cs, wave64).unwrap();
+                let mem = vec![0u32; 256];
+                let gpu = runner::dispatch(&dxil, [2, 1, 1], &[100, 0], &mem).unwrap();
+                let cpu = run_compute_waves(&lines, &cs, wave64, 2, &[100, 0], &mem);
+                assert_eq!(&gpu[..128], &cpu[..128], "{threads:?} wave64 {wave64}");
             }
         }
     }
