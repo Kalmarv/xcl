@@ -1507,6 +1507,14 @@ fn direct_sweep(input: &Input, args: &[String], top: usize, json: bool, t0: std:
     let max_bytes = opt("--max-bytes").map(|v| v as usize).unwrap_or(16384);
     let timeout = std::time::Duration::from_secs(opt("--timeout").unwrap_or(10));
     let skipped = AtomicUsize::new(0);
+    // `--lanes`: compute programs through the per-lane form too (`recomp::lower_dxil`); where it
+    // translates, its DXIL size against the per-instruction form's, and the refusals ranked
+    let lanes = args.iter().any(|a| a == "--lanes");
+    let lanes_tried = AtomicUsize::new(0);
+    let lanes_ok = AtomicUsize::new(0);
+    let lanes_bytes = AtomicUsize::new(0);
+    let lanes_vs = AtomicUsize::new(0);
+    let lanes_why: Mutex<HashMap<String, usize>> = Mutex::new(HashMap::new());
     // `--hash H`: only the container whose `[SHADER]` hash (FNV-64 of the container) is H, every
     // record searched; `--dump DIR`: write each program's direct DXIL (and with `--compare` the
     // HLSL path's source and DXIL) to DIR, for diffing the two (`dxc -dumpbin`)
@@ -1561,6 +1569,20 @@ fn direct_sweep(input: &Input, args: &[String], top: usize, json: bool, t0: std:
                             rx.recv_timeout(timeout).unwrap_or_else(|_| Err(format!("timeout: over {} s", timeout.as_secs())))
                         };
                         let time = t.elapsed();
+                        if let (true, recomp::Mode::Compute(cs)) = (lanes, &mode) {
+                            lanes_tried.fetch_add(1, Ordering::Relaxed);
+                            match recomp::lower_dxil::compute_with(code, cs, o) {
+                                Ok(k) => {
+                                    lanes_ok.fetch_add(1, Ordering::Relaxed);
+                                    lanes_bytes.fetch_add(k.dxil.len(), Ordering::Relaxed);
+                                    lanes_vs.fetch_add(r.as_ref().map_or(0, |d| d.len()), Ordering::Relaxed);
+                                    if trace {
+                                        eprintln!("per-lane: {name} FSSM#{fi}: {} B, per-instruction {:?} B", k.dxil.len(), r.as_ref().map(|d| d.len()));
+                                    }
+                                }
+                                Err(e) => *lanes_why.lock().unwrap().entry(survey_key(&e)).or_default() += 1,
+                            }
+                        }
                         let dump = |suffix: &str, bytes: &[u8]| {
                             if let Some(d) = &dump_dir {
                                 let _ = std::fs::write(d.join(format!("{blob_hash:016x}_f{fi}_{:x}.{suffix}", p.offset)), bytes);
@@ -1603,6 +1625,12 @@ fn direct_sweep(input: &Input, args: &[String], top: usize, json: bool, t0: std:
         println!("{}", rep.json(top));
     } else {
         println!("{} programs from {} sampled records (seed {seed}; {} over {max_bytes} B skipped){}{}", results.len(), order.len().min(input.len()), skipped.load(Ordering::Relaxed), if validate { ", validated" } else { "" }, if compare { ", compared with HLSL+DXC" } else { "" });
+        if lanes {
+            let mut why: Vec<(String, usize)> = lanes_why.into_inner().unwrap().into_iter().collect();
+            why.sort_by(|a, b| b.1.cmp(&a.1));
+            why.truncate(top);
+            println!("per-lane form: {} of {} compute programs; where it translates, {} B against {} B per instruction; refused for: {why:?}", lanes_ok.load(Ordering::Relaxed), lanes_tried.load(Ordering::Relaxed), lanes_bytes.load(Ordering::Relaxed), lanes_vs.load(Ordering::Relaxed));
+        }
         print!("{}", rep.text(top));
         println!("time {:.1} s", t0.elapsed().as_secs_f64());
     }
