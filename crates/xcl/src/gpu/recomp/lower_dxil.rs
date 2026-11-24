@@ -532,7 +532,7 @@ mod tests {
                 let bytes: Vec<u8> = lines.iter().flat_map(encode_line).collect();
                 let t = translate(&bytes, &Options { wave64: w64, ..Default::default() }).unwrap();
                 assert!(t.complete(), "{name}: {:?}", t.unsupported_why);
-                let hlsl = runner::run(&dxc::compile(&t.hlsl, "main", "cs_6_6", &[]).unwrap(), &st, &[]).unwrap();
+                let hlsl = runner::run(&dxc::compile(&t.hlsl, "main", "cs_6_6", &["-Gis"]).unwrap(), &st, &[]).unwrap();
                 if !w64 {
                     check(&hlsl.sgpr, &hlsl.vgpr[..32]);
                 }

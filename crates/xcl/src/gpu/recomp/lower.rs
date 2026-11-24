@@ -2330,7 +2330,7 @@ pub(crate) mod tests {
                 assert_eq!(r[4 + i], w.to_bits(), "lane {l} v{}", 4 + i);
             }
             assert_eq!(r[9], 0x3F7F_FFFF, "fract(-2^-30): below 1.0");
-            assert_eq!(f32::from_bits(r[10]), 2.0 * (-x).floor(), "lane {l}");
+            assert_eq!(r[10], (2.0 * (-x).floor()).to_bits(), "lane {l} v10");
             assert_eq!(f32::from_bits(r[11]), x.abs() - x.abs().floor(), "lane {l}");
         }
     }
