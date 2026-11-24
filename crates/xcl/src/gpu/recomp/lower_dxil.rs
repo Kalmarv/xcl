@@ -159,6 +159,29 @@ impl Ir for DxilIr {
     fn ballot_half(&mut self, c: Value) -> [Value; 2] {
         self.ballot(c)
     }
+    /// #1426's semantics of `d` (`Lw::inst_guarded`) in the current block: the inputs are written
+    /// into `Lw`'s SSA there first, so it reads them and nothing from other blocks (which its SSA
+    /// doesn't know); one that makes blocks of its own (a guarded memory access with a guard that
+    /// isn't `true`) is refused rather than left half-placed.
+    fn foreign(&mut self, d: &Decoded, guard: Value, inputs: &[(Var, Value)], outputs: &[Var]) -> Result<Vec<Value>, String> {
+        use crate::gpu::dxil::lower::{VAR_SCC, VAR_VGPR};
+        let var = |v: Var| match v {
+            Var::S(r) => r as u32,
+            Var::V(n) => VAR_VGPR + n as u32,
+            Var::Scc => VAR_SCC,
+            Var::M(_) => unreachable!("a lane-bit view is not a register"),
+        };
+        for &(v, x) in inputs {
+            self.lw.wr(var(v), x);
+        }
+        let block = self.lw.cur();
+        self.lw.pc = d.pc;
+        self.lw.inst_guarded(d, guard, None)?;
+        if self.lw.cur() != block {
+            return Err("it made blocks of its own".into());
+        }
+        Ok(outputs.iter().map(|&v| self.lw.rd(var(v))).collect())
+    }
     fn read_lane(&mut self, v: Value, lane: Value) -> Value {
         self.lw.s.wave_read_lane_at(v, lane)
     }

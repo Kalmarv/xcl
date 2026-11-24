@@ -90,6 +90,13 @@ pub trait Ir: Sink {
     }
     /// the number of bits set in `v` (`countbits`)
     fn count_bits(&mut self, v: Self::V) -> Self::V;
+    /// `d` lowered with another lowering's instruction semantics (#1426's `Lw::inst_guarded`):
+    /// `inputs` are the registers it reads, `guard` (i1) decides this lane's register writes and
+    /// memory effects, and the values of `outputs` after it come back in order. Err when there
+    /// is no such lowering or it refuses `d`.
+    fn foreign(&mut self, _d: &Decoded, _guard: Self::V, _inputs: &[(Var, Self::V)], _outputs: &[Var]) -> R<Vec<Self::V>> {
+        Err("no foreign lowering".into())
+    }
     fn io_load(&mut self, dword: Self::V) -> Self::V;
     fn res_store(&mut self, dword: Self::V, value: Self::V);
     /// the dword of the flat memory (`mem`, u2) at a byte address (a multiple of 4); out of
@@ -518,7 +525,7 @@ impl<'a, I: Ir> Lower<'a, I> {
     fn valu_op(&mut self, b: usize, d: &Decoded) -> R<()> {
         let name = d.inst.name;
         if d.variant == Variant::Sdwa {
-            return Err(format!("{name}: SDWA"));
+            return Err(format!("unsupported {name}: SDWA"));
         }
         if self.wave_valu(b, d)? {
             return Ok(());
@@ -526,7 +533,7 @@ impl<'a, I: Ir> Lower<'a, I> {
         let fv = |f: &str| rdna2::field_value(d.enc, &d.words, f);
         let vop3 = d.enc.name.starts_with("ENC_VOP3") || d.enc.name.starts_with("VOP3");
         if vop3 && ["ABS", "NEG", "CLAMP", "OMOD", "OP_SEL"].iter().any(|f| fv(f).unwrap_or(0) != 0) {
-            return Err(format!("{name}: VOP3 modifiers"));
+            return Err(format!("unsupported {name}: VOP3 modifiers"));
         }
         // sources: VOP1 / VOP2 / VOPC put src1 in VSRC1 (a VGPR); VOP3 in SRC1
         let s0 = fv("SRC0").unwrap_or(0);
@@ -1099,6 +1106,7 @@ fn lower_with<I: Ir>(insts: &[Decoded], stage: Stage, wave64: bool, mut ir: I, s
                 l.ir.at(s);
                 l.ssa.seal(&mut l.ir, s);
                 let r = l.vmem(s, d);
+                let r = l.or_bridge(r, s, d, true);
                 l.note_inst(r, s, d)?;
                 l.ir.br(c);
                 done[s] = true;
@@ -1119,6 +1127,7 @@ fn lower_with<I: Ir>(insts: &[Decoded], stage: Stage, wave64: bool, mut ir: I, s
                 } else {
                     Err(format!("unsupported {name}"))
                 };
+                let r = l.or_bridge(r, cur, d, false);
                 l.note_inst(r, cur, d)?;
             }
         }
@@ -1261,6 +1270,149 @@ impl<I: Ir> Lower<'_, I> {
     /// A refused instruction in block b: as `note`, and in survey mode the SGPRs (and, for a
     /// scalar instruction, SCC) it writes are left as 0 in both views (number and mask bit),
     /// so that a later read does not report a refusal that only follows from this one.
+    /// An instruction this lowering has no semantics of, through `Ir::foreign` (#1426's
+    /// per-instruction lowering) with the lane-mask analysis's guard: `true` where EXEC is proven
+    /// (or in a guarded store's own block, `in_store_block`), else the lane's EXEC bit. Its SGPR
+    /// operands are read as numbers (a mask read whole is refused, as everywhere), the mask a
+    /// VALU reads lane by lane (`v_cndmask_b32`'s selector, a carry-in) as a number holding only
+    /// this lane's bit, and a mask it writes (a compare, a carry-out) comes back as this lane's
+    /// bit of the ballot it makes. Instructions writing EXEC are not taken.
+    fn bridge(&mut self, b: usize, d: &Decoded, in_store_block: bool) -> R<()> {
+        let name = d.inst.name;
+        let (whole, written) = super::x64_masks::uses(d);
+        let (_, explicit_w) = rdna2::sgpr_uses(d);
+        let writes = explicit_w.iter().fold(written, |m, &r| m | 1u128 << r);
+        if writes & (3 << 126) != 0 || name.starts_with("V_CMPX") {
+            return Err("writes EXEC".into());
+        }
+        if name == "S_BARRIER" && self.partial[b] {
+            return Err("a barrier where some lanes are elsewhere".into());
+        }
+        // instructions whose #1426 semantics are known to differ from the HLSL path and the
+        // console (each reported on #1426): left to the fallback until fixed there
+        const DIFFERS_ON_1426: &[&str] = &[
+            // f32 → f16 of a value below the smallest f16 denormal: 0 instead of rounding to it
+            "V_CVT_F16_F32",
+        ];
+        if DIFFERS_ON_1426.contains(&name) {
+            return Err("its #1426 semantics differ from the console's".into());
+        }
+        let operand = |input: bool, ty: &str| d.ienc.operands.iter().any(|o| o.input == input && o.output != input && o.ty == ty);
+        let mut inputs: Vec<(Var, I::V)> = Vec::new();
+        // SGPRs read whole: numbers (EXEC included, which holds a mask here: refused)
+        for r in (0..128u8).filter(|&r| whole >> r & 1 != 0 && r != 125) {
+            let v = self.read_num(b, r)?;
+            inputs.push((Var::S(r), v));
+        }
+        // a mask read lane by lane: a number with only this lane's bit
+        let vop3 = d.enc.name.starts_with("ENC_VOP3") || d.enc.name.starts_with("VOP3");
+        if matches!(name, "V_CNDMASK_B32" | "V_ADD_CO_CI_U32" | "V_SUB_CO_CI_U32" | "V_SUBREV_CO_CI_U32") {
+            let m = if vop3 { rdna2::field_value(d.enc, &d.words, "SRC2").unwrap_or(0) } else { VCC as u64 };
+            if m > 127 {
+                return Err(format!("{name}: mask operand {m}"));
+            }
+            let bit = self.src_bit(b, m)?;
+            let lane = self.lane();
+            let one = self.ir.zext(bit);
+            let c31 = self.ir.int(31);
+            let sh = self.ir.bin(Bin::And, lane, c31);
+            let own = self.ir.bin(Bin::Shl, one, sh);
+            if self.wave64 {
+                let (c32, z) = (self.ir.int(32), self.ir.int(0));
+                let upper = self.ir.icmp(Cmp::Uge, lane, c32);
+                let (lo, hi) = (self.ir.select(upper, z, own), self.ir.select(upper, own, z));
+                inputs.push((Var::S(m as u8), lo));
+                inputs.push((Var::S(m as u8 + 1), hi));
+            } else {
+                inputs.push((Var::S(m as u8), own));
+            }
+        }
+        if operand(true, "OPR_SSRC_SPECIAL_SCC") {
+            let s = self.read_scc(b);
+            let s = self.ir.zext(s);
+            inputs.push((Var::Scc, s));
+        }
+        // VGPRs read, and the ones written (a write keeps the old value where the guard is off)
+        let (vr, vw) = rdna2::vgpr_uses(d);
+        let mut vregs: Vec<u16> = vr.iter().chain(&vw).map(|&v| v as u16).collect();
+        vregs.sort_unstable();
+        vregs.dedup();
+        for &v in &vregs {
+            let x = self.read(b, Var::V(v));
+            inputs.push((Var::V(v), x));
+        }
+        // outputs: VGPRs, SGPRs (their current values seeded too, so an output the instruction
+        // leaves alone reads back unchanged), SCC
+        let sw: Vec<u8> = (0..128u8).filter(|&r| writes >> r & 1 != 0 && r != 125).collect();
+        for &r in &sw {
+            if !inputs.iter().any(|&(v, _)| v == Var::S(r)) {
+                let x = self.read(b, Var::S(r));
+                inputs.push((Var::S(r), x));
+            }
+        }
+        let writes_scc = operand(false, "OPR_SSRC_SPECIAL_SCC");
+        let mut outputs: Vec<Var> = vw.iter().map(|&v| Var::V(v as u16)).collect();
+        outputs.extend(sw.iter().map(|&r| Var::S(r)));
+        if writes_scc {
+            outputs.push(Var::Scc);
+        }
+        let guard = if in_store_block || !self.guarded.contains(&d.pc) { self.ir.boolean(true) } else { self.read_bit(b, EXEC)? };
+        let vals = self.ir.foreign(d, guard, &inputs, &outputs)?;
+        for (&var, &v) in outputs.iter().zip(&vals) {
+            match var {
+                Var::V(_) => self.ssa.write(b, var, v),
+                Var::Scc => {
+                    let z = self.ir.int(0);
+                    let s = self.ir.icmp(Cmp::Ne, v, z);
+                    self.write_scc(b, s);
+                }
+                Var::S(_) | Var::M(_) => {}
+            }
+        }
+        if name.starts_with("V_") && !sw.is_empty() {
+            // a mask (a compare, a carry-out): this lane's bit of the ballot the instruction made
+            let base = sw[0];
+            let lo = vals[outputs.iter().position(|&v| v == Var::S(base)).unwrap()];
+            let word = match (self.wave64, outputs.iter().position(|&v| v == Var::S(base + 1))) {
+                (true, Some(k)) => {
+                    let lane = self.lane();
+                    let c32 = self.ir.int(32);
+                    let upper = self.ir.icmp(Cmp::Uge, lane, c32);
+                    self.ir.select(upper, vals[k], lo)
+                }
+                _ => lo,
+            };
+            let lane = self.lane();
+            let c31 = self.ir.int(31);
+            let sh = self.ir.bin(Bin::And, lane, c31);
+            let x = self.ir.bin(Bin::LShr, word, sh);
+            let one = self.ir.int(1);
+            let x = self.ir.bin(Bin::And, x, one);
+            let z = self.ir.int(0);
+            let bit = self.ir.icmp(Cmp::Ne, x, z);
+            self.write_bit(b, base, bit);
+        } else {
+            for (&var, &v) in outputs.iter().zip(&vals) {
+                if let Var::S(r) = var {
+                    self.write_num(b, r, v);
+                }
+            }
+        }
+        Ok(())
+    }
+
+    /// `r`, or an instruction it calls unsupported lowered through `bridge`.
+    fn or_bridge(&mut self, r: R<()>, b: usize, d: &Decoded, in_store_block: bool) -> R<()> {
+        match r {
+            Err(e) if e.starts_with("unsupported ") => match self.bridge(b, d, in_store_block) {
+                Ok(()) => Ok(()),
+                Err(f) if f == "no foreign lowering" => Err(e),
+                Err(f) => Err(format!("{e} ({f})")),
+            },
+            r => r,
+        }
+    }
+
     fn note_inst(&mut self, r: R<()>, b: usize, d: &Decoded) -> R<()> {
         if r.is_err() && self.noted.is_some() {
             let (z, f) = (self.ir.int(0), self.ir.boolean(false));
