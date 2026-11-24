@@ -1089,6 +1089,7 @@ impl<'a, I: Ir> Lower<'a, I> {
             return false;
         }
         let sum = self.sum;
+        // Lanes::new rejects irreducible control flow before constructing the loop bodies.
         if sum.dominates(bw, bc) {
             return sum.body.iter().flatten().all(|inside| !inside[bw] || inside[bc]);
         }
