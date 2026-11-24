@@ -271,17 +271,22 @@ pub struct Summary {
 
 impl Summary {
     /// Whether block a dominates block b (b reached from the entry).
-    pub fn dominates(&self, a: usize, mut b: usize) -> bool {
-        loop {
-            if b == a {
-                return true;
-            }
-            if b == 0 || self.idom[b] == usize::MAX {
-                return false;
-            }
-            b = self.idom[b];
-        }
+    pub fn dominates(&self, a: usize, b: usize) -> bool {
+        dominates(&self.idom, a, b)
     }
+}
+
+fn dominates(idom: &[usize], a: usize, mut b: usize) -> bool {
+    while idom[b] != usize::MAX {
+        if b == a {
+            return true;
+        }
+        if idom[b] == b {
+            break;
+        }
+        b = idom[b];
+    }
+    false
 }
 
 /// Executed with the lane's EXEC bit (VOPC and the lane reads / writes are mask producers).
@@ -403,22 +408,13 @@ impl<'a> Lanes<'a> {
                 break;
             }
         }
-        let dominates = |h: usize, mut b: usize| loop {
-            if b == h {
-                return true;
-            }
-            if b == 0 {
-                return false;
-            }
-            b = idom[b];
-        };
         let mut body: Vec<Option<Vec<bool>>> = vec![None; n];
         for &h in &order {
             for &(p, _) in &preds[h] {
                 if rpo[p] < rpo[h] {
                     continue;
                 }
-                if !dominates(h, p) {
+                if !dominates(&idom, h, p) {
                     return Err("irreducible control flow");
                 }
                 let inside = body[h].get_or_insert_with(|| vec![false; n]);
@@ -1050,6 +1046,15 @@ mod tests {
         let save: I = ("S_AND_SAVEEXEC_B64", "ENC_SOP1", &[("SDST", 0), ("SSRC0", 106)]);
         let s = run(&[CMP, save, ("S_CBRANCH_VCCZ", "ENC_SOPP", &[("SIMM16", 1)]), MOV2, MOV3, ENDPGM]).unwrap();
         assert_eq!((s.vector, s.guarded.len(), s.lane_branches), (2, 1, 1));
+    }
+
+    #[test]
+    fn dominance_ends_at_the_entry_even_when_it_is_not_block_zero() {
+        // 2 is the entry, 0 its child, 1 its grandchild. Block 3 is unreachable.
+        let idom = [2, 0, 2, usize::MAX];
+        assert!(dominates(&idom, 2, 1));
+        assert!(!dominates(&idom, 1, 0));
+        assert!(!dominates(&idom, 3, 3));
     }
 
     #[test]
