@@ -1287,8 +1287,8 @@ fn print(path: &Path, what: &str, agg: Agg, top: usize, json: bool, t0: std::tim
         let mut why: Vec<_> = rc.cs_lane_why.iter().collect();
         why.sort_by(|a, b| b.1.cmp(a.1));
         println!(
-            "compute programs, direct DXIL: {} tried; per-lane form {} ok, per-instruction form (#1426) {} ok; where both are ok ({}): per-lane {:.1} MB, per-instruction {:.1} MB of DXIL; per-lane refused for: {:?}",
-            c[0], c[1], c[2], c[3], c[4] as f64 / 1048576.0, c[5] as f64 / 1048576.0, &why[..why.len().min(15)]
+            "compute programs, direct DXIL: {} tried; per-lane form {} ok, per-instruction form (#1426) {} ok; where both are ok ({}): per-lane {} KB, per-instruction {} KB of DXIL; per-lane refused for: {:?}",
+            c[0], c[1], c[2], c[3], c[4] / 1024, c[5] / 1024, &why[..why.len().min(15)]
         );
         let l = &rc.lanes;
         println!(
