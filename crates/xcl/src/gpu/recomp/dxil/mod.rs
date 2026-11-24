@@ -1,16 +1,24 @@
 //! A DXIL module without HLSL: assembled and signed from LLVM IR text (`assemble`).
 //!
-//! Direct DXIL output (opt-in `XCL_RECOMP_DXIL=1`): the LLVM 3.7 bitcode DXIL is stored as, the
-//! DXBC container of a compute program with its digest, and the table of the DXIL operations.
+//! Direct DXIL output (opt-in `XCL_RECOMP_DXIL=1`): a builder of compute programs for the lowering
+//! ([`module::Module`]), which writes one as the LLVM 3.7 bitcode DXIL is stored as, in the DXBC
+//! container with its digest; and the table of the DXIL operations.
 
 pub mod assemble;
 pub mod bitstream;
 #[cfg(test)]
+mod builder_tests;
+#[cfg(test)]
 pub(crate) mod check;
 pub mod container;
+pub mod dxop;
 #[cfg(test)]
 pub(crate) mod fixtures;
+mod meta;
+pub mod module;
+mod number;
 pub mod ops;
+mod write;
 
 #[cfg(test)]
 mod tests {
