@@ -260,6 +260,12 @@ pub fn compare(ours: &str, reference: &str, differ: &[Differ]) -> Result<(), Str
     Err(format!("the listings differ at line {} (of {} and {} compared):\n{before}\n- ours:      {}\n- reference: {}", at + 1, a.len(), b.len(), line(&a), line(&b)))
 }
 
+/// Compare DXC's listings of two containers of one module: the one XCL `wrote` as bitcode and
+/// the one DXC `assembled` from the module's text. Only the digest may differ.
+pub fn same_listing(wrote: &[u8], assembled: &[u8]) -> Result<(), String> {
+    compare(&disassemble(wrote)?, &disassemble(assembled)?, &[SHADER_HASH])
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -491,5 +497,44 @@ void main() {
         container[program] = 0x65;
         let said = validate(&container).unwrap_err();
         assert!(said.contains("6.5") && said.contains("6.6"), "{said}");
+    }
+
+    /// The container `IDxcAssembler` makes of a listing. Only for the test below: the backend
+    /// has its own way from a module's text to a container.
+    fn assemble(listing: &str) -> Result<Vec<u8>, String> {
+        use windows::Win32::Graphics::Direct3D::Dxc::{CLSID_DxcAssembler, IDxcAssembler, DXC_CP_UTF8};
+        let utils: IDxcUtils = create(dxcompiler()?, &CLSID_DxcUtils)?;
+        let assembler: IDxcAssembler = create(dxcompiler()?, &CLSID_DxcAssembler)?;
+        unsafe {
+            let blob = utils.CreateBlob(listing.as_ptr() as *const c_void, listing.len() as u32, DXC_CP_UTF8).map_err(|e| format!("CreateBlob: {e}"))?;
+            let r = assembler.AssembleToContainer(&blob).map_err(|e| format!("AssembleToContainer: {e}"))?;
+            let status = r.GetStatus().map_err(|e| format!("{e}"))?;
+            if status.is_err() {
+                return Err(failure("AssembleToContainer", &r, status));
+            }
+            let container = r.GetResult().map_err(|e| format!("{e}"))?;
+            Ok(std::slice::from_raw_parts(container.GetBufferPointer() as *const u8, container.GetBufferSize()).to_vec())
+        }
+    }
+
+    /// DXC's listing of a container, assembled, is a container with the same listing but for
+    /// the digest: what `same_listing` holds a written module and its assembled text to.
+    #[test]
+    fn a_container_and_its_assembled_listing_have_the_same_listing() {
+        if !available() {
+            return;
+        }
+        // without the reflection part: the resource names the listing prints are from it, and
+        // an assembled container has none
+        let (container, listing) = reference(HLSL_LDS, "main", "cs_6_6", &["-Qstrip_reflect"]).unwrap();
+        let assembled = assemble(&listing).unwrap();
+        assert_ne!(assembled, container);
+        assert_eq!(same_listing(&container, &assembled), Ok(()));
+        let hash = compare(&listing, &disassemble(&assembled).unwrap(), &[]).unwrap_err();
+        assert!(hash.contains("- ours:      ; shader hash: "), "{hash}");
+        // another program
+        let other = dxc::compile(HLSL, "main", "cs_6_6", &[]).unwrap();
+        let said = same_listing(&other, &assembled).unwrap_err();
+        assert!(said.starts_with("the listings differ at line "), "{said}");
     }
 }
