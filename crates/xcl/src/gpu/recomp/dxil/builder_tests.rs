@@ -85,6 +85,8 @@ fn check(fixture: &Fixture) {
     let arguments = [&["-validator-version", "1.6", "-Qstrip_reflect"], fixture.arguments].concat();
     let (reference, theirs) = check::reference(fixture.hlsl, "main", "cs_6_6", &arguments).unwrap();
     let mut built = (fixture.build)();
+    // DXC's layout has every definition before its uses
+    built.check_dominance = true;
     let ours = built.finish().unwrap();
     dump("xcl.dxil", &ours);
     dump("dxc.dxil", &reference);
@@ -449,4 +451,39 @@ void main()
         m
     }
     check(&Fixture { hlsl: HLSL, arguments: &["-enable-16bit-types"], build, differ: &[], io: &[0x4009_21FB, 0x5444_2D18], res: None });
+}
+
+/// What the builder does not look at unless `XCL_RECOMP_DXIL_VERIFY=1` asks: `dxil.dll` refuses
+/// a program with a use its definition does not dominate.
+#[test]
+fn the_validator_refuses_a_use_its_definition_does_not_dominate() {
+    if !check::available() {
+        return;
+    }
+    let build = || {
+        let mut m = Module::compute([1, 1, 1]);
+        let res = m.root_uav(1, false);
+        let (mut f, _) = entry(&mut m);
+        let (then, join) = (f.block(), f.block());
+        let res = f.handle(res);
+        let x = f.raw_load(res, Val::i32(0));
+        let zero = f.icmp(Icmp::Eq, x, Val::i32(0));
+        f.br_if(zero, then, join);
+        f.at(then);
+        // of one arm only
+        let y = f.add(x, Val::i32(1));
+        f.br(join);
+        f.at(join);
+        f.raw_store(res, Val::i32(4), y);
+        f.ret();
+        m
+    };
+    let mut unchecked = build();
+    unchecked.check_dominance = false;
+    let said = check::validate(&unchecked.finish().unwrap()).expect_err("dxil.dll accepts the program");
+    assert!(said.contains("Instruction does not dominate all uses!"), "{said}");
+    let mut checked = build();
+    checked.check_dominance = true;
+    assert_eq!(checked.finish().map_err(|r| r.kind), Err("not-dominated"));
+    assert_eq!(checked.to_text().map_err(|r| r.kind), Err("not-dominated"));
 }

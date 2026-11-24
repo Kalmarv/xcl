@@ -11,6 +11,7 @@ mod builder_tests;
 #[cfg(test)]
 pub(crate) mod check;
 pub mod container;
+mod dominance;
 pub mod dxop;
 #[cfg(test)]
 pub(crate) mod fixtures;

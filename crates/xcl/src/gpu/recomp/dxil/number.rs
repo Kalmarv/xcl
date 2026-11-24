@@ -12,6 +12,7 @@
 
 use std::collections::HashMap;
 
+use super::dominance;
 use super::module::{Block, Inst, Kind, Module, Refused, Ty, TypeDef, Val};
 
 /// Where records go: a bitstream, or a list in tests.
@@ -153,6 +154,10 @@ impl Numbered {
                     return refuse("phi-incoming", b, k, "a phi with two values from one block".into());
                 }
             }
+        }
+
+        if m.check_dominance {
+            dominance::check(m, &order, &preds)?;
         }
 
         let mut n = Numbered {

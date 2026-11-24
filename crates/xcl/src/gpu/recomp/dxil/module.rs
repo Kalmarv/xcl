@@ -373,6 +373,8 @@ pub struct Module {
     pub(super) numthreads: [u32; 3],
     pub(super) wave_size: Option<u32>,
     pub(super) refused: Option<Refused>,
+    /// whether `finish` checks that definitions dominate their uses (`XCL_RECOMP_DXIL_VERIFY=1`)
+    pub(super) check_dominance: bool,
 }
 
 impl Module {
@@ -394,6 +396,7 @@ impl Module {
             numthreads,
             wave_size: None,
             refused: None,
+            check_dominance: super::dominance::wanted(),
         };
         let main = m.ty(TypeDef::Function(Ty::VOID, Vec::new()));
         m.functions.push(Function { name: "main".into(), ty: main, attr: None });
