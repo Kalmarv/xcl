@@ -1,31 +1,36 @@
 """Generate crates/xcl/src/gpu/recomp/dxil/ops.rs: the DXIL operations (the `dx.op` functions).
 
-Input: three files of DirectXShaderCompiler (github.com/microsoft/DirectXShaderCompiler,
-University of Illinois / NCSA licence) at the tag below, which its build generates from
-utils/hct/hctdb.py and commits:
+Input: DirectXShaderCompiler's own database of the operations, utils/hct/hctdb.py
+(github.com/microsoft/DirectXShaderCompiler, University of Illinois / NCSA licence), at the
+tag below. DXC's build generates its C++ tables (lib/DXIL/DxilOperations.cpp,
+include/dxc/DXIL/DxilInstructions.h, the enumerations of DxilConstants.h) from it with
+utils/hct/hctdb_instrhelp.py; this script reads the same database for the same facts:
 
-- include/dxc/DXIL/DxilConstants.h, the `OpCodeTableID` enumeration: each table's name and id;
-  each table's `OpCode` enumeration: the operations' numbers (checked against their index in
-  the table) and how many of the core ones each DXIL version has; the `ShaderKind`
-  enumeration: the stages;
-- lib/DXIL/DxilOperations.cpp, `<table>_OpCodeProps`: each operation's name, class, function
-  attribute and overloads, by index; `OP::GetOpFunc`: each operation's function type;
-  `OP::GetMinShaderModelAndMask`: each operation's lowest shader model and its stages;
-- include/dxc/DXIL/DxilInstructions.h, `DxilInst_<name>`: the names of the operands after the
-  opcode (a reserved operation has none).
+- utils/hct/hctdb.py is loaded and its `db_dxil()` built (it reads hctdb_inst_docs.txt beside
+  it): each table's id, and each operation's number, name, class, attribute, overloads,
+  operands (type code and name), lowest shader model and stages; how many core operations
+  each DXIL version has;
+- utils/hct/hctdb_instrhelp.py is read, not run, for the tables its generators turn the
+  database's codes into C++ with: `op_type_texts` (an operand's type code as OP::GetOpFunc's
+  type expression), `attr_dict`, `lower_exceptions` (the class's function name) and
+  `shader_stage_to_ShaderKind`.
 
 Usage:  python -I scripts/gen_dxil_ops.py crates/xcl/src/gpu/recomp/dxil/ops.rs [<folder>]
 
-<folder> holds the three files, by file name or by their path in the DXC repository. Without
-it they are downloaded from the tag into a new temporary folder. Their SHA-256 hashes go into
-the header of the generated file.
+<folder> holds the three files, by file name or by their path in the DXC repository, as the
+tag has them (LF line ends). Without it they are downloaded from the tag into a new temporary
+folder. hctdb.py is code this script runs, so the files must have the SHA-256 hashes below;
+for another tag, read its files, then change TAG and the hashes. The hashes also go into the
+header of the generated file.
 
-The parsing follows `xtask/src/dxil_ops.rs` of github.com/Kalmarv/dx (commit
-02d837a0d4788eee8eb64ac7682d5cc2160012aa, GPL-3.0-or-later, contributed to XCL under
-GPL-2.0-only by its author), which reads the names and operands; the class, attribute,
-overloads, types, shader models and stages are read here as well.
+The first version of this script (after `xtask/src/dxil_ops.rs` of github.com/Kalmarv/dx,
+commit 02d837a0d4788eee8eb64ac7682d5cc2160012aa, GPL-3.0-or-later, contributed to XCL under
+GPL-2.0-only by its author) read the generated C++ files instead; for this tag both give the
+same table.
 """
+import ast
 import hashlib
+import importlib.util
 import os
 import re
 import sys
@@ -33,16 +38,26 @@ import tempfile
 import urllib.request
 
 TAG = "v1.9.2609"
-CONSTANTS = "include/dxc/DXIL/DxilConstants.h"
-OPERATIONS = "lib/DXIL/DxilOperations.cpp"
-INSTRUCTIONS = "include/dxc/DXIL/DxilInstructions.h"
 URL = "https://raw.githubusercontent.com/microsoft/DirectXShaderCompiler/%s/%s"
+DATABASE = "utils/hct/hctdb.py"
+HELPERS = "utils/hct/hctdb_instrhelp.py"
+DOCS = "utils/hct/hctdb_inst_docs.txt"
+SHA256 = {
+    DATABASE: "07a9bffc87fa4b5e028b39c1b53a57b12e400682b67869e63ecf4b13128580f8",
+    HELPERS: "493980906937e96f05cdf1c1a48f2ec53151ce259b2f914086982c0cbb2729bf",
+    DOCS: "fcd54db75f43ab40999d7e3f743c688e81a86d6fbe75afdc2d9c6bb9fef34eca",
+}
 
-# OP::TypeSlot (include/dxc/DXIL/DxilOperations.h): the bit of an overload mask, and the letter
-# DxilOperations.cpp's `// Overloads:` comments give it, which the masks are checked against
+# OP::TypeSlot (include/dxc/DXIL/DxilOperations.h): the bit of an overload mask, in the order of
+# the letters of hctdb.py's `dxil_all_user_oload_chars`
 SLOTS = [("F16", "h"), ("F32", "f"), ("F64", "d"), ("I1", "1"), ("I8", "8"), ("I16", "w"), ("I32", "i"), ("I64", "l"), ("UDT", "u"), ("OBJECT", "o"), ("VECTOR", "<")]
 
-# the types OP::GetOpFunc builds a function type from: its expression, `Ty`'s variant
+# DXIL::ShaderKind (include/dxc/DXIL/DxilConstants.h; the database does not have it): the bit
+# of a stage mask
+KINDS = ["Pixel", "Vertex", "Geometry", "Hull", "Domain", "Compute", "Library", "RayGeneration", "Intersection", "AnyHit", "ClosestHit", "Miss", "Callable", "Mesh", "Amplification", "Node"]
+
+# the types OP::GetOpFunc builds a function type from: its expression (the one `op_type_texts`
+# has for a type code of the database), `Ty`'s variant
 TYPES = {
     "A(pV)": "Void",
     "A(pI1)": "I1",
@@ -218,189 +233,79 @@ pub fn op(opcode: u32) -> Option<&'static Op> {
 '''
 
 
-def between(text, begin, end, what):
-    """The text from after `begin` to before the first `end` after it."""
-    start = text.find(begin)
-    if start < 0:
-        sys.exit("%s: no `%s`" % (what, begin))
-    start += len(begin)
-    stop = text.find(end, start)
-    if stop < 0:
-        sys.exit("%s: `%s` has no `%s`" % (what, begin, end))
-    return text[start:stop]
-
-
-def operands(instructions):
-    """Each DxilInst_<operation>'s operands after the opcode, in order (`arg_<name> = <n>`)."""
+def literals(source, names):
+    """The dictionaries hctdb_instrhelp.py assigns to `names`, read from its text."""
     found = {}
-    for chunk in instructions.split("\nstruct DxilInst_")[1:]:
-        op, body = chunk.split(" {", 1)
-        body = body[:body.index("\n};")]
-        names = []
-        if "enum OperandIdx {" in body:
-            lines = [l.strip() for l in between(body, "enum OperandIdx {", "};", INSTRUCTIONS).splitlines() if l.strip()]
-            for n, line in enumerate(lines):
-                m = re.fullmatch(r"arg_(\w+) = (\d+),", line)
-                if not m or int(m.group(2)) != n + 1:
-                    sys.exit("%s: DxilInst_%s operand %d: `%s`" % (INSTRUCTIONS, op, n + 1, line))
-                names.append(m.group(1))
-        if op in found:
-            sys.exit("%s: DxilInst_%s twice" % (INSTRUCTIONS, op))
-        found[op] = names
-    return found
+    for node in ast.walk(ast.parse(source)):
+        if isinstance(node, ast.Assign) and len(node.targets) == 1 and isinstance(node.targets[0], ast.Name) and node.targets[0].id in names:
+            name = node.targets[0].id
+            if name in found:
+                sys.exit("%s: `%s` is assigned twice" % (HELPERS, name))
+            found[name] = ast.literal_eval(node.value)
+    for name in names:
+        if not isinstance(found.get(name), dict):
+            sys.exit("%s: no dictionary `%s`" % (HELPERS, name))
+    return [found[name] for name in names]
 
 
-def signatures(operations):
-    """Each operation's function type in OP::GetOpFunc: the return type, the opcode, the rest."""
-    found = {}
-    cases = between(operations, "// OPCODE-OLOAD-FUNCS:BEGIN", "// OPCODE-OLOAD-FUNCS:END", OPERATIONS)
-    for case in cases.split("case OpCode::")[1:]:
-        op, body = case.split(":", 1)
-        body = body[:body.index("break;")]
-        types = []
-        for statement in body.split(";"):
-            statement = re.sub(r"//.*", "", statement).strip()
-            if statement:
-                if statement not in TYPES:
-                    sys.exit("%s: GetOpFunc gives %s a type this script does not know: `%s`" % (OPERATIONS, op, statement))
-                types.append(TYPES[statement])
-        if len(types) < 2 or types[1] != "I32":
-            sys.exit("%s: GetOpFunc: %s has no i32 opcode after its return type" % (OPERATIONS, op))
-        if op in found:
-            sys.exit("%s: GetOpFunc has %s twice" % (OPERATIONS, op))
-        found[op] = types
-    return found
-
-
-def masks(text, what):
-    """`{{0x63}, {0x400}}` as [0x63, 0x400]."""
-    text = "".join(text.split())
-    if not re.fullmatch(r"\{(\{0x[0-9a-f]+\},?)*\}", text):
-        sys.exit("%s: overload masks `%s`" % (what, text))
-    return [int(m, 16) for m in re.findall(r"0x[0-9a-f]+", text)]
-
-
-def letters(mask, elements):
-    """A dimension's masks as the `// Overloads:` comment writes them, each part as a set."""
-    part = lambda m: frozenset(l for i, (_, l) in enumerate(SLOTS) if m >> i & 1 and l != "<")
-    return (part(mask), mask >> 10 & 1, part(elements))
-
-
-def tables(constants, operations, instructions):
-    names, types = operands(instructions), signatures(operations)
-    _, required = requirements(constants, operations)
+def tables(db, letters, helpers):
+    """Each table of the database: its name, id and operations as `render` writes them."""
+    type_texts, attr_names, lower_exceptions, stage_kinds = helpers
+    if letters != "".join(letter for _, letter in SLOTS):
+        sys.exit("%s: the overload letters are `%s`" % (DATABASE, letters))
+    if sorted(stage_kinds.values()) != sorted(KINDS):
+        sys.exit("%s: the stages are %s" % (HELPERS, sorted(stage_kinds.values())))
+    # as hctdb_instrhelp.py's print_opfunc_props_for_table: a letter's bit is its place
+    mask = lambda chars: sum(1 << letters.index(c) for c in chars)
     out, classes = [], {}
-    enumeration = between(constants, "enum class OpCodeTableID : unsigned {", "};", CONSTANTS)
-    for line in (l.strip() for l in enumeration.splitlines() if l.strip()):
-        m = re.match(r"(\w+) = (\d+),", line)
-        if not m:
-            sys.exit("%s: table `%s`" % (CONSTANTS, line))
-        table, table_id = m.group(1), int(m.group(2))
-        what = "%s, %s" % (OPERATIONS, table)
-        props = between(operations, "static const OP::OpCodeProperty %s_OpCodeProps[] = {" % table, "\n};", what) + "\n"
+    for table in db.op_tables:
         ops = []
-        # each entry: {OC::<id>, "<name>", OCC::<class>, "<function>", Attribute::<attr>, <dims>,
-        # {<type masks>}, {<vector element masks>}}, // Overloads: <letters>
-        entry = re.compile(
-            r'\{OC::(\w+),\s*"(\w+)",\s*OCC::(\w+),\s*"(\w+)",\s*Attribute::(\w+),\s*(\d+),\s*(\{(?:\{\w+\},?\s*)*\}),\s*(\{(?:\{\w+\},?\s*)*\})\},\s*// Overloads: (\S+)\n')
-        found = entry.findall(props)
-        if len(found) != props.count("{OC::"):
-            sys.exit("%s: %d of %d entries read" % (what, len(found), props.count("{OC::")))
-        for index, (ident, name, cls, function, attr, dims, allowed, elements, comment) in enumerate(found):
-            here = "%s: %s" % (what, name)
-            if ident != name:
-                sys.exit("%s is OC::%s" % (here, ident))
-            if attr not in ATTRS:
-                sys.exit("%s has the attribute %s" % (here, attr))
-            allowed, elements = masks(allowed, here), masks(elements, here)
-            if not len(allowed) == len(elements) == int(dims) <= 4:
-                sys.exit("%s: %s overload dimensions, %d and %d masks" % (here, dims, len(allowed), len(elements)))
-            said = [] if comment == "v" else [(frozenset(a), int("<" in d), frozenset(b)) for d in comment.split(",") for a, _, b in [d.partition("<")]]
-            if said != [letters(a, e) for a, e in zip(allowed, elements)]:
-                sys.exit("%s: the masks %s / %s are not `%s`" % (here, allowed, elements, comment))
-            if name not in types:
-                sys.exit("%s: GetOpFunc has no case for %s" % (OPERATIONS, name))
-            ret, params = types[name][0], types[name][2:]
-            if cls == "Reserved":
-                if name in names or params:
-                    sys.exit("%s is reserved but has operands" % here)
-                params = []
-            elif name not in names:
-                sys.exit("%s: no DxilInst_%s for %s's %s" % (INSTRUCTIONS, name, table, name))
-            elif len(names[name]) != len(params):
-                sys.exit("%s: DxilInst_%s names %d operands, GetOpFunc gives %d types" % (here, name, len(names[name]), len(params)))
-            else:
-                params = list(zip(names[name], params))
+        for index, i in enumerate(table):
+            here = "%s, %s: %s" % (DATABASE, table.name, i.name)
+            if i.dxil_opid != table.id << 16 | index or i.dxil_op != i.name:
+                sys.exit("%s is the operation %s, number %#x" % (here, i.dxil_op, i.dxil_opid))
+            if attr_names.get(i.fn_attr) not in ATTRS:
+                sys.exit("%s has the attribute `%s`" % (here, i.fn_attr))
+            overloads = []
+            if i.num_oloads > 0:
+                for dimension in i.oload_types.split(","):
+                    scalars, vector, elements = dimension.partition("<")
+                    overloads.append((mask(scalars + vector), mask(elements)))
+            if len(overloads) != i.num_oloads or (i.oload_types == "v") != (i.num_oloads == 0):
+                sys.exit("%s: the overloads `%s`" % (here, i.oload_types))
+            types = []
+            for o in i.ops:
+                text = type_texts.get(o.llvm_type, "").rstrip(";")
+                if text not in TYPES:
+                    sys.exit("%s: the type `%s` (`%s`), which this script does not know" % (here, o.llvm_type, text))
+                types.append(TYPES[text])
+            if [o.pos for o in i.ops] != list(range(len(i.ops))) or len(types) < 2 or types[1] != "I32" or i.ops[1].name != "opcode":
+                sys.exit("%s: its operands are not a result, the i32 opcode and the rest" % here)
+            params = [(o.name, ty) for o, ty in zip(i.ops[2:], types[2:])]
+            if i.is_reserved != (i.dxil_class == "Reserved") or i.is_reserved and params:
+                sys.exit("%s is reserved but has operands" % here)
+            function = lower_exceptions.get(i.dxil_class, i.dxil_class[:1].lower() + i.dxil_class[1:])
             # a class has one function per overload, so its operations with as many overload
             # dimensions have the same types (WavePrefixBitCount, with none, is in WavePrefixOp's)
-            shared = classes.setdefault((cls, dims), (function, name, types[name], attr))
-            if (function, types[name], attr) != (shared[0], shared[2], shared[3]):
-                sys.exit("%s: its function, types or attribute differ from %s's, of the same class %s" % (here, shared[1], cls))
-            ops.append((table_id << 16 | index, name, cls, function, attr, list(zip(allowed, elements)), ret, params) + required(table_id << 16 | index, name))
-        numbered = numbers(constants, table)
-        if numbered.get("NumOpCodes") != len(ops) or any(numbered.get(op[1]) != index for index, op in enumerate(ops)):
-            sys.exit("%s: the indices of %s are not the numbers of its OpCode enumeration" % (what, table))
-        out.append((table, table_id, ops))
-    if not out:
-        sys.exit("%s: OpCodeTableID lists no tables" % CONSTANTS)
+            shared = classes.setdefault((i.dxil_class, i.num_oloads), (function, i.name, types, i.fn_attr))
+            if (function, types, i.fn_attr) != (shared[0], shared[2], shared[3]):
+                sys.exit("%s: its function, types or attribute differ from %s's, of the same class %s" % (here, shared[1], i.dxil_class))
+            # OP::GetMinShaderModelAndMask: the shader model where the operation is kept (not
+            # translated for an older one), and every stage when none is named
+            stages = sum(1 << KINDS.index(stage_kinds[s]) for s in i.shader_stages) or (1 << len(KINDS)) - 1
+            ops.append((i.dxil_opid, i.name, i.dxil_class, function, attr_names[i.fn_attr], overloads, types[0], params, tuple(i.shader_model), stages))
+        out.append((table.name, table.id, ops))
+    if not out or out[0][:2] != ("CoreOps", 0):
+        sys.exit("%s: the first table is not CoreOps" % DATABASE)
     return out
 
 
-def requirements(constants, operations):
-    """The stages' names, and OP::GetMinShaderModelAndMask as a function of an opcode and its
-    name: the lowest shader model (where the operation is kept, not translated for an older
-    one) and the stage mask. The names are checked against the function's comments."""
-    kinds = [k.split("=")[0].strip() for k in between(constants, "enum class ShaderKind {", "Invalid,", CONSTANTS).split(",") if k.strip()]
-    if kinds[:2] != ["Pixel", "Vertex"] or len(kinds) > 16 or not all(re.fullmatch(r"\w+", k) for k in kinds):
-        sys.exit("%s: ShaderKind: %s" % (CONSTANTS, kinds))
-    rules = []
-    section = between(operations, "// OPCODE-SMMASK:BEGIN", "// OPCODE-SMMASK:END", OPERATIONS)
-    for chunk in section.split("// Instructions:")[1:]:
-        comment, rest = chunk.split("\n  if (", 1)
-        condition, body = rest.split(") {\n", 1)
-        named = {int(n): name for name, n in re.findall(r"(\w+)=(\d+)", comment)}
-        what = "%s: GetMinShaderModelAndMask, %s" % (OPERATIONS, sorted(named.values()))
-        condition = "".join(condition.split())
-        ranges = [(int(a or c), int(b or c)) for a, b, c in re.findall(r"(\d+)<=op&&op<=(\d+)|op==(\d+)", condition)]
-        if "||".join("(%d<=op&&op<=%d)" % r if r[0] != r[1] else "op==%d" % r[0] for r in ranges) != condition:
-            sys.exit("%s: the condition `%s`" % (what, condition))
-        if sorted(named) != sorted(n for a, b in ranges for n in range(a, b + 1)):
-            sys.exit("%s: `%s` is not the opcodes %s" % (what, condition, sorted(named)))
-        if "bWithTranslation" in body:
-            body = body.split("} else {", 1)[1]
-        sm = re.search(r"major = (\d+);\s*minor = (\d+);", body)
-        mask = re.search(r"mask =([^;]*);", body)
-        flags = re.findall(r"SFLAG\((\w+)\)", mask.group(1)) if mask else kinds
-        if mask and "".join(mask.group(1).split()) != "|".join("SFLAG(%s)" % f for f in flags) or not (sm or mask):
-            sys.exit("%s: its shader model and mask" % what)
-        rules.append((named, tuple(map(int, sm.groups())) if sm else (6, 0), sum(1 << kinds.index(f) for f in flags)))
-
-    def of(opcode, name):
-        for named, sm, mask in rules:
-            if opcode in named:
-                if named[opcode] != name:
-                    sys.exit("%s: GetMinShaderModelAndMask calls opcode %d %s, the table %s" % (OPERATIONS, opcode, named[opcode], name))
-                return sm, mask
-        return (6, 0), (1 << len(kinds)) - 1
-
-    return kinds, of
-
-
-def numbers(constants, table):
-    """The `OpCode` enumeration of a table: each name's value."""
-    block = between(constants, "// Enumeration for %s DXIL operations\nenum class OpCode : unsigned {" % table, "\n};", CONSTANTS)
-    block = re.sub(r"//.*", "", block)
-    return {name: int(value, 0) for name, value in re.findall(r"(\w+)\s*=\s*(\w+),", block)}
-
-
-def versions(constants):
-    """How many core operations DXIL 1.0, 1.1, ... have (`NumOpCodes_Dxil_1_<n>`)."""
-    core = numbers(constants, "CoreOps")
-    counts = []
-    while "NumOpCodes_Dxil_1_%d" % len(counts) in core:
-        counts.append(core["NumOpCodes_Dxil_1_%d" % len(counts)])
-    if not counts or counts != sorted(counts) or counts[-1] != core["NumOpCodes"]:
-        sys.exit("%s: the core operations by DXIL version: %s of %s" % (CONSTANTS, counts, core.get("NumOpCodes")))
+def versions(table):
+    """How many core operations DXIL 1.0, 1.1, ... have."""
+    info = table.op_enum.dxil_version_info
+    counts = [info[key] for key in sorted(info)]
+    if sorted(info) != [(1, n) for n in range(len(info))] or counts != sorted(counts) or counts[-1:] != [len(table.ops)]:
+        sys.exit("%s: the core operations by DXIL version: %s of %d" % (DATABASE, info, len(table.ops)))
     return counts
 
 
@@ -432,29 +337,38 @@ def render(tabs, counts, kinds):
     return "".join(out)
 
 
-def read(folder, path):
+def find(folder, path):
     for candidate in (os.path.join(folder, path), os.path.join(folder, os.path.basename(path))):
         if os.path.isfile(candidate):
-            return open(candidate, "rb").read()
+            return candidate
     sys.exit("%s: no %s" % (folder, path))
 
 
 def main(dst, folder=None):
-    paths = [OPERATIONS, INSTRUCTIONS, CONSTANTS]
     if folder is None:
         folder = tempfile.mkdtemp(prefix="dxc-%s-" % TAG)
-        for path in paths:
+        for path in SHA256:
             urllib.request.urlretrieve(URL % (TAG, path), os.path.join(folder, os.path.basename(path)))
         print("downloaded to %s" % folder)
-    data = {path: read(folder, path) for path in paths}
-    text = {path: data[path].decode("utf-8").replace("\r\n", "\n") for path in paths}
-    tabs = tables(text[CONSTANTS], text[OPERATIONS], text[INSTRUCTIONS])
+    files = {path: find(folder, path) for path in SHA256}
+    for path, file in files.items():
+        got = hashlib.sha256(open(file, "rb").read()).hexdigest()
+        if got != SHA256[path]:
+            sys.exit("%s is not %s of %s (sha256 %s, not %s): nothing was run" % (file, path, TAG, got, SHA256[path]))
+    if os.path.dirname(files[DOCS]) != os.path.dirname(files[DATABASE]):
+        sys.exit("%s: hctdb.py reads hctdb_inst_docs.txt beside itself" % folder)
+    spec = importlib.util.spec_from_file_location("hctdb", files[DATABASE])
+    hctdb = importlib.util.module_from_spec(spec)
+    spec.loader.exec_module(hctdb)
+    db = hctdb.db_dxil()
+    helpers = literals(open(files[HELPERS], encoding="utf-8").read(), ["op_type_texts", "attr_dict", "lower_exceptions", "shader_stage_to_ShaderKind"])
+    tabs = tables(db, hctdb.dxil_all_user_oload_chars, helpers)
     header = "// @generated by scripts/gen_dxil_ops.py from DirectXShaderCompiler %s – do not edit by hand.\n" % TAG
     header += "// Copyright (c) Microsoft Corporation. Licence: University of Illinois Open Source (NCSA).\n"
-    for path in paths:
-        header += "// input %s sha256 %s\n" % (path, hashlib.sha256(data[path]).hexdigest())
+    for path in SHA256:
+        header += "// input %s sha256 %s\n" % (path, SHA256[path])
     with open(dst, "w", encoding="utf-8", newline="\n") as f:
-        f.write(header + render(tabs, versions(text[CONSTANTS]), requirements(text[CONSTANTS], text[OPERATIONS])[0]))
+        f.write(header + render(tabs, versions(db.op_tables[0]), KINDS))
     print("%s: %s" % (dst, ", ".join("%s %d" % (table, len(ops)) for table, _, ops in tabs)))
 
 
