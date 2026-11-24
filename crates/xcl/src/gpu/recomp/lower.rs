@@ -1487,7 +1487,10 @@ impl<I: Ir> Lower<'_, I> {
                 inputs.push((Var::S(m as u8), lo));
                 inputs.push((Var::S(m as u8 + 1), hi));
             } else {
+                // #1426 reads the mask as an SGPR pair in wave32 too: the upper one is 0
+                let z = self.ir.int(0);
                 inputs.push((Var::S(m as u8), own));
+                inputs.push((Var::S(m as u8 + 1), z));
             }
         }
         if operand(true, "OPR_SSRC_SPECIAL_SCC") {

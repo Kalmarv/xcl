@@ -70,7 +70,9 @@ impl DxilIr {
         // set up in the entry block (a compute program's come with `compute_ids`)
         let mut ids = None;
         let lanes_set = match entry {
-            Entry::Kernel if lw.split => {
+            // (a kernel always: `Lw`'s lane bit, `lane31`, is what #1426's lowering of a carry-in or
+            // a `v_cndmask` reads, and stays 0 without it)
+            Entry::Kernel => {
                 lw.setup_lanes();
                 true
             }
