@@ -4,3 +4,5 @@
 
 pub mod assemble;
 pub mod bitstream;
+#[cfg(test)]
+pub(crate) mod check;
