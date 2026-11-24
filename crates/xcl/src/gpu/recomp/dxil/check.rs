@@ -164,6 +164,11 @@ pub enum Differ<'a> {
     Ident,
     /// TBAA: the `!tbaa` attachments of loads and stores, and the nodes they lead to.
     Tbaa,
+    /// The order of the `%x = type` lines and of the `declare` lines (DXC declares an operation
+    /// when a pass first needs it), and with it the numbers of the attribute groups: both kinds
+    /// of lines are sorted, a declaration gets its group's attributes in place of the number,
+    /// and the `attributes #n` and `; Function Attrs` lines go.
+    DeclarationOrder,
 }
 
 /// The digest of the container, which the listing's header prints.
@@ -212,9 +217,33 @@ fn kept(listing: &str, differ: &[Differ]) -> Vec<String> {
                 }
                 drop_nodes(&mut lines, tags);
             }
+            Differ::DeclarationOrder => {
+                // `attributes #0 = { nounwind readnone }` for `declare … #0`
+                let groups: Vec<(String, String)> =
+                    lines.iter().filter_map(|l| l.strip_prefix("attributes ")?.split_once(" = ")).map(|(n, set)| (format!(" {n}"), format!(" {set}"))).collect();
+                lines.retain(|l| !l.starts_with("attributes #") && !l.starts_with("; Function Attrs: "));
+                for l in lines.iter_mut().filter(|l| l.starts_with("declare ")) {
+                    if let Some((n, set)) = groups.iter().find(|(n, _)| l.ends_with(n.as_str())) {
+                        l.truncate(l.len() - n.len());
+                        l.push_str(set);
+                    }
+                }
+                sort_among_themselves(&mut lines, |l| l.starts_with("declare "));
+                sort_among_themselves(&mut lines, |l| l.starts_with('%') && l.contains(" = type "));
+            }
         }
     }
     lines
+}
+
+/// Sort the lines that `is` holds for, in the places they have.
+fn sort_among_themselves(lines: &mut [String], is: impl Fn(&str) -> bool) {
+    let places: Vec<usize> = (0..lines.len()).filter(|&i| is(&lines[i])).collect();
+    let mut sorted: Vec<String> = places.iter().map(|&i| std::mem::take(&mut lines[i])).collect();
+    sorted.sort();
+    for (i, line) in places.into_iter().zip(sorted) {
+        lines[i] = line;
+    }
 }
 
 /// Compare two listings line by line, `ours` of a container XCL wrote and DXC's `reference`
@@ -307,6 +336,53 @@ define void @main() {
         assert!(said.contains("- ours:      !llvm.ident") && said.contains("- reference:   ret void"), "{said}");
         let said = compare(OURS.trim_end_matches("!1 = !{i32 1, i32 6}\n"), LISTING, &all).unwrap_err();
         assert!(said.contains("- ours:      (the listing ends)"), "{said}");
+    }
+
+    #[test]
+    fn listings_compare_without_the_order_of_declarations() {
+        let dxc = "\
+%dx.types.Handle = type { i8* }
+%dx.types.ResRet.i32 = type { i32, i32, i32, i32, i32 }
+
+define void @main() {
+  ret void
+}
+
+; Function Attrs: nounwind readnone
+declare i32 @dx.op.threadId.i32(i32, i32) #0
+
+; Function Attrs: nounwind readonly
+declare %dx.types.ResRet.i32 @dx.op.rawBufferLoad.i32(i32, %dx.types.Handle, i32, i32, i8, i32) #1
+
+attributes #0 = { nounwind readnone }
+attributes #1 = { nounwind readonly }
+";
+        // the same declarations in the order the program calls them, the groups numbered in it
+        let ours = "\
+%dx.types.ResRet.i32 = type { i32, i32, i32, i32, i32 }
+%dx.types.Handle = type { i8* }
+
+define void @main() {
+  ret void
+}
+
+; Function Attrs: nounwind readonly
+declare %dx.types.ResRet.i32 @dx.op.rawBufferLoad.i32(i32, %dx.types.Handle, i32, i32, i8, i32) #0
+
+; Function Attrs: nounwind readnone
+declare i32 @dx.op.threadId.i32(i32, i32) #1
+
+attributes #0 = { nounwind readonly }
+attributes #1 = { nounwind readnone }
+";
+        assert_eq!(compare(ours, dxc, &[Differ::DeclarationOrder]), Ok(()));
+        assert!(compare(ours, dxc, &[]).unwrap_err().contains("at line 1 "));
+        // The attributes of a declaration still count, and so does a declaration only one has.
+        let said = compare(&ours.replace("#1 = { nounwind readnone }", "#1 = { nounwind }"), dxc, &[Differ::DeclarationOrder]).unwrap_err();
+        assert!(said.contains("- ours:      declare i32 @dx.op.threadId.i32(i32, i32) { nounwind }") && said.contains("i32) { nounwind readnone }"), "{said}");
+        let more = ours.replace("attributes #0", "declare void @dx.op.barrier(i32, i32) #1\n\nattributes #0");
+        let said = compare(&more, dxc, &[Differ::DeclarationOrder]).unwrap_err();
+        assert!(said.contains("- ours:      declare void @dx.op.barrier(i32, i32) { nounwind readnone }"), "{said}");
     }
 
     #[test]
