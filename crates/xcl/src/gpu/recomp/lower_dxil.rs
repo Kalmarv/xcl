@@ -478,6 +478,7 @@ mod tests {
         for (name, lines) in [
             ("straight", STRAIGHT),
             ("skipped if", SKIPPED_IF),
+            ("region diamond", REGION_DIAMOND),
             ("leaving loop", LEAVING_LOOP),
             ("uniform loop", UNIFORM_LOOP),
             ("memory", MEMORY),

@@ -263,6 +263,25 @@ pub struct Summary {
     /// blocks the entry reaches: every block after its forward predecessors)
     pub blocks: Vec<Block>,
     pub order: Vec<usize>,
+    /// each block's immediate dominator (the entry's is itself; `usize::MAX`: not reached), and
+    /// for each block: Some(blocks of its loop) when it heads one
+    pub idom: Vec<usize>,
+    pub body: Vec<Option<Vec<bool>>>,
+}
+
+impl Summary {
+    /// Whether block a dominates block b (b reached from the entry).
+    pub fn dominates(&self, a: usize, mut b: usize) -> bool {
+        loop {
+            if b == a {
+                return true;
+            }
+            if b == 0 || self.idom[b] == usize::MAX {
+                return false;
+            }
+            b = self.idom[b];
+        }
+    }
 }
 
 /// Executed with the lane's EXEC bit (VOPC and the lane reads / writes are mask producers).
@@ -286,6 +305,7 @@ struct Lanes<'a> {
     preds: Vec<Vec<(usize, usize)>>,
     /// reverse postorder, and for each block: Some(blocks of its loop) when it heads one
     order: Vec<usize>,
+    idom: Vec<usize>,
     body: Vec<Option<Vec<bool>>>,
     /// per instruction: SGPRs it overwrites (`x64_masks::uses`), SGPRs it may change, whether
     /// it writes SCC
@@ -421,7 +441,7 @@ impl<'a> Lanes<'a> {
                 (written, kill, d.ienc.operands.iter().any(|o| o.output && o.ty == "OPR_SSRC_SPECIAL_SCC"))
             })
             .collect();
-        Ok(Lanes { insts, wave64, launch, bdd: Bdd::new(), atoms: HashMap::new(), born: Vec::new(), blocks, succ, preds, order, body, effects })
+        Ok(Lanes { insts, wave64, launch, bdd: Bdd::new(), atoms: HashMap::new(), born: Vec::new(), blocks, succ, preds, order, idom, body, effects })
     }
 
     fn atom(&mut self, a: Atom, block: usize) -> R<B> {
@@ -828,6 +848,8 @@ impl<'a> Lanes<'a> {
             })
             .collect();
         sum.order = self.order.clone();
+        sum.idom = self.idom.clone();
+        sum.body = self.body.clone();
         Ok(sum)
     }
 }

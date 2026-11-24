@@ -174,6 +174,9 @@ struct Lower<'a, I: Ir> {
     /// inside a coalesced guarded run's own block: only lanes with EXEC set enter, so writes
     /// need no per-instruction guard
     unguarded: bool,
+    /// per IR block of the program: its analysis block, and whether it is a coalesced run's
+    /// block (only the lanes with their EXEC bit enter it)
+    place: Vec<Option<(usize, bool)>>,
     /// the IR block each mask bit was written in, and the mask bits read (block, value)
     def_block: std::collections::HashMap<I::V, usize>,
     lane_uses: Vec<(usize, I::V)>,
@@ -996,7 +999,9 @@ impl<'a, I: Ir> Lower<'a, I> {
     /// Whether a lane reading mask bit v in block c may see its own stale bit: v (or a phi
     /// operand reaching it) was written in another block that not every lane passed through.
     /// The hardware's whole-wave write left the absent lanes' bits 0 there; this lane kept its
-    /// own older one. EXEC is not concerned: an absent lane's bit is 0 in both.
+    /// own older one. EXEC is not concerned: an absent lane's bit is 0 in both. Unless that
+    /// block dominates c and c is in every loop it is in: then every lane reading in c passed
+    /// the write, in the same pass as the wave's last one.
     fn stale(&self, c: usize, v: I::V) -> bool {
         let mut seen = HashSet::new();
         let mut work = vec![v];
@@ -1009,7 +1014,7 @@ impl<'a, I: Ir> Lower<'a, I> {
                 Some(ops) => work.extend_from_slice(ops),
                 None => {
                     if let Some(&b) = self.def_block.get(&v) {
-                        if self.def_owner[b] != self.use_owner[c] && self.partial[b] {
+                        if self.def_owner[b] != self.use_owner[c] && self.partial[b] && !self.passed(b, c) {
                             return true;
                         }
                     }
@@ -1017,6 +1022,21 @@ impl<'a, I: Ir> Lower<'a, I> {
             }
         }
         false
+    }
+
+    /// Whether every lane that gets to IR block c passed IR block w on the way, in the same pass
+    /// of every loop w is in (c is not past an exit of one). The end (where the kernel ABI
+    /// stores) is not a block of the program: never.
+    fn passed(&self, w: usize, c: usize) -> bool {
+        let (Some((bw, run)), Some((bc, _))) = (self.place[w], self.place[c]) else {
+            return false;
+        };
+        if run {
+            // a coalesced run's block: only the lanes with their EXEC bit pass it
+            return false;
+        }
+        let sum = self.sum;
+        sum.dominates(bw, bc) && sum.body.iter().flatten().all(|inside| !inside[bw] || inside[bc])
     }
 
     /// Whether v is (or is a phi reaching) `marker`.
@@ -1156,8 +1176,10 @@ fn lower_with<I: Ir>(insts: &[Decoded], stage: Stage, wave64: bool, mut ir: I, s
     let mut partial = vec![false; count];
     let mut def_owner: Vec<usize> = (0..count).collect();
     let mut use_owner: Vec<usize> = (0..count).collect();
+    let mut place = vec![None; count];
     for (b, p) in partial_blocks(&sum).into_iter().enumerate() {
         partial[blk(b)] = p;
+        place[blk(b)] = Some((b, false));
         for &(_, s, c) in &splits[b] {
             partial[s] = true;
             partial[c] = p;
@@ -1165,6 +1187,8 @@ fn lower_with<I: Ir>(insts: &[Decoded], stage: Stage, wave64: bool, mut ir: I, s
             use_owner[s] = blk(b);
             def_owner[c] = blk(b);
             use_owner[c] = blk(b);
+            place[s] = Some((b, true));
+            place[c] = Some((b, false));
         }
     }
     let ends: Vec<usize> = sum.order.iter().copied().filter(|&b| sum.blocks[b].succ.is_empty()).collect();
@@ -1215,6 +1239,7 @@ fn lower_with<I: Ir>(insts: &[Decoded], stage: Stage, wave64: bool, mut ir: I, s
         def_owner,
         use_owner,
         unguarded: false,
+        place,
         def_block: std::collections::HashMap::new(),
         lane_uses: Vec::new(),
         dpp_src: None,
@@ -2165,6 +2190,25 @@ pub(crate) mod tests {
         ("V_MOV_B32", "ENC_VOP1", &[("VDST", 1), ("SRC0", 135)]),
         ("S_OR_B32", "ENC_SOP2", &[("SDST", 126), ("SSRC0", 126), ("SSRC1", 0)]),
         ("V_ADD_NC_U32", "ENC_VOP2", &[("VDST", 2), ("SRC0", 129), ("VSRC1", 1)]),
+        ENDPGM,
+    ];
+    /// v_cmp_gt_u32 vcc, 16, v0; s_and_saveexec s0, vcc; s_cbranch_execz L; s_mov s4, 5;
+    /// v_cmp_gt_u32 vcc, 8, v0; s_and_saveexec s1, vcc; s_cbranch_execz M; v_mov v1, 7;
+    /// M: exec |= s1; v_cndmask v3, 0, v0, vcc; v_add v2, s4, v3; L: exec |= s0: s4, VCC and s1
+    /// are written in the lanes below 16 and read by them past the inner if
+    pub(crate) const REGION_DIAMOND: &[I] = &[
+        ("V_CMP_GT_U32", "ENC_VOPC", &[("SRC0", 144), ("VSRC1", 0)]),
+        ("S_AND_SAVEEXEC_B32", "ENC_SOP1", &[("SDST", 0), ("SSRC0", 106)]),
+        ("S_CBRANCH_EXECZ", "ENC_SOPP", &[("SIMM16", 8)]),
+        ("S_MOV_B32", "ENC_SOP1", &[("SDST", 4), ("SSRC0", 133)]),
+        ("V_CMP_GT_U32", "ENC_VOPC", &[("SRC0", 136), ("VSRC1", 0)]),
+        ("S_AND_SAVEEXEC_B32", "ENC_SOP1", &[("SDST", 1), ("SSRC0", 106)]),
+        ("S_CBRANCH_EXECZ", "ENC_SOPP", &[("SIMM16", 1)]),
+        ("V_MOV_B32", "ENC_VOP1", &[("VDST", 1), ("SRC0", 135)]),
+        ("S_OR_B32", "ENC_SOP2", &[("SDST", 126), ("SSRC0", 126), ("SSRC1", 1)]),
+        ("V_CNDMASK_B32", "ENC_VOP2", &[("VDST", 3), ("SRC0", 128), ("VSRC1", 0)]),
+        ("V_ADD_NC_U32", "ENC_VOP2", &[("VDST", 2), ("SRC0", 4), ("VSRC1", 3)]),
+        ("S_OR_B32", "ENC_SOP2", &[("SDST", 126), ("SSRC0", 126), ("SSRC1", 0)]),
         ENDPGM,
     ];
     /// s_mov s0, exec; L: v_add v1, v1, 1; v_cmp_ge_u32 vcc, v1, v0; exec &= ~vcc;
@@ -3309,6 +3353,30 @@ pub(crate) mod tests {
     }
 
     #[test]
+    fn a_value_written_in_a_lane_region_is_read_in_it_past_an_inner_if() {
+        // the writes dominate the reads and no loop is left between: accepted
+        let (s, v) = state(32);
+        let (_, v) = run(REGION_DIAMOND, false, &s, &v);
+        for (l, regs) in v.iter().enumerate() {
+            let (v1, v3) = if l < 8 { (7, l as u32) } else { (0, 0) };
+            let want = if l < 16 { (v1, 5 + v3, v3) } else { (0, 0, 0) };
+            assert_eq!((regs[1], regs[2], regs[3]), want, "lane {l}");
+        }
+        // written in the loop the lanes leave one by one, read after it: refused
+        let mut lines = LEAVING_LOOP.to_vec();
+        lines.insert(6, ("V_CNDMASK_B32", "ENC_VOP2", &[("VDST", 3), ("SRC0", 128), ("VSRC1", 0)]));
+        let err = lower_kernel(&decode(&lines), false, Interp::default()).err().expect("refused");
+        assert!(err.contains("some lanes were elsewhere"), "{err}");
+        // written in the arm some lanes skip, read after the join: refused
+        let mut lines = SKIPPED_IF.to_vec();
+        lines[2] = ("S_CBRANCH_EXECZ", "ENC_SOPP", &[("SIMM16", 2)]);
+        lines.insert(3, ("S_MOV_B32", "ENC_SOP1", &[("SDST", 4), ("SSRC0", 133)]));
+        lines.insert(6, ("V_ADD_NC_U32", "ENC_VOP2", &[("VDST", 3), ("SRC0", 4), ("VSRC1", 1)]));
+        let err = lower_kernel(&decode(&lines), false, Interp::default()).err().expect("refused");
+        assert!(err.contains("some lanes were elsewhere"), "{err}");
+    }
+
+    #[test]
     fn lanes_leave_a_loop_one_by_one() {
         let (s, v) = state(32);
         let (s, v) = run(LEAVING_LOOP, false, &s, &v);
@@ -3467,7 +3535,7 @@ pub(crate) mod tests {
             runner::skip_test(if !gpu_waves() { "no GPU with 32-lane waves" } else { "no DXC" });
             return;
         }
-        for (name, lines) in [("straight", STRAIGHT), ("skipped if", SKIPPED_IF), ("leaving loop", LEAVING_LOOP), ("uniform loop", UNIFORM_LOOP), ("memory", MEMORY)] {
+        for (name, lines) in [("straight", STRAIGHT), ("skipped if", SKIPPED_IF), ("region diamond", REGION_DIAMOND), ("leaving loop", LEAVING_LOOP), ("uniform loop", UNIFORM_LOOP), ("memory", MEMORY)] {
             let bytes: Vec<u8> = lines.iter().flat_map(|(n, e, f)| rdna2::encode(n, e, f, None).unwrap()).collect();
             let (s, v) = state(32);
             let mut st = runner::KernelState::default();
