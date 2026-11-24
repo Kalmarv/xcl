@@ -1,16 +1,19 @@
 //! Test-time checks of DXIL containers against Microsoft's own tools, for the tests of this
-//! module: `dxil.dll`'s validator says whether a container is valid DXIL. The libraries are the
-//! ones [`dxc`] loads. D3D12 does not need `dxil.dll` to accept a container, so nothing here is
-//! part of the program.
+//! module: `dxil.dll`'s validator says whether a container is valid DXIL, and DXC's listing of
+//! a container is compared with its listing of what it compiles from HLSL for the same program.
+//! The libraries are the ones [`dxc`] loads. D3D12 does not need `dxil.dll` to accept a
+//! container, so nothing here is part of the program.
 //!
 //! A test starts with `if !check::available() { return; }`.
 
+use std::collections::BTreeSet;
 use std::ffi::c_void;
 use std::sync::OnceLock;
 
 use windows::core::{Interface, GUID, HRESULT};
 use windows::Win32::Graphics::Direct3D::Dxc::{
-    DxcValidatorFlags_Default, IDxcBlob, IDxcOperationResult, IDxcUtils, IDxcValidator, CLSID_DxcUtils, CLSID_DxcValidator, DXC_CP_ACP,
+    DxcBuffer, DxcValidatorFlags_Default, IDxcBlob, IDxcCompiler3, IDxcOperationResult, IDxcResult, IDxcUtils, IDxcValidator, CLSID_DxcCompiler, CLSID_DxcUtils,
+    CLSID_DxcValidator, DXC_CP_ACP,
 };
 
 use super::super::{dxc, runner};
@@ -96,6 +99,105 @@ pub fn validate(container: &[u8]) -> Result<(), String> {
     Ok(())
 }
 
+/// DXC's listing of a container (`IDxcCompiler3::Disassemble`, what `dxc -dumpbin` prints).
+pub fn disassemble(container: &[u8]) -> Result<String, String> {
+    let compiler: IDxcCompiler3 = create(dxcompiler()?, &CLSID_DxcCompiler)?;
+    let buf = DxcBuffer { Ptr: container.as_ptr() as *const c_void, Size: container.len(), Encoding: DXC_CP_ACP.0 };
+    unsafe {
+        let r: IDxcResult = compiler.Disassemble(&buf).map_err(|e| format!("Disassemble: {e}"))?;
+        let status = r.GetStatus().map_err(|e| format!("{e}"))?;
+        if status.is_err() {
+            return Err(failure("Disassemble", &r, status));
+        }
+        Ok(text(&r.GetResult().map_err(|e| format!("{e}"))?))
+    }
+}
+
+/// The container DXC compiles from `hlsl` and its listing, to [`compare`] with the listing of
+/// the container XCL writes for the same program. `profile` e.g. "cs_6_6"; `extra` are dxc
+/// arguments.
+pub fn reference(hlsl: &str, entry: &str, profile: &str, extra: &[&str]) -> Result<(Vec<u8>, String), String> {
+    let container = dxc::compile(hlsl, entry, profile, extra)?;
+    let listing = disassemble(&container)?;
+    Ok((container, listing))
+}
+
+/// What the listings of two containers of one program may differ in.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum Differ<'a> {
+    /// Lines that contain this text.
+    Line(&'a str),
+    /// The node `!llvm.ident` names: the compiler's name and version.
+    Ident,
+    /// TBAA: the `!tbaa` attachments of loads and stores, and the nodes they lead to.
+    Tbaa,
+}
+
+/// The digest of the container, which the listing's header prints.
+pub const SHADER_HASH: Differ = Differ::Line("; shader hash: ");
+
+/// The numbers of the metadata nodes `text` names (`!7`).
+fn node_refs(text: &str) -> Vec<u32> {
+    let number = |at: usize| text[at + 1..].split(|c: char| !c.is_ascii_digit()).next().and_then(|n| n.parse().ok());
+    text.match_indices('!').filter_map(|(at, _)| number(at)).collect()
+}
+
+/// Drop the lines that define these nodes and the nodes they lead to.
+fn drop_nodes(lines: &mut Vec<String>, mut nodes: Vec<u32>) {
+    let mut dropped = BTreeSet::new();
+    while let Some(n) = nodes.pop() {
+        let head = format!("!{n} = ");
+        if let Some(line) = lines.iter().find(|l| l.starts_with(&head)) {
+            if dropped.insert(head.clone()) {
+                nodes.extend(node_refs(&line[head.len()..]));
+            }
+        }
+    }
+    lines.retain(|l| !dropped.iter().any(|head| l.starts_with(head)));
+}
+
+/// The lines of a listing without what `differ` names.
+fn kept(listing: &str, differ: &[Differ]) -> Vec<String> {
+    let mut lines: Vec<String> = listing.lines().map(str::to_string).collect();
+    for d in differ {
+        match *d {
+            Differ::Line(text) => lines.retain(|l| !l.contains(text)),
+            Differ::Ident => {
+                let named = lines.iter().filter_map(|l| l.strip_prefix("!llvm.ident = ")).flat_map(node_refs).collect();
+                drop_nodes(&mut lines, named);
+            }
+            Differ::Tbaa => {
+                const TAG: &str = ", !tbaa !";
+                let mut tags = Vec::new();
+                for l in &mut lines {
+                    while let Some(at) = l.find(TAG) {
+                        let digits = l[at + TAG.len()..].chars().take_while(char::is_ascii_digit).count();
+                        let end = at + TAG.len() + digits;
+                        tags.extend(l[at + TAG.len()..end].parse::<u32>());
+                        l.replace_range(at..end, "");
+                    }
+                }
+                drop_nodes(&mut lines, tags);
+            }
+        }
+    }
+    lines
+}
+
+/// Compare two listings line by line, `ours` of a container XCL wrote and DXC's `reference`
+/// for the same program, both without what `differ` names. The error shows the first line
+/// that differs. Nothing is renumbered: a metadata node that only one listing has (other than
+/// the TBAA nodes, which come last) shifts every later `!N` and shows as a difference.
+pub fn compare(ours: &str, reference: &str, differ: &[Differ]) -> Result<(), String> {
+    let (a, b) = (kept(ours, differ), kept(reference, differ));
+    let Some(at) = (0..a.len().max(b.len())).find(|&i| a.get(i) != b.get(i)) else {
+        return Ok(());
+    };
+    let line = |l: &[String]| l.get(at).map_or("(the listing ends)", String::as_str).to_string();
+    let before = a[at.saturating_sub(3)..at].join("\n");
+    Err(format!("the listings differ at line {} (of {} and {} compared):\n{before}\n- ours:      {}\n- reference: {}", at + 1, a.len(), b.len(), line(&a), line(&b)))
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -108,6 +210,101 @@ void main(uint3 id : SV_DispatchThreadID) {
     res.Store(4, a * 3 + 1);
 }
 ";
+
+    /// A program with `lds`: its loads and stores carry TBAA.
+    const HLSL_LDS: &str = "
+RWByteAddressBuffer res : register(u0);
+groupshared uint lds[64];
+[numthreads(64, 1, 1)]
+void main(uint3 id : SV_DispatchThreadID, uint gi : SV_GroupIndex) {
+    lds[gi] = res.Load(id.x * 4);
+    GroupMemoryBarrierWithGroupSync();
+    res.Store(gi * 4, lds[63 - gi]);
+}
+";
+
+    /// Some lines of DXC 1.9.2609's listing of `HLSL_LDS`.
+    const LISTING: &str = "\
+; shader hash: 868e2ccc077259ade84ccc43a91d88a9
+define void @main() {
+  store i32 %7, i32 addrspace(3)* %8, align 4, !tbaa !10
+  %11 = load i32, i32 addrspace(3)* %10, align 4, !tbaa !10
+  ret void
+}
+!llvm.ident = !{!0}
+!dx.version = !{!1}
+!0 = !{!\"dxcoob 1.9.2609.5 (01b62ad47)\"}
+!1 = !{i32 1, i32 6}
+!10 = !{!11, !11, i64 0}
+!11 = !{!\"int\", !12, i64 0}
+!12 = !{!\"omnipotent char\", !13, i64 0}
+!13 = !{!\"Simple C/C++ TBAA\"}
+";
+
+    /// What another writer gives for it: its own digest and name, no TBAA.
+    const OURS: &str = "\
+; shader hash: 00000000000000000000000000000000
+define void @main() {
+  store i32 %7, i32 addrspace(3)* %8, align 4
+  %11 = load i32, i32 addrspace(3)* %10, align 4
+  ret void
+}
+!llvm.ident = !{!0}
+!dx.version = !{!1}
+!0 = !{!\"xcl\"}
+!1 = !{i32 1, i32 6}
+";
+
+    #[test]
+    fn listings_compare_without_what_is_named() {
+        let all = [SHADER_HASH, Differ::Ident, Differ::Tbaa];
+        assert_eq!(compare(OURS, LISTING, &all), Ok(()));
+        assert_eq!(compare(LISTING, LISTING, &[]), Ok(()));
+        // Each of the three is needed, and the error shows the first line that differs.
+        let said = compare(OURS, LISTING, &all[1..]).unwrap_err();
+        assert!(said.contains("at line 1 ") && said.contains("- reference: ; shader hash: 868e"), "{said}");
+        let said = compare(OURS, LISTING, &[SHADER_HASH, Differ::Tbaa]).unwrap_err();
+        assert!(said.contains("- ours:      !0 = !{!\"xcl\"}"), "{said}");
+        let said = compare(OURS, LISTING, &all[..2]).unwrap_err();
+        assert!(said.contains("at line 2 ") && said.contains("- reference:   store i32 %7, i32 addrspace(3)* %8, align 4, !tbaa !10"), "{said}");
+        // A line that is not named still counts, and so does a listing that ends early.
+        let said = compare(&OURS.replace("i32 6}", "i32 5}"), LISTING, &all).unwrap_err();
+        assert!(said.contains("- ours:      !1 = !{i32 1, i32 5}") && said.contains("- reference: !1 = !{i32 1, i32 6}"), "{said}");
+        let said = compare(&OURS.replace("  ret void\n}\n", ""), LISTING, &all).unwrap_err();
+        assert!(said.contains("- ours:      !llvm.ident") && said.contains("- reference:   ret void"), "{said}");
+        let said = compare(OURS.trim_end_matches("!1 = !{i32 1, i32 6}\n"), LISTING, &all).unwrap_err();
+        assert!(said.contains("- ours:      (the listing ends)"), "{said}");
+    }
+
+    #[test]
+    fn a_dxc_container_matches_its_listing() {
+        if !available() {
+            return;
+        }
+        let (container, listing) = reference(HLSL, "main", "cs_6_6", &[]).unwrap();
+        assert!(listing.contains("define void @main()") && listing.contains("; shader hash: "), "{listing}");
+        assert_eq!(compare(&disassemble(&container).unwrap(), &listing, &[]), Ok(()));
+        // DXC compiles the same program to the same listing, and another program to another.
+        let (_, again) = reference(HLSL, "main", "cs_6_6", &[]).unwrap();
+        assert_eq!(compare(&again, &listing, &[]), Ok(()));
+        let (_, other) = reference(&HLSL.replace("a * 3", "a * 5"), "main", "cs_6_6", &[]).unwrap();
+        let said = compare(&other, &listing, &[SHADER_HASH]).unwrap_err();
+        assert!(said.contains("- ours:      ") && said.contains("mul i32") && said.contains(", 5"), "{said}");
+    }
+
+    /// What `Differ::Tbaa` and `Differ::Ident` look for is what the DXC in use prints.
+    #[test]
+    fn tbaa_and_the_compilers_name_are_found_in_a_dxc_listing() {
+        if !available() {
+            return;
+        }
+        let (_, listing) = reference(HLSL_LDS, "main", "cs_6_6", &[]).unwrap();
+        assert!(listing.contains(", !tbaa !") && listing.contains("omnipotent char") && listing.contains("!{!\"dxc"), "{listing}");
+        let rest = kept(&listing, &[Differ::Ident, Differ::Tbaa]).join("\n");
+        assert!(!rest.contains("tbaa") && !rest.contains("omnipotent char") && !rest.contains("TBAA") && !rest.contains("!{!\"dxc"), "{rest}");
+        assert!(rest.contains("store i32") && rest.contains("!llvm.ident = !{!"), "{rest}");
+        assert_eq!(listing.lines().count() - rest.lines().count(), 5, "the name's node and four of TBAA");
+    }
 
     /// Where the data of a container's part starts.
     fn part(container: &[u8], kind: &[u8; 4]) -> usize {
