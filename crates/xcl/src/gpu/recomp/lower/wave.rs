@@ -44,7 +44,7 @@ impl<I: Ir> Lower<'_, I> {
             return Some((r, false));
         }
         // the upper dword of a wave64 mask pair
-        (self.wave64 && r > 0 && self.holds_mask(b, r - 1)).then_some((r - 1, true))
+        (self.wave64 && r > 0 && self.holds_mask(b, r - 1)).then(|| (r - 1, true))
     }
 
     /// The mask in s<r> as numbers (lanes 0–31, 32–63): the ballot of its bits; with `half`,

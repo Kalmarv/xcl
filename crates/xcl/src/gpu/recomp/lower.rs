@@ -3140,6 +3140,20 @@ pub(crate) mod tests {
         out
     }
 
+    /// A cross-lane scalar op on s0 holding a number takes the number path (the check for the
+    /// upper dword of a mask pair at s<r - 1> must not compute r - 1 for s0: nobodyttk, #1269).
+    #[test]
+    fn a_wave_op_on_s0_holding_a_number() {
+        let lines: &[I] = &[
+            ("S_MOV_B32", "ENC_SOP1", &[("SDST", 0), ("SSRC0", 255), ("LITERAL", 0xF0F0)]),
+            ("S_BCNT1_I32_B32", "ENC_SOP1", &[("SDST", 1), ("SSRC0", 0)]),
+            ENDPGM,
+        ];
+        // the CPU lowering has no number form of it (DXIL takes it from #1426): refused, no panic
+        let err = lower_kernel(&decode(lines), false, Interp::default()).err().expect("refused");
+        assert_eq!(err, "unsupported S_BCNT1_I32_B32");
+    }
+
     /// `s_wqm` of a mask sets every lane of a quad with a bit; `s_cselect` picks a mask or a
     /// number by SCC.
     #[test]
