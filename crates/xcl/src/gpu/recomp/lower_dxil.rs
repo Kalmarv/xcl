@@ -394,9 +394,6 @@ pub fn enabled() -> bool {
 /// A compute program in its per-lane form with the runtime's options `o` (`pso::direct_compute`):
 /// the container and its static samplers.
 pub fn compute_with(code: &[u8], cs: &super::CsInterface, o: KernelOptions) -> Result<crate::gpu::dxil::kernel::Kernel, String> {
-    if o.mem_windows & super::HEAP_WINDOWS != 0 {
-        return Err("heap memory windows".into());
-    }
     let mut insts = Vec::new();
     let mut off = 0usize;
     while off + 4 <= code.len() {
@@ -685,15 +682,12 @@ mod tests {
 
     /// With the runtime's four memory windows (`compute_with`), the memory instructions go
     /// through #1426's window switch (blocks of its own in the `Ir` block) and the program
-    /// still gives the CPU lowering's memory; heap memory windows are refused.
+    /// still gives the CPU lowering's memory.
     #[test]
     fn a_per_lane_program_with_four_memory_windows_runs_on_the_gpu() {
         let cs = compute_cs();
         let bytes: Vec<u8> = COMPUTE.iter().flat_map(|(n, e, f)| crate::gpu::rdna2::encode(n, e, f, None).unwrap()).collect();
         let o = super::KernelOptions { wave64: false, split: false, mem_windows: 4, sampler_base: 0 };
-        let heap = super::KernelOptions { mem_windows: 4 | super::super::HEAP_WINDOWS, ..o };
-        let heap = super::compute_with(&bytes, &cs, heap).err().unwrap_or_default();
-        assert!(heap.contains("heap"), "{heap}");
         if !gpu() {
             return;
         }
