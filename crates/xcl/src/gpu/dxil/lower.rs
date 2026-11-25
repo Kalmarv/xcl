@@ -245,6 +245,8 @@ pub struct Lw {
     pub img_writes: Vec<u64>,
     /// program writes/atomics global or image UAVs or uses `GLC=1`: `s_barrier` emits `ALL_SYNC`
     pub barrier_uav_fence: bool,
+    /// highest VGPR index referenced by the program (for `v_movrel*` outside `Entry::Kernel`)
+    pub max_vgpr: u64,
     /// static samplers bound so far: (S#, comparison, handle) at `s<i>, space1`
     pub static_used: Vec<([u32; 4], bool, super::ops::Sampler)>,
     pub sampler_base: u32,

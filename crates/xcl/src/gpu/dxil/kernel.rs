@@ -647,6 +647,15 @@ impl Lw {
             has_f64_round_op: false,
             img_writes: crate::gpu::recomp::emit::image_write_srsrcs(insts),
             barrier_uav_fence: crate::gpu::recomp::emit::has_uav_write_or_glc(insts),
+            max_vgpr: insts
+                .iter()
+                .flat_map(|d| {
+                    let (r, w) = crate::gpu::rdna2::vgpr_uses(d);
+                    r.into_iter().chain(w)
+                })
+                .filter(|&v| v < 256)
+                .max()
+                .unwrap_or(0),
             exec_cache: HashMap::new(),
             xs: None,
             xw: None,
