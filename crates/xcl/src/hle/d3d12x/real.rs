@@ -3625,7 +3625,9 @@ fn driver_compile_identified<R>(kind: &str, bytes: usize, gate: bool, record: Op
         crate::xlog_info!("D3D12.X: driver compile start #{sequence}: {kind} PSO, {bytes} B DXIL{record}");
     }
     let started = std::time::Instant::now();
+    let in_driver = (bytes >= huge_pso_bytes()).then(HugeInDriver::enter);
     let r = build();
+    drop(in_driver);
     let took = started.elapsed();
     if log {
         crate::xlog_info!("D3D12.X: driver compile finish #{sequence}: {kind} PSO, {bytes} B DXIL, {} ms{}", took.as_millis(), gate_note(bytes >= huge_pso_bytes(), huge, slot.is_some(), waited));
@@ -3655,8 +3657,41 @@ fn gate_compute_driver_compile(has_cached_blob: bool) -> bool {
 /// pipeline (`wanted`): then at once and without a slot (None), as when that thread builds it
 /// itself. Holding such a build back holds the title back: on a machine with less than the
 /// headroom free throughout a retail title's world loading, the first one would not go on and
-/// keeps the slot, until the title's watchdog ends it.
+/// keep the slot, the others waiting behind it (#505). So the commit wait ends too once it has
+/// lasted `COMMIT_WAIT_ALONE` with no huge driver compile in flight anywhere (nothing XCL builds
+/// will give commit back then), and after `COMMIT_WAIT_MOST` in any case; the build goes on
+/// with what there is.
 fn big_compile_turn(slots: &'static Slots, commit_free: impl Fn() -> bool, wanted: impl Fn() -> bool) -> Option<SlotGuard> {
+    big_compile_turn_alone(slots, commit_free, wanted, || HUGE_IN_DRIVER.load(Ordering::Relaxed), COMMIT_WAIT_ALONE, COMMIT_WAIT_MOST)
+}
+
+/// How long a big compile waits for its commit headroom while no huge driver compile is in
+/// flight, before it goes on without it.
+const COMMIT_WAIT_ALONE: std::time::Duration = std::time::Duration::from_secs(10);
+/// The longest a big compile waits for its commit headroom, whatever is in flight.
+const COMMIT_WAIT_MOST: std::time::Duration = std::time::Duration::from_secs(30);
+
+/// Huge driver compiles in the driver now, on any thread (`driver_compile_identified`).
+static HUGE_IN_DRIVER: AtomicUsize = AtomicUsize::new(0);
+
+struct HugeInDriver;
+
+impl HugeInDriver {
+    fn enter() -> Self {
+        HUGE_IN_DRIVER.fetch_add(1, Ordering::Relaxed);
+        HugeInDriver
+    }
+}
+
+impl Drop for HugeInDriver {
+    fn drop(&mut self) {
+        HUGE_IN_DRIVER.fetch_sub(1, Ordering::Relaxed);
+    }
+}
+
+/// `big_compile_turn` with the huge compiles in flight (`in_driver`), the time alone
+/// (`alone_for`) and the longest commit wait (`most`) given.
+fn big_compile_turn_alone(slots: &'static Slots, commit_free: impl Fn() -> bool, wanted: impl Fn() -> bool, in_driver: impl Fn() -> usize, alone_for: std::time::Duration, most: std::time::Duration) -> Option<SlotGuard> {
     const LOOK: std::time::Duration = std::time::Duration::from_millis(50);
     let slot = {
         let mut n = slots.n.lock().unwrap();
@@ -3672,9 +3707,24 @@ fn big_compile_turn(slots: &'static Slots, commit_free: impl Fn() -> bool, wante
         *n += 1;
         SlotGuard(slots)
     };
+    let waited = std::time::Instant::now();
+    let mut alone_since: Option<std::time::Instant> = None;
     while !commit_free() {
         if wanted() {
             return None;
+        }
+        let others = in_driver();
+        let why = if others > 0 {
+            alone_since = None;
+            (waited.elapsed() >= most).then(|| format!("the longest wait ({} ms) is over, {others} huge compiles in flight", most.as_millis()))
+        } else if alone_since.get_or_insert_with(std::time::Instant::now).elapsed() >= alone_for {
+            Some(format!("the last {} ms with no huge compile in flight", alone_for.as_millis()))
+        } else {
+            (waited.elapsed() >= most).then(|| format!("the longest wait ({} ms) is over", most.as_millis()))
+        };
+        if let Some(why) = why {
+            crate::xlog_warn!("D3D12.X: a huge driver compile goes on without its commit headroom: none free after {} ms, {why}", waited.elapsed().as_millis());
+            break;
         }
         std::thread::sleep(LOOK);
     }
@@ -3829,6 +3879,41 @@ mod big_compile_tests {
         assert!(!t.is_finished(), "one at a time");
         drop(first);
         assert!(t.join().unwrap(), "the next one's turn");
+        assert_eq!(*S.n.lock().unwrap(), 0);
+    }
+
+    #[test]
+    fn the_commit_wait_ends_alone_or_after_the_longest_wait() {
+        static S: Slots = Slots { n: Mutex::new(0), cv: std::sync::Condvar::new(), most: 1 };
+        // the commit reading the gate sees, and the huge compiles in the driver
+        static FREE: AtomicU64 = AtomicU64::new(4 << 30);
+        static IN: AtomicUsize = AtomicUsize::new(0);
+        fn turn(most: Duration) -> Option<SlotGuard> {
+            let free = || FREE.load(Ordering::Acquire) >= big_compile_headroom(990_000);
+            big_compile_turn_alone(&S, free, || false, || IN.load(Ordering::Acquire), Duration::from_millis(300), most)
+        }
+        // 4 GiB free: a 990 KB program (3 GiB of headroom) goes at once
+        let t0 = Instant::now();
+        drop(turn(Duration::from_secs(60)).expect("its turn"));
+        assert!(t0.elapsed() < Duration::from_millis(250));
+        // 1 GiB free and a huge compile in flight: it waits, however long
+        FREE.store(1 << 30, Ordering::Release);
+        IN.store(1, Ordering::Release);
+        let t = std::thread::spawn(|| turn(Duration::from_secs(60)).is_some());
+        std::thread::sleep(Duration::from_millis(700));
+        assert!(!t.is_finished(), "another compile may give commit back: it waits");
+        // none in flight any more: it goes on after the time alone, still short of commit
+        IN.store(0, Ordering::Release);
+        let alone = Instant::now();
+        assert!(t.join().unwrap(), "it goes on with its slot");
+        assert!(alone.elapsed() >= Duration::from_millis(300) && alone.elapsed() < Duration::from_secs(5));
+        assert_eq!(*S.n.lock().unwrap(), 0);
+        // compiles in flight throughout: it goes on after the longest wait
+        IN.store(1, Ordering::Release);
+        let t0 = Instant::now();
+        let held = turn(Duration::from_millis(600)).expect("it goes on with its slot");
+        assert!(t0.elapsed() >= Duration::from_millis(600) && t0.elapsed() < Duration::from_secs(5));
+        drop(held);
         assert_eq!(*S.n.lock().unwrap(), 0);
     }
 }
