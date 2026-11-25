@@ -53,18 +53,12 @@ struct Chain {
     tail: Vec<ID3D12PipelineState>,
     words: u32,
     whole_code: Vec<u8>,
-    whole: OnceLock<ID3D12PipelineState>,
-    build_whole: Mutex<()>,
+    whole: OnceLock<Option<ID3D12PipelineState>>,
 }
 
 impl Chain {
     unsafe fn whole(&self) -> Result<ID3D12PipelineState, String> {
-        if let Some(p) = self.whole.get() { return Ok(p.clone()); }
-        let _guard = self.build_whole.lock().unwrap();
-        if let Some(p) = self.whole.get() { return Ok(p.clone()); }
-        let p = self.builder.pipeline(&self.whole_code, &pc_iid(Kind::PipelineState)).ok_or("whole compute pipeline")?;
-        let _ = self.whole.set(p.clone());
-        Ok(p)
+        self.whole.get_or_init(|| self.builder.pipeline(&self.whole_code, &pc_iid(Kind::PipelineState))).clone().ok_or_else(|| "whole compute pipeline".into())
     }
 }
 
@@ -91,7 +85,7 @@ pub(super) unsafe fn build(this: *mut c_void, create: PsoFn, desc: &D3D12_COMPUT
     let mut pieces = built.into_iter().collect::<Option<Vec<_>>>()?.into_iter();
     let first = pieces.next()?;
     let chain = Arc::new(Chain { builder, tail: pieces.collect(), words: plan.dwords_per_group,
-        whole_code: whole.to_vec(), whole: OnceLock::new(), build_whole: Mutex::new(()) });
+        whole_code: whole.to_vec(), whole: OnceLock::new() });
     PROGRAMS.fetch_add(1, Ordering::Relaxed);
     PIECES.fetch_add(plan.pieces.len() as u64, Ordering::Relaxed);
     *result = first.into_raw();
@@ -235,7 +229,7 @@ pub(in crate::hle::d3d12x) unsafe fn dispatch(list: &ID3D12GraphicsCommandList, 
 
 #[cfg(test)]
 mod tests {
-    use super::{scratch_bytes, LEAST};
+    use super::*;
 
     const MB: u64 = 1 << 20;
 
@@ -283,5 +277,25 @@ mod tests {
         // one group always fits, whatever the bounds say
         assert_eq!(scratch_bytes(9 * MB, 9 * MB, 4 * MB, None, 400 * MB, 384 * MB), (9 * MB, true));
         assert_eq!(scratch_bytes(9 * MB, 9 * MB, 4 * MB, Some(MB), 400 * MB, 384 * MB), (9 * MB, true));
+    }
+
+    #[test]
+    fn a_whole_form_that_fails_to_build_is_not_built_again() {
+        static CALLS: AtomicU64 = AtomicU64::new(0);
+        unsafe extern "system" fn refused(_: *mut c_void, _: *const c_void, _: *const GUID, _: *mut *mut c_void) -> HRESULT {
+            CALLS.fetch_add(1, Ordering::Relaxed);
+            crate::util::E_FAIL
+        }
+        unsafe {
+            let Ok(dev) = crate::gpu::agility::create_device(None, D3D_FEATURE_LEVEL_11_0) else {
+                return crate::gpu::recomp::runner::skip_test("no GPU");
+            };
+            let signature = pso::dispatch_chain_root_signature(&dev, &[]).unwrap();
+            let builder = Arc::new(PipelineBuilder { device: dev, create: refused, signature, flags: D3D12_PIPELINE_STATE_FLAG_NONE, node: 0, record: 0 });
+            let chain = Chain { builder, tail: Vec::new(), words: 4, whole_code: vec![0; 16], whole: OnceLock::new() };
+            assert!(chain.whole().is_err());
+            assert!(chain.whole().is_err());
+            assert_eq!(CALLS.load(Ordering::Relaxed), 1);
+        }
     }
 }
