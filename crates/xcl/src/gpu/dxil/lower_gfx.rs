@@ -14,7 +14,7 @@ use super::lower::{err, LResult, Lw};
 use super::module::{Pred, Value};
 use crate::gpu::dxbc::SigElement;
 use crate::gpu::rdna2::{self, Decoded};
-use crate::gpu::recomp::{elements_at, ps_attribute_f16, ps_attribute_slot, ps_f16_slot, ps_input_vgpr, ps_slot_attribute, ranked, vs_param_register, PsInterface, VsInterface};
+use crate::gpu::recomp::{out_param_elements, ps_attribute_f16, ps_attribute_slot, ps_f16_slot, ps_input_vgpr, ps_slot_attribute, ranked, PsInterface, VsInterface};
 
 /// An output element: its signature handle, components and the temporaries holding them.
 pub struct GfxOut {
@@ -119,7 +119,7 @@ impl Lw {
                 _ => SemKind::Arbitrary,
             };
             let s = io.output(GSig::new(&e.name, e.index, kind, gct(e.component_type), n));
-            outs.push((s, n, e.component_type == 3));
+            outs.push((s, n, matches!(e.component_type, 3 | 6)));
         }
         // initial VGPRs: v0 = vertex id, v3 = instance id, the fetch shader's attribute VGPRs
         let mut vgpr = HashMap::new();
@@ -327,15 +327,22 @@ impl Lw {
                 32..=63 => {
                     let vs = self.gfx().vs.clone().expect("vs");
                     let k = (tgt - 32) as usize;
-                    let at = vs_param_register(&vs, k).map(|r| elements_at(&vs.outputs, true, r)).unwrap_or_default();
-                    for j in at {
+                    let (at, f16) = out_param_elements(&vs.outputs, vs.params.as_deref(), k);
+                    for (j, first) in at {
                         let (vars, n) = {
                             let o = &self.gfx().params[j];
                             (o.vars.clone(), o.comps)
                         };
                         for c in 0..n as usize {
-                            if enabled(c) {
-                                let v = comp(self, c);
+                            // packed float16: component c is half c & 1 of dword first + c / 2
+                            let dw = if f16 { first + c / 2 } else { c };
+                            if dw < 4 && enabled(dw) {
+                                let mut v = comp(self, dw);
+                                if f16 {
+                                    let h = self.lshrc(v, 16 * (c as u32 & 1));
+                                    let x = self.s.f16_to_f32(h);
+                                    v = self.bits(x);
+                                }
                                 self.set_out(vars[c], v);
                             }
                         }

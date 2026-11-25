@@ -117,7 +117,7 @@ pub struct VsInterface {
     pub attr_base: u64,
     /// the OSG1 register of each `exp param N` from the console's table (`vs_output_table`;
     /// None: the N-th distinct register)
-    pub params: Option<Vec<u32>>,
+    pub params: Option<Vec<OutParam>>,
 }
 
 impl VsInterface {
@@ -162,6 +162,8 @@ pub struct MsInterface {
     pub threads: u32,
     pub max_vertices: u32,
     pub max_primitives: u32,
+    /// the console's output table, as `VsInterface::params`
+    pub params: Option<Vec<OutParam>>,
 }
 
 /// dwords before the vertices of a mesh record: vertex count, primitive count, 2 spare
@@ -228,6 +230,7 @@ impl GsInterface {
             threads: 64,
             max_vertices: (GS_PRIMS_PER_GROUP * mvc).clamp(1, 256),
             max_primitives: (GS_PRIMS_PER_GROUP * mvc.saturating_sub(2).max(1)).clamp(1, 256),
+            params: None,
         }
     }
 }
@@ -371,6 +374,15 @@ pub struct PsAttr {
     pub pair: Option<u8>,
 }
 
+/// One `exp param N` of the console's output table: its first OSG1 register; `f16`: float16
+/// values, two per dword (`pair`: more than one dword – a second register may follow).
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct OutParam {
+    pub register: u32,
+    pub f16: bool,
+    pub pair: bool,
+}
+
 /// The PS input table of an FSSM: SPI_PS_INPUT_ENA and, per `v_interp attrN`, the register it
 /// reads. 32 records of 8 bytes at +0x130 (+ the sub-version shift): kind, register, component
 /// mask, attribute number, 0, 0, register again, 1 flat / 2 interpolated; then the record count
@@ -404,8 +416,11 @@ pub fn ps_input_table(fssm: &[u8]) -> Option<(u32, Vec<PsAttr>)> {
 /// of 6 bytes at +0x1D4 (+ the sub-version shift): kind (6 user, 0 position), register, param
 /// number, 0, 0, 0; the record count after them (+0xC0). Usually param N = the N-th output
 /// register, but not always (a Fortnite VS exports its SV_Position register as a param).
-/// Checked on every cached VS of three titles (984, 13, 1).
-pub fn vs_output_table(fssm: &[u8]) -> Option<Vec<u32>> {
+/// Checked on every cached VS of three titles (984, 13, 1). The same table describes a mesh
+/// (NGG) program's params. A float16 param (two values per dword) has 1 in the last byte, 3
+/// when it takes more than one dword, and then repeats its register in byte 3 (442 MS of one
+/// title); the table does not name the second register of a pair (`f16_registers`).
+pub fn vs_output_table(fssm: &[u8]) -> Option<Vec<OutParam>> {
     let base = 0x1D4 + fssm_shift(fssm)?;
     let n = fssm.get(base + 0xC0..base + 0xC4).map(|b| u32::from_le_bytes(b.try_into().unwrap()))? as usize;
     if n > 32 {
@@ -414,10 +429,11 @@ pub fn vs_output_table(fssm: &[u8]) -> Option<Vec<u32>> {
     let mut out = Vec::with_capacity(n);
     for k in 0..n {
         let r = fssm.get(base + 6 * k..base + 6 * k + 6)?;
-        if r[2] as usize != k || r[3..6] != [0, 0, 0] {
+        let f16 = r[5] & 1 == 1;
+        if r[2] as usize != k || r[4] != 0 || !matches!(r[5], 0 | 1 | 3) || (r[3] != 0 && !(f16 && r[3] == r[1])) {
             return None;
         }
-        out.push(r[1] as u32);
+        out.push(OutParam { register: r[1] as u32, f16, pair: r[5] == 3 });
     }
     Some(out)
 }
@@ -439,6 +455,28 @@ pub fn f16_registers(sig: &[SigElement], first: u32, second: Option<u32>, pair: 
     };
     let width = sig.iter().filter(|e| e.system_value == 0 && e.register == first).map(|e| 8 - e.mask.leading_zeros() as usize).max().unwrap_or(4);
     std::iter::once((first, 0)).chain(second.map(|r| (r, width.div_ceil(2)))).collect()
+}
+
+/// The registers of `exp param N` with the first dword of each (`f16_registers`), and whether
+/// they hold packed float16: the console's table, else the N-th distinct register.
+pub fn out_param_registers(outputs: &[SigElement], params: Option<&[OutParam]>, n: usize) -> Option<(Vec<(u32, usize)>, bool)> {
+    match params {
+        Some(t) => {
+            let p = t.get(n)?;
+            if !p.f16 {
+                return Some((vec![(p.register, 0)], false));
+            }
+            Some((f16_registers(outputs, p.register, None, p.pair, &|r| t.iter().any(|q| q.register == r)), true))
+        }
+        None => param_registers(outputs, true).get(n).map(|&r| (vec![(r, 0)], false)),
+    }
+}
+
+/// The elements `exp param N` writes (places in `ranked(outputs, true)`), each with the first
+/// dword of its register, and whether the param holds packed float16 (`out_param_registers`).
+pub fn out_param_elements(outputs: &[SigElement], params: Option<&[OutParam]>, n: usize) -> (Vec<(usize, usize)>, bool) {
+    let (regs, f16) = out_param_registers(outputs, params, n).unwrap_or_default();
+    (regs.iter().flat_map(|&(r, first)| elements_at(outputs, true, r).into_iter().map(move |j| (j, first))).collect(), f16)
 }
 
 /// The registers of a float16-packed PS attribute with the first dword of each (None: the
@@ -494,7 +532,7 @@ pub fn ps_slot_attribute(ps: &PsInterface, slot: usize) -> Option<usize> {
 /// The register `exp param N` of a VS writes: the console's table, else the N-th distinct one.
 pub fn vs_param_register(vs: &VsInterface, n: usize) -> Option<u32> {
     match &vs.params {
-        Some(t) => t.get(n).copied(),
+        Some(t) => t.get(n).map(|p| p.register),
         None => param_registers(&vs.outputs, true).get(n).copied(),
     }
 }
@@ -543,6 +581,7 @@ pub fn interface(blob: &[u8], sh: &super::xbox::XboxShader, f: &super::xbox::Fss
                 threads,
                 max_vertices: (p.ms_max_vertices as u32).clamp(1, 256),
                 max_primitives: (p.ms_max_primitives as u32).clamp(1, 256),
+                params: vs_output_table(&f.data),
             }))
         }
         _ => None,
@@ -1776,6 +1815,27 @@ mod attribute_tests {
         assert_eq!(f16_registers(&narrow, 1, None, true, &|r| r == 1), [(1, 0), (2, 1)]);
     }
 
+    /// Float16 params packed the same way in a VS / MS output table (the record shapes of the
+    /// title's MS): the table parses, the second register of a pair is the next float16 register
+    /// that starts no param of its own (the record does not name it), and `exp param N` writes
+    /// the elements of both registers.
+    #[test]
+    fn f16_packed_params() {
+        let sig = f16_sig();
+        let mut f = vec![0u8; 0x400];
+        f[0x10] = 6;
+        // VS / MS output records: [6, reg, param, reg, 0, 3]; param 5 is a single float16 (1)
+        let outs: [[u8; 6]; 6] = [[6, 1, 0, 1, 0, 3], [6, 3, 1, 0, 0, 0], [6, 4, 2, 4, 0, 3], [6, 6, 3, 0, 0, 0], [6, 7, 4, 7, 0, 3], [6, 9, 5, 0, 0, 1]];
+        f[0x1DC..0x1DC + 36].copy_from_slice(&outs.concat());
+        f[0x1DC + 0xC0] = 6;
+        let params = vs_output_table(&f).unwrap();
+        assert_eq!(params.iter().map(|p| (p.register, p.f16, p.pair)).collect::<Vec<_>>(), [(1, true, true), (3, false, false), (4, true, true), (6, false, false), (7, true, true), (9, true, false)]);
+        let regs = |n: usize| out_param_registers(&sig, Some(&params), n);
+        assert_eq!([regs(0), regs(1), regs(4), regs(5), regs(6)], [Some((vec![(1, 0), (2, 2)], true)), Some((vec![(3, 0)], false)), Some((vec![(7, 0), (8, 2)], true)), Some((vec![(9, 0)], true)), None]);
+        // elements in `ranked` order: r7 holds two, r8 one
+        assert_eq!(out_param_elements(&sig, Some(&params), 4), (vec![(6, 0), (7, 0), (8, 2)], true));
+    }
+
     /// Minecraft's UI vertex shader: an ISG1 input the program never reads (NORMAL0, r1) gets
     /// no fetch-shader VGPRs – POSITION0 (r2) is read in v8, TEXCOORD0 (r3) in v12.
     #[test]
@@ -1813,7 +1873,7 @@ mod attribute_tests {
         f[0x10] = 5;
         f[0x1D4..0x1D4 + 18].copy_from_slice(&[6, 0, 0, 0, 0, 0, 0, 1, 1, 0, 0, 0, 6, 2, 2, 0, 0, 0]);
         f[0x1D4 + 0xC0] = 3;
-        assert_eq!(vs_output_table(&f), Some(vec![0, 1, 2]));
+        assert_eq!(vs_output_table(&f).map(|t| t.iter().map(|p| p.register).collect::<Vec<_>>()), Some(vec![0, 1, 2]));
         f[0x1D4 + 8] = 7;
         assert_eq!(vs_output_table(&f), None);
     }
