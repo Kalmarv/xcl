@@ -1813,6 +1813,9 @@ static NEXT_PAGE_INDEX: AtomicUsize = AtomicUsize::new(0);
 struct Away {
     at: std::collections::BTreeMap<usize, usize>,
     page: std::collections::HashMap<usize, usize>,
+    /// Homes explicitly mapped by the title. An away mapping takes precedence while a
+    /// page is elsewhere; freeing or explicitly unmapping a home removes its entry.
+    mapped_homes: std::collections::HashMap<usize, usize>,
     /// homes in a sparse window whose pages went away in this call, given back at its end in
     /// runs (`give_back_homes`): one page at a time, a retail game's start took 20 s
     gone: Vec<usize>,
@@ -1825,6 +1828,16 @@ struct Away {
     /// page-mapping method names.
     title: std::collections::HashMap<usize, usize>,
 }
+
+impl Away {
+    fn mapped_away(&mut self, at: usize, page: usize) {
+        // A new mapping at the same address displaces a previously requested home.
+        self.mapped_homes.remove(&at);
+        self.at.insert(at, page);
+        self.page.insert(page, at);
+    }
+}
+
 static AWAY: std::sync::Mutex<Option<Away>> = std::sync::Mutex::new(None);
 
 /// The title released `[base, base + len)`: the pages it mapped there are mapped there no more.
@@ -1849,14 +1862,15 @@ pub fn physical_page_at(va: usize) -> bool {
     AWAY.lock().unwrap().as_ref().is_some_and(|a| a.at.contains_key(&(va & !(PHYS_PAGE - 1))))
 }
 
-/// The physical page mapped away from home at each of the `n` 64 KiB pages from `va` (None: none
-/// there, or a page at its home). The console maps one page at several addresses at once; here it
-/// is at one (`map_pages` moves it), so `d3d12x::vram` asks which page an address had to let
-/// textures at two addresses of one page share its video memory.
+/// The mapped physical page at each of the `n` 64 KiB addresses from `va`, including homes
+/// requested by the title. A GPU resource retains the page it had at placement across a move.
 pub fn physical_pages(va: usize, n: usize) -> Vec<Option<usize>> {
     let g = AWAY.lock().unwrap();
     let Some(a) = g.as_ref() else { return vec![None; n] };
-    (0..n).map(|i| va.checked_add(i * PHYS_PAGE).and_then(|at| a.at.get(&at).copied())).collect()
+    (0..n).map(|i| {
+        let at = va.checked_add(i.checked_mul(PHYS_PAGE)?)?;
+        a.at.get(&at).copied().or_else(|| a.mapped_homes.get(&at).copied().filter(|p| !a.page.contains_key(p)))
+    }).collect()
 }
 
 /// Counts the calls that map or unmap physical pages in a GPU view (`mirrors`): what
@@ -2314,8 +2328,7 @@ unsafe fn move_away(away: &mut Away, old: usize, at: usize, page: usize, in_uma:
     std::ptr::copy_nonoverlapping(old as *const u8, at as *mut u8, PHYS_PAGE);
     page_placed(page, at, false, true);
     release_at(old);
-    away.at.insert(at, page);
-    away.page.insert(page, at);
+    away.mapped_away(at, page);
     Ok(true)
 }
 
@@ -2396,6 +2409,10 @@ pub unsafe extern "system" fn FreeTitlePhysicalPages(_p: HANDLE, n: usize, arr: 
             continue;
         }
         freed.push(page);
+        // (a home the title mapped explicitly keeps no identity once its page is freed)
+        if let Some(away) = away.as_mut() {
+            away.mapped_homes.remove(&(block.home + (index - first) * PHYS_PAGE));
+        }
         // A mapped address keeps its contents after free, but no longer tracks this page.
         if let Some(away) = away.as_mut() {
             if let Some(at) = away.page.remove(&page) {
@@ -2488,6 +2505,14 @@ unsafe fn map_pages(away: &mut Away, va: *mut c_void, n: usize, arr: *mut usize)
                 unmap_away(away, at, &(home..home + n * PHYS_PAGE));
             }
         }
+        for (i, &p) in pages.iter().enumerate() {
+            let at = home + i * PHYS_PAGE;
+            // Another physical page can still occupy this home. Follow the existing away
+            // mapping; remembering p here would resurrect it when that occupant moves on.
+            if !away.at.contains_key(&at) {
+                away.mapped_homes.insert(at, p);
+            }
+        }
         return home as *mut c_void;
     }
     let base = va as usize;
@@ -2511,6 +2536,7 @@ unsafe fn map_pages(away: &mut Away, va: *mut c_void, n: usize, arr: *mut usize)
             (at_run, home_run) = Default::default();
         }
         if p == 0 {
+            away.mapped_homes.remove(&at);
             continue;
         }
         if let Some(&old) = away.page.get(&p) {
@@ -2542,8 +2568,7 @@ unsafe fn map_pages(away: &mut Away, va: *mut c_void, n: usize, arr: *mut usize)
         let plain = crate::gpu::uma::get().is_none_or(|u| !u.contains(at));
         if fresh && plain && !committed_page_in(home, &mut home_run) {
             lazy::mark(at);
-            away.at.insert(at, p);
-            away.page.insert(p, at);
+            away.mapped_away(at, p);
             away.title.insert(at, p);
             page_placed(p, at, false, false);
             pagelog::note("page mapped (never used: zeros on first touch)", at, 0, p);
@@ -2581,8 +2606,7 @@ unsafe fn map_pages(away: &mut Away, va: *mut c_void, n: usize, arr: *mut usize)
             }
             page_placed(p, at, false, true);
         }
-        away.at.insert(at, p);
-        away.page.insert(p, at);
+        away.mapped_away(at, p);
         away.title.insert(at, p);
     }
     sparse_run.flush();
@@ -3689,6 +3713,54 @@ mod tests {
             assert_eq!(FreeTitlePhysicalPages(std::ptr::null_mut(), 3, pages.as_mut_ptr()), 1);
             assert!(!PHYS_BLOCKS.lock().unwrap().contains_key(&page_index(pages[0]).unwrap()));
             assert!(MapTitlePhysicalPages(std::ptr::null_mut(), 3, 0, 4, pages.as_mut_ptr()).is_null());
+        }
+    }
+
+    /// The GPU asks which physical pages were explicitly mapped at each address.
+    /// Moving, unmapping and freeing part of an allocation must update that lookup.
+    #[test]
+    fn mapped_home_page_identity_follows_moves_and_partial_frees() {
+        unsafe {
+            if crate::gpu::uma::get().is_none() {
+                return crate::gpu::recomp::runner::skip_test("no UMA");
+            }
+            let mut count = 2;
+            let mut pages = [0usize; 2];
+            assert_eq!(AllocateTitlePhysicalPages(std::ptr::null_mut(), 0, &mut count, pages.as_mut_ptr()), 1);
+            let home = page_home(pages[0]).unwrap();
+            assert_eq!(physical_pages(home, 2), vec![None, None], "allocation alone does not map its home");
+            assert_eq!(MapTitlePhysicalPages(std::ptr::null_mut(), 2, 0, 4, pages.as_mut_ptr()) as usize, home);
+            assert_eq!(physical_pages(home, 2), vec![Some(pages[0]), Some(pages[1])]);
+            let elsewhere = mem::VirtualAlloc(std::ptr::null(), PHYS_PAGE, mem::MEM_RESERVE, mem::PAGE_READWRITE);
+            assert!(!elsewhere.is_null());
+            assert_eq!(MapTitlePhysicalPages(elsewhere, 1, 0, 4, pages.as_mut_ptr()), elsewhere);
+            assert_eq!(physical_pages(home, 2), vec![None, Some(pages[1])]);
+            assert_eq!(physical_pages(elsewhere as usize, 1), vec![Some(pages[0])]);
+            let mut nonconsecutive = [pages[1], pages[0]];
+            assert!(MapTitlePhysicalPages(std::ptr::null_mut(), 2, 0, 4, nonconsecutive.as_mut_ptr()).is_null());
+            assert_eq!(physical_pages(elsewhere as usize, 1), vec![Some(pages[0])]);
+            assert_eq!(physical_pages(home, 2), vec![None, Some(pages[1])]);
+            assert_eq!(MapTitlePhysicalPages(home as *mut c_void, 1, 0, 4, pages.as_mut_ptr()) as usize, home);
+            assert_eq!(physical_pages(elsewhere as usize, 1), vec![None]);
+            assert_eq!(physical_pages(home, 2), vec![Some(pages[0]), Some(pages[1])]);
+            // Page 1 goes over page 0's former home and then moves onward.
+            let first = home as *mut c_void;
+            assert_eq!(MapTitlePhysicalPages(first, 1, 0, 4, pages.as_mut_ptr().add(1)), first);
+            assert_eq!(physical_pages(home, 2), vec![Some(pages[1]), None]);
+            // Requesting the first page at home while the second still occupies it does
+            // not evict that occupant in kernelx. Do not cache a conflicting GPU identity.
+            assert_eq!(MapTitlePhysicalPages(first, 1, 0, 4, pages.as_mut_ptr()), first);
+            assert_eq!(physical_pages(home, 2), vec![Some(pages[1]), None]);
+            assert_eq!(MapTitlePhysicalPages(elsewhere, 1, 0, 4, pages.as_mut_ptr().add(1)), elsewhere);
+            assert_eq!(physical_pages(home, 2), vec![None, None]);
+            assert_eq!(MapTitlePhysicalPages(std::ptr::null_mut(), 2, 0, 4, pages.as_mut_ptr()) as usize, home);
+            assert_eq!(FreeTitlePhysicalPages(std::ptr::null_mut(), 1, pages.as_mut_ptr()), 1);
+            assert_eq!(physical_pages(home, 2), vec![None, Some(pages[1])]);
+            let second = (home + PHYS_PAGE) as *mut c_void;
+            assert_eq!(MapTitlePhysicalPages(second, 1, 0, 4, std::ptr::null_mut()), second);
+            assert_eq!(physical_pages(home, 2), vec![None, None]);
+            assert_eq!(FreeTitlePhysicalPages(std::ptr::null_mut(), 1, pages.as_mut_ptr().add(1)), 1);
+            assert_ne!(mem::VirtualFree(elsewhere, 0, mem::MEM_RELEASE), 0);
         }
     }
 
