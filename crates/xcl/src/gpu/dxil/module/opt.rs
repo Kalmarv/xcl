@@ -8,6 +8,8 @@
 //! results); this pass removes the redundancy without changing what any
 //! remaining instruction computes.
 
+mod scalar_load;
+
 use std::collections::HashMap;
 
 use super::{BinOp, CastOp, FnAttrs, Module, Op, Pred, Ty, Value};
@@ -344,6 +346,67 @@ impl Module {
         idom
     }
 
+    /// Keep selected floating-point register values in f32 across EXEC predication.
+    /// A bitcast on either side preserves the guest word, including signed zero and NaNs.
+    pub(in crate::gpu::dxil) fn fold_float_selects(&mut self) -> bool {
+        let float = self.f32();
+        let word = self.i32();
+        let mut uses = vec![0usize; self.insts.len()];
+        let mut float_uses = uses.clone();
+        for &i in self.blocks.iter().flatten() {
+            let op = &self.insts[i as usize].op;
+            op.for_each_operand(|v| {
+                if let Value::Inst(j) = v {
+                    uses[j as usize] += 1;
+                    if matches!(op, Op::Cast(CastOp::BitCast, _, ty) if *ty == float) {
+                        float_uses[j as usize] += 1;
+                    }
+                }
+            });
+        }
+        let saved = self.cur;
+        let mut changed = false;
+        for b in self.block_layout().0 {
+            self.cur = super::Block(b as u32);
+            let old = std::mem::take(&mut self.blocks[b]);
+            self.blocks[b].reserve(old.len());
+            for i in old {
+                if let Op::Select(c, x, y) = self.insts[i as usize].op {
+                    if self.insts[i as usize].ty == word {
+                        let mut arms = [None; 2];
+                        let mut saved_casts = 0;
+                        for (arm, val) in arms.iter_mut().zip([x, y]) {
+                            if let Value::Inst(j) = val {
+                                if let Op::Cast(CastOp::BitCast, src, _) = self.insts[j as usize].op {
+                                    if self.value_ty(src) == float {
+                                        *arm = Some(src);
+                                        if uses[j as usize] == 1 {
+                                            saved_casts += 1;
+                                        }
+                                    }
+                                }
+                            } else if let Some(bits) = self.const_u64(val) {
+                                *arm = Some(self.f32c(bits as u32));
+                            }
+                        }
+                        let added = arms.iter().filter(|v| v.is_none()).count()
+                            + usize::from(uses[i as usize] > float_uses[i as usize]);
+                        if saved_casts + float_uses[i as usize] > added {
+                            let x = arms[0].unwrap_or_else(|| self.bitcast(x, float));
+                            let y = arms[1].unwrap_or_else(|| self.bitcast(y, float));
+                            let selected = self.select(c, x, y);
+                            self.insts[i as usize].op = Op::Cast(CastOp::BitCast, selected, word);
+                            changed = true;
+                        }
+                    }
+                }
+                self.blocks[b].push(i);
+            }
+        }
+        self.cur = saved;
+        changed
+    }
+
     /// Cleans up the entry function (see the module docs of `opt`). Values
     /// keep their identities; replaced ones simply lose their uses.
     ///
@@ -546,6 +609,9 @@ impl Module {
         }
         for b in &mut self.blocks {
             b.retain(|&i| live[i as usize]);
+        }
+        if !skip("cse") && !self.scalar_load_ranges.is_empty() {
+            self.share_scalar_load_arithmetic(&order, &idom);
         }
     }
 }

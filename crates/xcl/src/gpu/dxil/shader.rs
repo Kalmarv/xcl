@@ -135,6 +135,7 @@ pub struct Shader {
     pub(super) bindings: Vec<Binding>,
     pub(super) handle_ty: Ty,
     props_ty: Ty,
+    pub(super) legacy_mul: Option<u32>,
 }
 
 /// A raw (byte-address) UAV bound at `u<lower>, space<space>`.
@@ -154,7 +155,7 @@ impl Shader {
         let handle_ty = m.named_struct("dx.types.Handle", &[p8]);
         let i32 = m.i32();
         let props_ty = m.named_struct("dx.types.ResourceProperties", &[i32, i32]);
-        Shader { m, stage, sm, entry, features: BTreeSet::new(), bindings: Vec::new(), handle_ty, props_ty }
+        Shader { m, stage, sm, entry, features: BTreeSet::new(), bindings: Vec::new(), handle_ty, props_ty, legacy_mul: None }
     }
 
     pub fn require(&mut self, f: Feature) {
@@ -485,6 +486,9 @@ impl Shader {
             self.m.ret();
         }
         self.m.optimize();
+        if self.m.fold_float_selects() {
+            self.m.optimize();
+        }
         self.infer_type_features();
         let flags: u64 = self.features.iter().map(|f| f.metadata_bit()).fold(0, |a, b| a | b);
         let sfi0: u64 = self.features.iter().map(|f| f.container_bit()).fold(0, |a, b| a | b);

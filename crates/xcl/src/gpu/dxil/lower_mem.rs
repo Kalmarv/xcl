@@ -1048,6 +1048,7 @@ impl Lw {
         let sbase = Self::field(d, "SBASE");
         let imm = Self::fv(d, "OFFSET") as u32;
         let soff = rdna2::field_value(d.enc, &d.words, "SOFFSET").unwrap_or(125);
+        let first = self.s.m.instruction_count();
         let soff = if soff == 125 { self.c(0) } else { self.code32(soff, None, false).ok_or_else(|| format!("{}: op", rdna2::format(d)))? };
         let mut vals = if name.starts_with("s_buffer_load") {
             let (d0, d1, d2) = (self.sreg(sbase), self.sreg(sbase + 1), self.sreg(sbase + 2));
@@ -1103,6 +1104,7 @@ impl Lw {
                 out
             })
         };
+        self.s.m.mark_scalar_load(first);
         let coherent = ["GLC", "DLC"].iter().any(|f| rdna2::field_value(d.enc, &d.words, f) == Some(1));
         if self.split && coherent {
             // both halves take the lower half's values

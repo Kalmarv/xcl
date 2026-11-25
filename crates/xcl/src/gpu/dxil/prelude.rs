@@ -165,12 +165,24 @@ impl Lw {
     }
     /// `mul_legacy`: 0 · anything = 0.
     pub fn mul_legacy(&mut self, a: Value, b: Value) -> Value {
-        let z = self.fc(0.0);
-        let az = self.fcmp(Pred::FOEq, a, z);
-        let bz = self.fcmp(Pred::FOEq, b, z);
-        let c = self.lor(az, bz);
-        let p = self.fmul(a, b);
-        self.sel(c, z, p)
+        let function = if let Some(f) = self.s.legacy_mul {
+            f
+        } else {
+            let float = self.s.m.f32();
+            let helper = self.s.m.begin_scalar_helper("xcl.mul.legacy", &[float, float], float);
+            let (x, y) = (helper.args[0], helper.args[1]);
+            let zero = self.fc(0.0);
+            let x_zero = self.fcmp(Pred::FOEq, x, zero);
+            let y_zero = self.fcmp(Pred::FOEq, y, zero);
+            let either_zero = self.lor(x_zero, y_zero);
+            let product = self.fmul(x, y);
+            let result = self.sel(either_zero, zero, product);
+            let f = helper.function;
+            self.s.m.end_scalar_helper(helper, result);
+            self.s.legacy_mul = Some(f);
+            f
+        };
+        self.s.m.call(function, &[a, b])
     }
     /// `mad_nf`: separately rounded multiply and add (`precise`).
     pub fn mad_nf(&mut self, a: Value, b: Value, c: Value) -> Value {

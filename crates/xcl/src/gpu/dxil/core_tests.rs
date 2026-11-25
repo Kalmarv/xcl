@@ -437,3 +437,39 @@ fn ps_get_lod_with_a_static_sampler() {
         super::coverage::translate_mode(&code, &Mode::Pixel(psi), ko, true).unwrap_or_else(|e| panic!("{}", &e[..e.len().min(800)]));
     }
 }
+
+#[test]
+fn direct_arithmetic_legacy_multiply_shares_the_exact_zero_guard() {
+    use crate::gpu::recomp::runner::{self, KernelState};
+    let code = prog(&[
+        ("V_MUL_LEGACY_F32", "ENC_VOP2", &[("VDST", 2), ("SRC0", 256), ("VSRC1", 1)], None),
+        ("V_MUL_LEGACY_F32", "ENC_VOP2", &[("VDST", 3), ("SRC0", 257), ("VSRC1", 2)], None),
+    ]);
+    let dx = translate(&code, KernelOptions { wave64: false, split: false, mem_windows: 1, sampler_base: 0 }).unwrap();
+    let ir = super::validate::disassemble(&dx).unwrap();
+    assert_eq!(ir.lines().filter(|s| s.contains("call float @xcl.mul.legacy")).count(), 2);
+    if !runner::wave32_supported().unwrap_or(false) {
+        runner::skip_test("no wave32");
+        return;
+    }
+    let inputs = [(0.0, f32::NAN), (f32::INFINITY, -0.0), (-0.0, -3.0), (-2.5, 4.0), (f32::NAN, 1.0)];
+    let mut st = KernelState::default();
+    for (lane, regs) in st.vgpr.iter_mut().enumerate() {
+        let (x, y): (f32, f32) = inputs[lane % inputs.len()];
+        regs[0] = x.to_bits();
+        regs[1] = y.to_bits();
+    }
+    let out = runner::run(&dx, &st, &[]).unwrap();
+    let mul = |a: f32, b: f32| if a == 0.0 || b == 0.0 { 0.0 } else { a * b };
+    for (lane, regs) in out.vgpr[..32].iter().enumerate() {
+        let (x, y) = inputs[lane % inputs.len()];
+        let p = mul(x, y);
+        for (got, want) in [(regs[2], p), (regs[3], mul(y, p))] {
+            if want.is_nan() {
+                assert!(f32::from_bits(got).is_nan(), "lane {lane}");
+            } else {
+                assert_eq!(got, want.to_bits(), "lane {lane}");
+            }
+        }
+    }
+}

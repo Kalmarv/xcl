@@ -1112,3 +1112,61 @@ fn dx_op_attrs_match_dxc() {
     }
     assert!(n > 50, "only {n} declarations found");
 }
+
+#[test]
+fn direct_arithmetic_float_select_preserves_selected_bits() {
+    let mut k = kernel();
+    let x = k.input_f(0);
+    let y = k.input_f(1);
+    let x = k.s.funary(FUnary::FAbs, x);
+    let y = k.s.funary(FUnary::FAbs, y);
+    let word = k.s.m.i32();
+    let x = k.s.m.bitcast(x, word);
+    let y = k.s.m.bitcast(y, word);
+    let limit = k.s.m.i32c(16);
+    let lower_half = k.s.m.cmp(Pred::ULt, k.lane, limit);
+    let selected = k.s.m.select(lower_half, x, y);
+    k.out(0, selected);
+    let dx = k.finish([32, 1, 1]);
+    let ir = validate::disassemble(&dx).unwrap();
+    assert!(ir.lines().any(|s| s.contains("select i1") && s.contains(", float ")));
+    let words = [0x8000_0000, 0x7fc1_2345, 0xffc5_4321, 0x8000_0001, 0xff80_0000, 0x4060_0000];
+    let a: Vec<_> = words.into_iter().cycle().take(32).collect();
+    let b: Vec<_> = words.into_iter().cycle().skip(3).take(32).collect();
+    let Some(r) = gpu(&dx, &mem_of(&[a.clone(), b.clone()]), &[], &[]) else { return };
+    for (lane, &got) in outv(&r, 0).iter().enumerate() {
+        assert_eq!(got, (if lane < 16 { a[lane] } else { b[lane] }) & 0x7fff_ffff, "lane {lane}");
+    }
+}
+
+#[test]
+fn direct_arithmetic_shared_address_keeps_loads_after_their_stores() {
+    let mut k = kernel();
+    let half = k.s.m.i32c(16);
+    let cond = k.s.m.cmp(Pred::ULt, k.lane, half);
+    let arms = [k.s.m.new_block(), k.s.m.new_block()];
+    let end = k.s.m.new_block();
+    let off = k.slot(0);
+    let bump = k.s.m.i32c(72);
+    k.s.m.cond_br(cond, arms[0], arms[1]);
+    for (i, arm) in arms.into_iter().enumerate() {
+        k.s.m.set_block(arm);
+        let first = k.s.m.instruction_count();
+        let addr = k.s.m.bin(BinOp::Add, off, bump);
+        let value = k.s.m.i32c(41 + i as u32);
+        k.s.raw_store(k.mem, addr, &[value]);
+        let actual = k.s.raw_load(k.mem, addr, 1)[0];
+        k.s.m.mark_scalar_load(first);
+        k.out(0, actual);
+        k.s.m.br(end);
+    }
+    k.s.m.set_block(end);
+    let dx = k.finish([32, 1, 1]);
+    let ir = validate::disassemble(&dx).unwrap();
+    assert_eq!(ir.lines().filter(|s| s.contains(" = add i32 ") && s.ends_with(", 72")).count(), 1);
+    assert_eq!(ir.lines().filter(|s| s.contains("call") && s.contains("@dx.op.rawBufferLoad")).count(), 2);
+    let Some(r) = gpu(&dx, &[0; 64], &[], &[]) else { return };
+    for (lane, &got) in outv(&r, 0).iter().enumerate() {
+        assert_eq!(got, if lane < 16 { 41 } else { 42 }, "lane {lane}");
+    }
+}

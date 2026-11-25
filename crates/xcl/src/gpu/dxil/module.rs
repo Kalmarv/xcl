@@ -267,6 +267,7 @@ pub struct Module {
     func_ids: HashMap<String, u32>,
     globals: Vec<GlobalDef>,
     insts: Vec<InstDef>,
+    scalar_load_ranges: Vec<std::ops::Range<usize>>,
     def_block: Vec<Block>,
     blocks: Vec<Vec<u32>>,
     cur: Block,
@@ -296,6 +297,7 @@ impl Module {
             func_ids: HashMap::new(),
             globals: Vec::new(),
             insts: Vec::new(),
+            scalar_load_ranges: Vec::new(),
             def_block: Vec::new(),
             blocks: vec![Vec::new()],
             cur: Block(0),
@@ -628,6 +630,14 @@ impl Module {
             list.push(id);
         }
         Value::Inst(id)
+    }
+
+    pub(super) fn instruction_count(&self) -> usize {
+        self.insts.len()
+    }
+
+    pub(super) fn mark_scalar_load(&mut self, first: usize) {
+        self.scalar_load_ranges.push(first..self.insts.len());
     }
 
     // ---- instructions
