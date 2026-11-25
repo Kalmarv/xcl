@@ -3938,10 +3938,17 @@ fn huge_pso_bytes() -> usize {
     *V.get_or_init(|| env_count(std::env::var("XCL_HUGE_PSO_BYTES").ok().as_deref(), 256 << 10, 1, usize::MAX))
 }
 
-/// Huge driver compiles at once on the workers (default 1, `XCL_HUGE_PSO_CONCURRENCY`).
+/// Allow one huge driver compile per four available logical CPUs, up to four by default.
+fn default_huge_pso_concurrency(cpus: usize) -> usize {
+    (cpus / 4).clamp(1, 4)
+}
+
 fn huge_pso_concurrency() -> usize {
     static V: std::sync::OnceLock<usize> = std::sync::OnceLock::new();
-    *V.get_or_init(|| env_count(std::env::var("XCL_HUGE_PSO_CONCURRENCY").ok().as_deref(), 1, 1, 64))
+    *V.get_or_init(|| {
+        let cpus = std::thread::available_parallelism().map_or(1, |n| n.get());
+        env_count(std::env::var("XCL_HUGE_PSO_CONCURRENCY").ok().as_deref(), default_huge_pso_concurrency(cpus), 1, 64)
+    })
 }
 
 /// Hard cap on concurrent huge (`>= 256 KB`) driver compiles even when wanted by a title bind
@@ -4174,6 +4181,13 @@ mod big_compile_tests {
         t.into_iter().for_each(|h| h.join().unwrap());
         assert_eq!(PEAK.load(Ordering::SeqCst), 2, "12 concurrent wanted huge compiles must cap at 2");
         assert_eq!(*S.n.lock().unwrap(), 0);
+    }
+
+    #[test]
+    fn default_huge_pso_slots_scale_with_available_cpus() {
+        for (cpus, slots) in [(1, 1), (4, 1), (7, 1), (8, 2), (15, 3), (16, 4), (32, 4), (64, 4)] {
+            assert_eq!(default_huge_pso_concurrency(cpus), slots, "{cpus} available CPUs");
+        }
     }
 
     #[test]
