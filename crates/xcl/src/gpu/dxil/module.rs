@@ -43,6 +43,7 @@ enum TypeDef {
 /// A value: global variable, function, module constant or instruction result.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash, PartialOrd, Ord)]
 pub enum Value {
+    Param(Ty, u32),
     Global(u32),
     Func(u32),
     Const(u32),
@@ -80,12 +81,14 @@ pub enum FnAttrs {
     NoUnwind,
     /// `noduplicate nounwind` (barriers)
     NoDuplicate,
+    NoInline,
 }
 
 impl FnAttrs {
     /// Index into the PARAMATTR table (+1; 0 = none).
     fn index(self) -> u64 {
         match self {
+            FnAttrs::NoInline => 5,
             FnAttrs::None => 0,
             FnAttrs::ReadNone => 1,
             FnAttrs::ReadOnly => 2,
@@ -197,6 +200,7 @@ enum Op {
     Cmp(Pred, Value, Value),
     Select(Value, Value, Value),
     Extract(Value, u32),
+    Return(Value),
     Call(u32, Vec<Value>),
     Phi(Vec<(Value, Block)>),
     Load(Value, u32),
@@ -248,6 +252,8 @@ pub struct Module {
     type_ids: HashMap<TypeDef, Ty>,
     consts: Vec<ConstDef>,
     const_ids: HashMap<ConstDef, u32>,
+    return_slot: Option<Value>,
+    helpers: std::collections::BTreeMap<u32, std::rc::Rc<Module>>,
     funcs: Vec<FuncDecl>,
     func_ids: HashMap<String, u32>,
     globals: Vec<GlobalDef>,
@@ -276,6 +282,8 @@ impl Module {
             type_ids: HashMap::new(),
             consts: Vec::new(),
             const_ids: HashMap::new(),
+            return_slot: None,
+            helpers: Default::default(),
             funcs: Vec::new(),
             func_ids: HashMap::new(),
             globals: Vec::new(),
@@ -509,6 +517,7 @@ impl Module {
             Value::Const(c) => match &self.consts[c as usize] {
                 ConstDef::Int(t, _) | ConstDef::Float(t, _) | ConstDef::Undef(t) | ConstDef::Null(t) | ConstDef::Aggregate(t, _) => *t,
             },
+            Value::Param(ty, _) => ty,
             Value::Inst(i) => self.insts[i as usize].ty,
         }
     }
@@ -549,7 +558,7 @@ impl Module {
     /// Whether the current block already ends in a terminator.
     pub fn terminated(&self) -> bool {
         self.blocks[self.cur.0 as usize].last().is_some_and(|&i| {
-            matches!(self.insts[i as usize].op, Op::Br(_) | Op::CondBr(..) | Op::Switch(..) | Op::Ret | Op::Unreachable)
+            matches!(self.insts[i as usize].op, Op::Br(_) | Op::CondBr(..) | Op::Switch(..) | Op::Ret | Op::Return(_) | Op::Unreachable)
         })
     }
 
@@ -623,6 +632,45 @@ impl Module {
         let t = self.struct_elem(at, idx);
         self.push(Op::Extract(agg, idx), t)
     }
+    pub fn return_word(&mut self, v: Value) {
+        let void = self.void();
+        self.push(Op::Return(v), void);
+    }
+
+    /// Calls consume and read their scratch in one basic block. Every piece may
+    /// therefore have its own entry-block allocation for wide SMEM returns.
+    pub fn return_slot(&mut self) -> Value {
+        if let Some(slot) = self.return_slot { return slot; }
+        let word = self.i32();
+        let words = self.array(16, word);
+        let current = self.current_block();
+        self.set_block(Block(0));
+        let old = self.set_insert_before_term(true);
+        let slot = self.alloca(words, 4);
+        self.set_insert_before_term(old);
+        self.set_block(current);
+        self.return_slot = Some(slot);
+        slot
+    }
+
+    pub fn function(&self, name: &str) -> Option<u32> {
+        self.func_ids.get(name).copied()
+    }
+
+    /// A helper owns its local instructions. Its symbol indices start with the caller's
+    /// tables and those tables grow only while the caller is suspended.
+    pub fn finish_helper(&mut self, f: u32, mut body: Module) {
+        if let Some(err) = body.error() { self.fail(err); }
+        self.types.clone_from(&body.types);
+        self.type_ids.clone_from(&body.type_ids);
+        self.consts.clone_from(&body.consts);
+        self.const_ids.clone_from(&body.const_ids);
+        self.funcs.clone_from(&body.funcs);
+        self.func_ids.clone_from(&body.func_ids);
+        body.helpers.clear();
+        self.helpers.insert(f, std::rc::Rc::new(body));
+    }
+
     pub fn call(&mut self, f: u32, args: &[Value]) -> Value {
         let ret = match &self.types[self.funcs[f as usize].ty.0 as usize] {
             TypeDef::Func(r, p) => {
@@ -858,6 +906,13 @@ impl Module {
                 }
             }
         }
+        for (&f, helper) in &self.helpers {
+            if !fused[f as usize] { continue; }
+            for def in &helper.insts {
+                if let Op::Call(callee, _) = def.op { fused[callee as usize] = true; }
+                def.op.for_each_operand(|v| if let Value::Global(g) = v { gused[g as usize] = true; });
+            }
+        }
         let mut gmap: Vec<Option<u64>> = vec![None; self.globals.len()];
         let mut n_globals = 0u64;
         for (g, used) in gused.iter().enumerate() {
@@ -895,6 +950,7 @@ impl Module {
         }
         let abs = |v: Value| -> u64 {
             match v {
+                Value::Param(..) => unreachable!("parameter in entry"),
                 Value::Global(g) => gmap[g as usize].expect("use of a dropped global"),
                 Value::Func(f) => n_globals + fmap[f as usize].expect("use of a dropped function"),
                 Value::Const(c) => const_base + c as u64,
@@ -920,9 +976,13 @@ impl Module {
         w.record(PARAMATTR_GRP_CODE_ENTRY, &[2, FN, 0, ATTR_NOUNWIND, 0, ATTR_READONLY]);
         w.record(PARAMATTR_GRP_CODE_ENTRY, &[3, FN, 0, ATTR_NOUNWIND]);
         w.record(PARAMATTR_GRP_CODE_ENTRY, &[4, FN, 0, ATTR_NODUPLICATE, 0, ATTR_NOUNWIND]);
+        let groups = if self.helpers.is_empty() { 4 } else {
+            w.record(PARAMATTR_GRP_CODE_ENTRY, &[5, FN, 0, 14, 0, ATTR_NOUNWIND]);
+            5
+        };
         w.end_block();
         w.enter_block(BLOCK_PARAMATTR);
-        for g in 1..=4 {
+        for g in 1..=groups {
             w.record(PARAMATTR_CODE_ENTRY, &[g]);
         }
         w.end_block();
@@ -942,12 +1002,13 @@ impl Module {
                 &[g.ty.0 as u64, ((g.addrspace as u64) << 2) | 2 | g.constant as u64, init, linkage, align, 0, 0, 0, 0, 0, 0, 0],
             );
         }
-        for f in self.funcs.iter().enumerate().filter(|(i, _)| fused[*i]).map(|x| x.1) {
+        for (idx, f) in self.funcs.iter().enumerate().filter(|(i, _)| fused[*i]) {
+            let helper = self.helpers.contains_key(&(idx as u32));
             // [type, cc, isproto, linkage, paramattr, align, section, visibility,
             //  gc, unnamed_addr, prologue, dllstorage, comdat, prefix, personality]
             w.record(
                 MODULE_CODE_FUNCTION,
-                &[f.ty.0 as u64, 0, (!f.defined) as u64, LINKAGE_EXTERNAL, f.attrs.index(), 0, 0, 0, 0, 0, 0, 0, 0, 0, 0],
+                &[f.ty.0 as u64, 0, (!(f.defined || helper)) as u64, if helper { LINKAGE_INTERNAL } else { LINKAGE_EXTERNAL }, f.attrs.index(), 0, 0, 0, 0, 0, 0, 0, 0, 0, 0],
             );
         }
 
@@ -1027,6 +1088,35 @@ impl Module {
             }
         }
         w.end_block();
+
+        for (&f, helper) in &self.helpers {
+            if !fused[f as usize] { continue; }
+            let TypeDef::Func(_, params) = &self.types[self.funcs[f as usize].ty.0 as usize] else { unreachable!() };
+            let (blocks, positions) = helper.block_layout();
+            let first = inst_base + params.len() as u64;
+            let mut next = first;
+            let mut ids = vec![0; helper.insts.len()];
+            for &block in &blocks {
+                for &id in &helper.blocks[block] {
+                    ids[id as usize] = next;
+                    if !helper.is_void(helper.insts[id as usize].ty) { next += 1; }
+                }
+            }
+            let local_id = |v| match v {
+                Value::Param(_, i) => inst_base + u64::from(i),
+                Value::Inst(i) => ids[i as usize],
+                _ => abs(v),
+            };
+            w.enter_block(BLOCK_FUNCTION);
+            w.record(FUNC_CODE_DECLAREBLOCKS, &[blocks.len() as u64]);
+            for block in blocks {
+                for &id in &helper.blocks[block] {
+                    helper.write_inst(&mut w, id as usize, ids[id as usize], &local_id, &positions, &mut operands);
+                }
+            }
+            if let Some(err) = helper.error() { self.fail(err); }
+            w.end_block();
+        }
 
         w.end_block(); // module
         w.finish()
@@ -1145,7 +1235,7 @@ impl Module {
                     r(a);
                     r(b)
                 }
-                Op::Cast(_, a, _) | Op::Extract(a, _) | Op::Load(a, _) | Op::CondBr(a, _, _) | Op::Alloca(_, a, _) => r(a),
+                Op::Return(a) | Op::Cast(_, a, _) | Op::Extract(a, _) | Op::Load(a, _) | Op::CondBr(a, _, _) | Op::Alloca(_, a, _) => r(a),
                 Op::Select(a, b, c) | Op::CmpXchg(a, b, c) => {
                     r(a);
                     r(b);
@@ -1208,6 +1298,7 @@ impl Module {
             Op::Cast(op, v, t) => w.record(FUNC_CODE_INST_CAST, &[rel(*v), t.0 as u64, *op as u64]),
             Op::Cmp(p, a, b) => w.record(FUNC_CODE_INST_CMP2, &[rel(*a), rel(*b), *p as u64]),
             Op::Select(c, t, f) => w.record(FUNC_CODE_INST_VSELECT, &[rel(*t), rel(*f), rel(*c)]),
+            Op::Return(v) => w.record(FUNC_CODE_INST_RET, &[rel(*v)]),
             Op::Extract(a, idx) => w.record(FUNC_CODE_INST_EXTRACTVAL, &[rel(*a), *idx as u64]),
             Op::Call(f, args) => {
                 let fd = &self.funcs[*f as usize];
@@ -1276,6 +1367,7 @@ impl Module {
             Value::Const(c) => match &self.consts[c as usize] {
                 ConstDef::Int(t, _) | ConstDef::Float(t, _) | ConstDef::Undef(t) | ConstDef::Null(t) | ConstDef::Aggregate(t, _) => *t,
             },
+            Value::Param(ty, _) => ty,
             Value::Inst(i) => self.insts[i as usize].ty,
         }
     }
@@ -1401,6 +1493,7 @@ impl Module {
             Op::Br(b) => InstInfo::Term(None, vec![*b]),
             Op::CondBr(c, t, f) => InstInfo::Term(Some(*c), vec![*t, *f]),
             Op::Switch(v, d, cases) => InstInfo::Term(Some(*v), std::iter::once(*d).chain(cases.iter().map(|c| c.1)).collect()),
+            Op::Return(v) => InstInfo::Term(Some(*v), Vec::new()),
             Op::Ret | Op::Unreachable => InstInfo::Term(None, Vec::new()),
         }
     }

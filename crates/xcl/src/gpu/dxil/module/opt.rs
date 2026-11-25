@@ -20,7 +20,7 @@ impl Op {
                 f(*a);
                 f(*b)
             }
-            Op::Cast(_, v, _) | Op::Extract(v, _) | Op::Load(v, _) | Op::Alloca(_, v, _) | Op::CondBr(v, ..) => f(*v),
+            Op::Return(v) | Op::Cast(_, v, _) | Op::Extract(v, _) | Op::Load(v, _) | Op::Alloca(_, v, _) | Op::CondBr(v, ..) => f(*v),
             Op::Select(a, b, c) | Op::CmpXchg(a, b, c) => {
                 f(*a);
                 f(*b);
@@ -47,7 +47,7 @@ impl Op {
                 *a = f(*a);
                 *b = f(*b)
             }
-            Op::Cast(_, v, _) | Op::Extract(v, _) | Op::Load(v, _) | Op::Alloca(_, v, _) | Op::CondBr(v, ..) => *v = f(*v),
+            Op::Return(v) | Op::Cast(_, v, _) | Op::Extract(v, _) | Op::Load(v, _) | Op::Alloca(_, v, _) | Op::CondBr(v, ..) => *v = f(*v),
             Op::Select(a, b, c) | Op::CmpXchg(a, b, c) => {
                 *a = f(*a);
                 *b = f(*b);

@@ -158,11 +158,12 @@ fn translate_entry(
 ) -> Result<Kernel, String> {
     // SSA construction recurses along the CFG (one level per guarded memory access between
     // a register's definition and its use): a thread with a large stack for big programs
+    let outline = std::env::var("XCL_DXIL_OUTLINE").is_ok_and(|v| v == "1");
     let code = code.to_vec();
     std::thread::Builder::new()
         .name("xcl-dxil-translate".into())
         .stack_size(256 << 20)
-        .spawn(move || translate_on_this_thread(&code, o, entry, compact, nest, tables))
+        .spawn(move || translate_on_this_thread(&code, o, entry, compact, nest, tables, outline))
         .map_err(|e| format!("translator thread: {e}"))?
         .join()
         .map_err(|e| {
@@ -186,6 +187,11 @@ fn mem_windows(s: &mut Shader, mem_windows: u32, coherent: bool) -> (Vec<RawUav>
     ((0..n).map(|k| if coherent { s.raw_uav_coherent(2 + k, 0) } else { s.raw_uav(2 + k, 0) }).collect(), None)
 }
 
+#[cfg(test)]
+pub(super) fn translate_outline_fixture(code: &[u8], o: KernelOptions, outline: bool) -> Result<Vec<u8>, String> {
+    translate_on_this_thread(code, o, Entry::Kernel, Some(false), None, 0, outline).map(|k| k.dxil)
+}
+
 fn translate_on_this_thread(
     code: &[u8],
     o: KernelOptions,
@@ -193,6 +199,7 @@ fn translate_on_this_thread(
     compact: Option<bool>,
     nest: Option<super::compact::Nest>,
     tables: usize,
+    outline: bool,
 ) -> Result<Kernel, String> {
     let geo = match &entry {
         Entry::Geometry(g) => Some(g.clone()),
@@ -209,6 +216,7 @@ fn translate_on_this_thread(
     let split = o.wave64 && o.split && !gfx;
     let leaders: BTreeSet<u64> = cfg.blocks.iter().filter_map(|b| b.insts.first().map(|&i| cfg.insts[i].pc)).collect();
     let mut lw = Lw::new(&cfg.insts, &leaders, o, &entry);
+    lw.outline_smem = outline && (kernel || compute);
     let uses_lds = lw.lds.is_some();
     let res = lw.res;
     let io = lw.init.io.expect("the I/O buffer");
@@ -553,6 +561,7 @@ impl Lw {
             guard_override: None,
             mask_override: None,
             local_masks: false,
+            outline_smem: false,
             exchange_error: None,
             pc: 0,
         };

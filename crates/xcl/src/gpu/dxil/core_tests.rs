@@ -831,3 +831,49 @@ fn raw_loads_in_root_windows_respect_exec_and_bounds() {
         }
     }
 }
+
+fn scalar_load_fixture() -> Vec<u8> {
+    prog(&[
+        ("S_BUFFER_LOAD_DWORDX4", "ENC_SMEM", &[("SDATA", 24), ("SBASE", 4), ("SOFFSET", 125)], None),
+        ("S_LOAD_DWORDX2", "ENC_SMEM", &[("SDATA", 28), ("SBASE", 4), ("SOFFSET", 125)], None),
+        ("S_BUFFER_LOAD_DWORDX4", "ENC_SMEM", &[("SDATA", 32), ("SBASE", 4), ("OFFSET", 4), ("SOFFSET", 125)], None),
+    ])
+}
+
+#[test]
+fn outlined_scalar_loads_validate() {
+    for windows in [1, 4, 0x104] {
+        let opts = KernelOptions { wave64: true, split: true, mem_windows: windows, sampler_base: 0 };
+        let blob = super::kernel::translate_outline_fixture(&scalar_load_fixture(), opts, true).unwrap();
+        super::validate::validate(&blob).unwrap();
+        let ir = super::validate::disassemble(&blob).unwrap();
+        assert!(ir.contains("define internal") && ir.contains("@xcl_buffer_load_4"));
+    }
+}
+
+#[test]
+fn outlined_scalar_loads_match_inline_at_view_end() {
+    use crate::gpu::recomp::runner::{self, KernelState};
+    let (wave32, native64) = match (runner::wave32_supported(), runner::wave64_supported()) {
+        (Ok(a), Ok(b)) => (a, b),
+        (Err(e), _) | (_, Err(e)) => return runner::skip_test(&e),
+    };
+    if !wave32 && !native64 {
+        return runner::skip_test("no wave32 or wave64 GPU");
+    }
+    let memory: Vec<u32> = (0..32).map(|i| 0xabc0_0000 + i).collect();
+    for (wave64, split) in [(false, false), (true, true), (true, false)] {
+        if (wave64 && !split && !native64) || ((!wave64 || split) && !wave32) { continue; }
+        let opts = KernelOptions { wave64, split, mem_windows: 1, sampler_base: 0 };
+        let blobs = [false, true].map(|enabled| super::kernel::translate_outline_fixture(&scalar_load_fixture(), opts, enabled).unwrap());
+        for (lo, hi) in [(u32::MAX, 0), (0, 0x7f), (1, 0)] {
+            let mut state = KernelState::default();
+            state.sgpr[126..128].copy_from_slice(&[lo, hi]);
+            state.sgpr[8..12].copy_from_slice(&[16, 0, 10, 0]);
+            let [a, b] = blobs.each_ref().map(|dxil| runner::run(dxil, &state, &memory).unwrap());
+            assert_eq!(a.raw, b.raw);
+            assert_eq!(&b.sgpr[24..28], &[memory[4], memory[5], memory[6], 0]);
+            assert_eq!(&b.sgpr[32..36], &[memory[5], memory[6], 0, 0]);
+        }
+    }
+}
