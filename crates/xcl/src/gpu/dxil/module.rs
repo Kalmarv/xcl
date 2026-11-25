@@ -670,7 +670,8 @@ impl Module {
         self.const_ids.clone_from(&body.const_ids);
         self.funcs.clone_from(&body.funcs);
         self.func_ids.clone_from(&body.func_ids);
-        body.helpers.clear();
+        self.globals.clone_from(&body.globals);
+        self.helpers = std::mem::take(&mut body.helpers);
         self.helpers.insert(f, std::rc::Rc::new(body));
     }
 
@@ -889,15 +890,11 @@ impl Module {
                 Value::Func(f) => fused[f as usize] = true,
                 _ => {}
             };
-            for &b in &order {
-                for &i in &self.blocks[b] {
-                    let op = &self.insts[i as usize].op;
-                    if let Op::Call(f, _) = op {
-                        mark(Value::Func(*f));
-                    }
-                    op.for_each_operand(&mut mark);
-                }
-            }
+            self.any_emitted_inst(|_, op, _| {
+                if let Op::Call(f, _) = op { mark(Value::Func(*f)); }
+                op.for_each_operand(&mut mark);
+                false
+            });
             for c in &self.consts {
                 if let ConstDef::Aggregate(_, e) = c {
                     e.iter().copied().for_each(&mut mark);
@@ -907,13 +904,6 @@ impl Module {
                 if let MdDef::Val(_, v) = m {
                     mark(*v);
                 }
-            }
-        }
-        for (&f, helper) in &self.helpers {
-            if !fused[f as usize] { continue; }
-            for def in &helper.insts {
-                if let Op::Call(callee, _) = def.op { fused[callee as usize] = true; }
-                def.op.for_each_operand(|v| if let Value::Global(g) = v { gused[g as usize] = true; });
             }
         }
         let mut gmap: Vec<Option<u64>> = vec![None; self.globals.len()];
@@ -1510,40 +1500,54 @@ impl Module {
             Op::Ret | Op::Unreachable => InstInfo::Term(None, Vec::new()),
         }
     }
-    /// Whether an instruction of the entry function produces or consumes a
-    /// value of type `t` (the shader-flag rules key off instruction types).
     /// The 64-bit integer and double types, if already interned (lookup
     /// without adding them to the type table).
     pub fn existing_i64_f64(&self) -> (Option<Ty>, Option<Ty>) {
         (self.type_ids.get(&TypeDef::Int(64)).copied(), self.type_ids.get(&TypeDef::Double).copied())
     }
-    /// Whether the entry uses a D3D11.1 double extension through plain
-    /// instructions: double `fdiv`, or conversions between double and
-    /// integers (DXC's shader-flag rules; `Fma` is flagged by its helper).
+    /// Visit instructions in reachable blocks, following calls into emitted helpers.
+    fn any_emitted_inst(&self, mut test: impl FnMut(&Module, &Op, Ty) -> bool) -> bool {
+        let mut pending = vec![self];
+        let mut seen = std::collections::BTreeSet::new();
+        while let Some(body) = pending.pop() {
+            for block in body.block_layout().0 {
+                for &i in &body.blocks[block] {
+                    let d = &body.insts[i as usize];
+                    if test(body, &d.op, d.ty) { return true; }
+                    if let Op::Call(f, _) = &d.op {
+                        if let Some(helper) = self.helpers.get(f) {
+                            if seen.insert(*f) { pending.push(helper.as_ref()); }
+                        }
+                    }
+                }
+            }
+        }
+        false
+    }
+
+    pub fn uses_fmad(&self) -> bool {
+        self.any_emitted_inst(|m, op, _| matches!(op, Op::Call(f, args)
+            if m.funcs[*f as usize].name.starts_with("dx.op.tertiary.")
+                && args.first().and_then(|&v| m.const_u64(v)) == Some(46)))
+    }
+
+    /// D3D11.1 double extensions include double division and integer conversions.
     pub fn uses_double_extensions(&self) -> bool {
-        let Some(f64) = self.type_ids.get(&TypeDef::Double).copied() else { return false };
-        self.insts.iter().any(|d| match &d.op {
-            Op::Bin(BinOp::UDiv | BinOp::SDiv, ..) => d.ty == f64,
-            Op::Cast(CastOp::FPToUI | CastOp::FPToSI, v, _) => self.value_ty(*v) == f64,
+        let Some(&f64) = self.type_ids.get(&TypeDef::Double) else { return false };
+        self.any_emitted_inst(|m, op, ty| match op {
+            Op::Bin(BinOp::UDiv | BinOp::SDiv, ..) => ty == f64,
+            Op::Cast(CastOp::FPToUI | CastOp::FPToSI, v, _) => m.value_ty(*v) == f64,
             Op::Cast(CastOp::UIToFP | CastOp::SIToFP, _, t) => *t == f64,
             _ => false,
         })
     }
+
     pub fn insts_use_type(&self, t: Ty) -> bool {
-        self.blocks.iter().flatten().any(|&i| {
-            let d = &self.insts[i as usize];
-            if d.ty == t {
-                return true;
-            }
-            let ops: Vec<Value> = match self.inst_info(i) {
-                InstInfo::Call(_, a) => a.to_vec(),
-                InstInfo::Phi(l) => l.iter().map(|p| p.0).collect(),
-                InstInfo::Load(p) => vec![p],
-                InstInfo::Store(p, v) => vec![p, v],
-                InstInfo::Other(v) => v,
-                InstInfo::Term(c, _) => c.into_iter().collect(),
-            };
-            ops.into_iter().any(|v| self.value_ty(v) == t)
+        self.any_emitted_inst(|m, op, ty| {
+            if ty == t { return true; }
+            let mut used = false;
+            op.for_each_operand(|v| used |= m.value_ty(v) == t);
+            used
         })
     }
     /// True if any surviving `dx.op.annotateHandle` call carries the `IsROV` flag (`0x2000`).
@@ -1647,6 +1651,50 @@ impl Module {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn feature_scans_follow_only_reachable_helper_code() {
+        use crate::gpu::dxil::{container::Stage, shader::{Feature, Shader}, validate};
+        let mut shader = Shader::new(Stage::Compute, (6, 6));
+        shader.require(Feature::DisableMathRefactoring);
+        let m = &mut shader.m;
+        let (word, wide, double, float) = (m.i32(), m.i64(), m.f64(), m.f32());
+        let sig = m.func_ty(word, &[word]);
+        let outer = m.declare("outer", sig, FnAttrs::NoInline);
+        let mut outer_body = m.declarations();
+        let inner = outer_body.declare("inner", sig, FnAttrs::NoInline);
+        let mut body = outer_body.declarations();
+        let p = Value::Param(word, 0);
+        let w = body.cast(CastOp::ZExt, p, wide);
+        let d = body.cast(CastOp::UIToFP, w, double);
+        let v = body.cast(CastOp::FPTrunc, d, float);
+        let fm_ty = body.func_ty(float, &[word, float, float, float]);
+        let fm = body.declare("dx.op.tertiary.f32", fm_ty, FnAttrs::ReadNone);
+        let opcode = body.i32c(46);
+        let mad = body.call(fm, &[opcode, v, v, v]);
+        let result = body.bitcast(mad, word);
+        let shared = body.global("helper_word", word, 3, None, false, 4);
+        body.store(shared, result, 4);
+        body.return_word(result);
+        outer_body.finish_helper(inner, body);
+        let v = outer_body.call(inner, &[p]);
+        outer_body.return_word(v);
+        m.finish_helper(outer, outer_body);
+        let dead = m.new_block();
+        m.set_block(dead);
+        let arg = m.i32c(1);
+        m.call(outer, &[arg]);
+        m.ret();
+        m.set_block(m.entry_block());
+        assert!(!m.insts_use_type(wide) && !m.uses_double_extensions() && !m.uses_fmad());
+        m.call(outer, &[arg]);
+        m.ret();
+        assert!(m.insts_use_type(wide) && m.insts_use_type(double));
+        assert!(m.uses_double_extensions() && m.uses_fmad());
+        let blob = shader.try_finish([1, 1, 1], None).unwrap();
+        validate::validate(&blob).unwrap();
+    }
+
 
     #[test]
     fn sign_extension_does_not_intern_unrelated_integer_types() {

@@ -216,7 +216,6 @@ fn translate_on_this_thread(
     let split = o.wave64 && o.split && !gfx;
     let leaders: BTreeSet<u64> = cfg.blocks.iter().filter_map(|b| b.insts.first().map(|&i| cfg.insts[i].pc)).collect();
     let mut lw = Lw::new(&cfg.insts, &leaders, o, &entry);
-    lw.outline_smem = outline && (kernel || compute);
     let uses_lds = lw.lds.is_some();
     let res = lw.res;
     let io = lw.init.io.expect("the I/O buffer");
@@ -344,6 +343,22 @@ fn translate_on_this_thread(
     // scalar loads the program repeats keep their first values (compute programs and kernels:
     // the other stages enter their code by edges the CFG does not hold)
     let reloads = if follow_loads { super::reload::analyze(&cfg) } else { Default::default() };
+    if outline && follow_loads {
+        // Compact lowering emits each representative once and does not substitute reloads.
+        let mut count_block = |b: usize| {
+            for &i in &cfg.blocks[b].insts {
+                if plan.is_none() && reloads.get(b, i).is_some_and(|r| r.available) { continue; }
+                if let Some((buffer, words)) = super::lower_mem::scalar_load_shape(cfg.insts[i].inst.name) {
+                    lw.scalar_load_sites[buffer as usize][words.ilog2() as usize] += 1;
+                }
+            }
+        };
+        if let Some(p) = &plan {
+            for &r in &p.rep { count_block(p.order[r]); }
+        } else {
+            for &b in &cfg.rpo { count_block(b); }
+        }
+    }
     let mut gs_entry: Option<usize> = None;
     if let Some(p) = &plan {
         match nest {
@@ -561,7 +576,7 @@ impl Lw {
             guard_override: None,
             mask_override: None,
             local_masks: false,
-            outline_smem: false,
+            scalar_load_sites: [[0; 5]; 2],
             exchange_error: None,
             pc: 0,
         };

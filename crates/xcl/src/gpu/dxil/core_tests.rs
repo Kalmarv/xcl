@@ -837,7 +837,33 @@ fn scalar_load_fixture() -> Vec<u8> {
         ("S_BUFFER_LOAD_DWORDX4", "ENC_SMEM", &[("SDATA", 24), ("SBASE", 4), ("SOFFSET", 125)], None),
         ("S_LOAD_DWORDX2", "ENC_SMEM", &[("SDATA", 28), ("SBASE", 4), ("SOFFSET", 125)], None),
         ("S_BUFFER_LOAD_DWORDX4", "ENC_SMEM", &[("SDATA", 32), ("SBASE", 4), ("OFFSET", 4), ("SOFFSET", 125)], None),
+        ("S_BUFFER_LOAD_DWORDX4", "ENC_SMEM", &[("SDATA", 40), ("SBASE", 4), ("OFFSET", 8), ("SOFFSET", 125)], None),
+        ("S_BUFFER_LOAD_DWORDX4", "ENC_SMEM", &[("SDATA", 44), ("SBASE", 4), ("OFFSET", 12), ("SOFFSET", 125)], None),
+        ("S_LOAD_DWORDX2", "ENC_SMEM", &[("SDATA", 48), ("SBASE", 4), ("OFFSET", 4), ("SOFFSET", 125)], None),
+        ("S_LOAD_DWORDX2", "ENC_SMEM", &[("SDATA", 50), ("SBASE", 4), ("OFFSET", 8), ("SOFFSET", 125)], None),
+        ("S_LOAD_DWORDX2", "ENC_SMEM", &[("SDATA", 52), ("SBASE", 4), ("OFFSET", 12), ("SOFFSET", 125)], None),
     ])
+}
+
+#[test]
+fn scalar_load_threshold_counts_emitted_sites_per_shape() {
+    let threshold = super::lower_mem::MIN_OUTLINE_SITES;
+    let opts = KernelOptions { wave64: false, split: false, mem_windows: 4, sampler_base: 0 };
+    for n in [threshold - 1, threshold] {
+        let mut code = Vec::new();
+        for site in 0..n {
+            for _ in 0..2 {
+                // The second load of the same address is a reload hit.
+                code.extend(encode("S_LOAD_DWORDX2", "ENC_SMEM", &[("SDATA", 24), ("SBASE", 4),
+                    ("OFFSET", u64::from(site) * 4), ("SOFFSET", 125)], None).unwrap());
+            }
+        }
+        code.extend(prog(&[("S_BUFFER_LOAD_DWORDX2", "ENC_SMEM", &[("SDATA", 36), ("SBASE", 4), ("SOFFSET", 125)], None)]));
+        let blob = super::kernel::translate_outline_fixture(&code, opts, true).unwrap();
+        let ir = super::validate::disassemble(&blob).unwrap();
+        assert_eq!(ir.contains("@xcl_scalar_load_2("), n == threshold);
+        assert!(!ir.contains("@xcl_buffer_load_2("));
+    }
 }
 
 #[test]

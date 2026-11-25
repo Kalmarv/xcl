@@ -151,6 +151,25 @@ pub struct FmtComp1 {
     pub dflt: Value,
 }
 
+pub(super) const MIN_OUTLINE_SITES: u32 = 4;
+
+pub(super) fn scalar_load_shape(name: &str) -> Option<(bool, u32)> {
+    let (buffer, width) = if let Some(width) = name.strip_prefix("S_BUFFER_LOAD_") {
+        (true, width)
+    } else {
+        (false, name.strip_prefix("S_LOAD_")?)
+    };
+    let count = match width {
+        "DWORD" => 1,
+        "DWORDX2" => 2,
+        "DWORDX4" => 4,
+        "DWORDX8" => 8,
+        "DWORDX16" => 16,
+        _ => return None,
+    };
+    Some((buffer, count))
+}
+
 impl Lw {
     /// Runs `f` on the active memory window (`mem`, `mem1`.. at u2.., or descriptor heap
     /// when `self.heap_mem` is set via `XCL_HEAP_WINDOWS`), returning `out_tys.len()` values
@@ -1141,20 +1160,12 @@ impl Lw {
             self.write64(&Dst::S(sdata), z, z);
             return Ok(());
         }
-        let count = match name.trim_start_matches("s_buffer_load_").trim_start_matches("s_load_") {
-            "dword" => 1,
-            "dwordx2" => 2,
-            "dwordx4" => 4,
-            "dwordx8" => 8,
-            "dwordx16" => 16,
-            _ => return err(d, "SMEM"),
-        };
+        let Some((buffer, count)) = scalar_load_shape(d.inst.name) else { return err(d, "SMEM") };
         let sdata = Self::field(d, "SDATA");
         let sbase = Self::field(d, "SBASE");
         let imm = Self::fv(d, "OFFSET") as u32;
         let soff = rdna2::field_value(d.enc, &d.words, "SOFFSET").unwrap_or(125);
         let soff = if soff == 125 { self.c(0) } else { self.code32(soff, None, false).ok_or_else(|| format!("{}: op", rdna2::format(d)))? };
-        let buffer = name.starts_with("s_buffer_load");
         if !buffer {
             // a repeat of a load nothing has changed since: its values (`reload`)
             let slot = self.reload.map(|r| super::reload::VAR_RELOAD + 16 * r.slot);
@@ -1171,7 +1182,7 @@ impl Lw {
         let size = if buffer { self.sreg(sbase + 2) } else { self.c(0) };
         let imm = self.c(if buffer { imm } else { ((imm << 11) as i32 >> 11) as u32 });
         let args = [lo, hi, size, imm, soff];
-        let mut vals = if self.outline_smem {
+        let mut vals = if self.scalar_load_sites[buffer as usize][count.ilog2() as usize] >= MIN_OUTLINE_SITES {
             self.call_scalar_load(count, buffer, args)
         } else {
             self.scalar_load(count, buffer, args)

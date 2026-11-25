@@ -292,25 +292,22 @@ impl Shader {
         // typed UAV loads (`texture_load` without a mip): the whole program's flag stays only on
         // the pieces that have one, the validator wants flags to match usage
         let uav_load = |args: &[Value], m: &Module| args.get(2).is_some_and(|&mip| matches!(mip, Value::Const(c) if matches!(m.consts[c as usize], super::ConstDef::Undef(_))));
-        if !self.m.blocks.iter().flatten().any(|&i| matches!(&self.m.insts[i as usize].op,
-            Op::Call(f, args) if self.m.funcs[*f as usize].name.starts_with("dx.op.textureLoad") && uav_load(args, &self.m))) {
-            self.features.remove(&Feature::TypedUavLoadAdditionalFormats);
-        }
-        let mut called = BTreeSet::new();
-        for &i in self.m.blocks.iter().flatten() {
-            if let Op::Call(f, _) = self.m.insts[i as usize].op { called.insert(f); }
-        }
-        for m in std::iter::once(&self.m).chain(called.iter().filter_map(|f| self.m.helpers.get(f).map(|h| h.as_ref()))) {
-            for &i in m.blocks.iter().flatten() {
-                if let Op::Call(f, args) = &m.insts[i as usize].op {
-                    if m.funcs[*f as usize].name == "dx.op.createHandleFromHeap" {
-                        self.features.insert(if m.const_u64(args[2]) == Some(0) {
-                            Feature::ResourceHeapIndexing
-                        } else { Feature::SamplerHeapIndexing });
-                    }
+        let mut typed_load = false;
+        self.m.any_emitted_inst(|m, op, _| {
+            if let Op::Call(f, args) = op {
+                let name = &m.funcs[*f as usize].name;
+                if name.starts_with("dx.op.textureLoad") && uav_load(args, m) {
+                    typed_load = true;
+                }
+                if name == "dx.op.createHandleFromHeap" {
+                    self.features.insert(if m.const_u64(args[2]) == Some(0) {
+                        Feature::ResourceHeapIndexing
+                    } else { Feature::SamplerHeapIndexing });
                 }
             }
-        }
+            false
+        });
+        if !typed_load { self.features.remove(&Feature::TypedUavLoadAdditionalFormats); }
     }
 }
 
