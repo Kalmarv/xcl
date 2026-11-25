@@ -72,6 +72,8 @@ impl Op {
 thread_local! {
     /// Tests: leave out `fold_guarded_selects` on this thread (the form to compare against).
     pub(crate) static NO_SELECT_FOLD: std::cell::Cell<bool> = const { std::cell::Cell::new(false) };
+    /// Tests: leave out `fold_bitcast_pairs` on this thread.
+    pub(crate) static NO_PAIR_FOLD: std::cell::Cell<bool> = const { std::cell::Cell::new(false) };
 }
 
 /// How an instruction may be merged with an identical one.
@@ -586,7 +588,7 @@ impl Module {
     /// Cleans up the entry function (see the module docs of `opt`). Values
     /// keep their identities; replaced ones simply lose their uses.
     ///
-    /// `XCL_DXIL_NO_OPT=phi,fold,cse,select,dce,merge` (any subset, or `all`) skips passes, for bisecting.
+    /// `XCL_DXIL_NO_OPT=phi,fold,cse,select,pairs,dce,merge` (any subset, or `all`) skips passes, for bisecting.
     pub fn optimize(&mut self) {
         let off = std::env::var("XCL_DXIL_NO_OPT").unwrap_or_default();
         let skip = |p: &str| off.split(',').any(|x| x.trim() == p || x.trim() == "all");
@@ -814,11 +816,14 @@ impl Module {
         }
 
         #[cfg(test)]
-        let skip_fold = NO_SELECT_FOLD.with(|c| c.get());
+        let (skip_fold, skip_pairs) = (NO_SELECT_FOLD.with(|c| c.get()), NO_PAIR_FOLD.with(|c| c.get()));
         #[cfg(not(test))]
-        let skip_fold = false;
+        let (skip_fold, skip_pairs) = (false, false);
         if !skip("select") && !skip_fold {
             self.fold_guarded_selects(&order, &repl);
+            if !skip("pairs") && !skip_pairs {
+                self.fold_bitcast_pairs(&order, &repl);
+            }
         }
 
         // dead instructions: live = side effects, terminators and their operands, transitively
@@ -1032,6 +1037,32 @@ impl Module {
                     v
                 });
                 self.insts[i as usize].op = op;
+            }
+        }
+    }
+
+    /// `bitcast(bitcast(x))` back to `x`'s type is `x`. The peephole folds these during CSE;
+    /// `fold_guarded_selects` leaves new ones where it took a select's arm that was a bitcast.
+    fn fold_bitcast_pairs(&mut self, order: &[u32], repl: &[Option<Value>]) {
+        let mut alias: Vec<Option<Value>> = vec![None; self.insts.len()];
+        // definitions come before their uses except in phis: phis take their aliases in pass 2
+        for pass in 0..2 {
+            for &b in order {
+                for k in 0..self.blocks[b as usize].len() {
+                    let i = self.blocks[b as usize][k] as usize;
+                    if repl[i].is_some() {
+                        continue;
+                    }
+                    let mut op = std::mem::replace(&mut self.insts[i].op, Op::Ret);
+                    op.map_operands(|v| match v {
+                        Value::Inst(j) => alias[j as usize].unwrap_or(v),
+                        _ => v,
+                    });
+                    if pass == 0 && matches!(op, Op::Cast(CastOp::BitCast, ..)) {
+                        alias[i] = self.simplify_op(&op, self.insts[i].ty, &HashMap::new());
+                    }
+                    self.insts[i].op = op;
+                }
             }
         }
     }
@@ -1770,6 +1801,45 @@ mod tests {
         let has = |v: Value| matches!(v, Value::Inst(i) if body.contains(&i));
         assert!(!has(s1), "s1 has no uses left");
         assert!(has(s3), "s3 is read in every lane");
+        let order: Vec<u32> = m.block_layout().0.into_iter().map(|b| b as u32).collect();
+        assert!(m.uses_well_formed(&order));
+    }
+
+    #[test]
+    fn bitcast_pairs_left_by_the_select_fold_fold() {
+        let mut m = Module::new();
+        m.define_entry("main");
+        let entry = m.entry_block();
+        m.set_block(entry);
+
+        let void = m.void();
+        let (i32t, f32t) = (m.i32(), m.f32());
+        let src_ty = m.func_ty(i32t, &[]);
+        let src = m.declare("dx.op.waveGetLaneIndex", src_ty, FnAttrs::ReadNone);
+        let sink_ty = m.func_ty(void, &[i32t]);
+        let sink = m.declare("dx.op.storeOutput.i32", sink_ty, FnAttrs::NoUnwind);
+
+        let x = m.call(src, &[]);
+        let (c5, one) = (m.i32c(5), m.f32c(0x3F80_0000));
+        let exec = m.cmp(Pred::ULt, x, c5);
+        // v = exec ? bits(float(x) + 1) : x; v = exec ? bits(float(v) + 1) : v
+        let xf = m.bitcast(x, f32t);
+        let a = m.bin(BinOp::Add, xf, one);
+        let ai = m.bitcast(a, i32t);
+        let s1 = m.select(exec, ai, x);
+        let s1f = m.bitcast(s1, f32t);
+        let b = m.bin(BinOp::Add, s1f, one);
+        let bi = m.bitcast(b, i32t);
+        let s2 = m.select(exec, bi, s1);
+        m.call(sink, &[s2]);
+        m.ret();
+        m.optimize();
+
+        let Value::Inst(bx) = b else { panic!() };
+        assert!(matches!(m.insts[bx as usize].op, Op::Bin(BinOp::Add, v, w, _) if v == a && w == one), "b = a + 1");
+        let body = &m.blocks[entry.0 as usize];
+        let has = |v: Value| matches!(v, Value::Inst(i) if body.contains(&i));
+        assert!(!has(s1f), "bitcast(bitcast(a)) has no uses left");
         let order: Vec<u32> = m.block_layout().0.into_iter().map(|b| b as u32).collect();
         assert!(m.uses_well_formed(&order));
     }
