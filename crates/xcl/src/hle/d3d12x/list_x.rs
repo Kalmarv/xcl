@@ -854,6 +854,9 @@ struct ListState {
     occlusion: Occlusion,
     /// UMA address ranges written by this list since last Reset/KickoffX
     written_ranges: Vec<(u64, u64)>,
+    /// `(va, bytes, value)` of this list's last immediate write (`write`) to each address; a later
+    /// write over it of unknown value (fill, copy) removes it
+    written_values: Vec<(u64, u64, u64)>,
     /// Sparse-window `(va, bytes)` ranges written by memory ops (`Write32/64`, `Fill*`,
     /// `CopyMemoryToMemoryX`, timestamps) to copy back to the CPU view after execution.
     sparse_writes: Vec<(usize, usize)>,
@@ -898,6 +901,7 @@ impl ListState {
             return;
         }
         let end = va.saturating_add(size);
+        self.written_values.retain(|&(s, n, _)| !(va < s + n && s < end));
         if self.written_ranges.len() < MAX_WRITTEN_RANGES {
             self.written_ranges.push((va, end));
         } else if let Some(last) = self.written_ranges.last_mut() {
@@ -1147,6 +1151,7 @@ pub(super) fn clear_segment_state(list: usize) {
     if let Some(s) = recording(list).lock().unwrap().as_mut().and_then(|m| m.get_mut(&list)) {
         s.occlusion = Occlusion::default();
         s.written_ranges.clear();
+        s.written_values.clear();
         s.clear_sparse_writes();
         s.clear_write64_signals();
         s.clear_waits();
@@ -1315,6 +1320,16 @@ fn note_copy_into(list: usize, dst: usize, offset: u64, n: u64) {
     // (a buffer placed in a GPU view is over its tiles already: this counts the path)
     super::bind::want_view(super::view_want::Path::CopyInto, at, n);
     note_write(list, at, n);
+}
+
+/// `note_write` for an immediate write of `words`, keeping its value for `wait_memory`.
+fn note_write_value(list: usize, va: u64, words: &[u32]) {
+    let mut g = recording(list).lock().unwrap();
+    let s = g.get_or_insert_with(HashMap::new).entry(list).or_default();
+    s.note_write(va, 4 * words.len() as u64);
+    if words.len() <= 2 && s.written_values.len() < MAX_WRITTEN_RANGES {
+        s.written_values.push((va, 4 * words.len() as u64, words.iter().rev().fold(0, |v, &w| v << 32 | w as u64)));
+    }
 }
 
 // ---------------------------------------------------------------------------------------
@@ -3052,9 +3067,17 @@ unsafe fn write(list: *mut c_void, va: u64, words: &[u32], mode: D3D12_WRITEBUFF
         // that runs late does not take the CPU's view of it back (`sparse::IMM_KEEP_MAX`)
         let counter = words.len() == 2 && SYNC_GRAPH.lock().unwrap().as_ref().and_then(|g| g.cells.get(&cpu_at(va))).is_some_and(|c| !c.non_monotonic && c.recorded_max != 0);
         let bytes = n as u8 | if counter { super::sparse::IMM_KEEP_MAX } else { 0 };
-        recording(list as usize).lock().unwrap().get_or_insert_with(HashMap::new).entry(list as usize).or_default().note_imm(va, value, bytes);
+        let mut g = recording(list as usize).lock().unwrap();
+        let s = g.get_or_insert_with(HashMap::new).entry(list as usize).or_default();
+        s.note_imm(va, value, bytes);
+        // (its value, for `wait_memory`, as `note_write_value` keeps it)
+        let end = va + n;
+        s.written_values.retain(|&(w, len, _)| !(va < w + len && w < end));
+        if s.written_values.len() < MAX_WRITTEN_RANGES {
+            s.written_values.push((va, n, value));
+        }
     } else {
-        note_write(list as usize, va, n);
+        note_write_value(list as usize, va, words);
     }
     let params: Vec<D3D12_WRITEBUFFERIMMEDIATE_PARAMETER> = words.iter().enumerate().map(|(i, &w)| D3D12_WRITEBUFFERIMMEDIATE_PARAMETER { Dest: at + 4 * i as u64, Value: w }).collect();
     let modes = vec![mode; words.len()];
@@ -3658,7 +3681,9 @@ unsafe fn wait_memory(list: *mut c_void, va: u64, width: u8, comparison: u32, va
     let need_split = {
         let mut g = recording(list as usize).lock().unwrap();
         let s = g.get_or_insert_with(HashMap::new).entry(list as usize).or_default();
-        if s.has_prior_write(va, n) {
+        // (only when the value it wrote meets the wait: else another queue is to produce it)
+        let own = s.written_values.iter().find(|&&(w, len, _)| w == va && len == n);
+        if s.has_prior_write(va, n) && own.is_none_or(|&(_, _, v)| compare_u64(comparison, v & mask, value) == Some(true)) {
             return;
         }
         if s.write64_signals.is_empty() {
@@ -4009,6 +4034,7 @@ pub unsafe extern "system" fn kickoff_x(this: *mut c_void) {
         let sparse_writes = s.clear_sparse_writes();
         let write64_signals = s.clear_write64_signals();
         s.written_ranges.clear();
+        s.written_values.clear();
         let cpu_writes = std::mem::take(&mut s.cpu_writes);
         let pred_in_state = std::mem::replace(&mut s.pred_in_state, false);
         let pred_buf = s.pred_buf.as_ref().map(|r| r.as_raw() as usize);
@@ -4120,6 +4146,7 @@ pub unsafe extern "system" fn kickoff_x(this: *mut c_void) {
             s.pred_in_state = false;
             s.occlusion = Occlusion { active: None, ended_early };
             s.written_ranges.clear();
+            s.written_values.clear();
             s.clear_sparse_writes();
             s.clear_write64_signals();
             s.clear_waits();
@@ -4890,6 +4917,7 @@ unsafe fn reset_pc_inner(this: *mut c_void, alloc: usize, pso: usize) -> i32 {
         s.depth_bounds = None;
         s.occlusion = Occlusion::default();
         s.written_ranges.clear();
+        s.written_values.clear();
         s.clear_sparse_writes();
         s.clear_write64_signals();
         s.clear_waits();
@@ -6040,6 +6068,73 @@ mod tests {
         assert!(s.has_prior_write(0x0FFC, 8));
         assert!(!s.has_prior_write(0x1008, 4));
         assert!(!s.has_prior_write(0x0FF8, 8));
+    }
+
+    /// A wait on an address the same list wrote is dropped only when the value that write left
+    /// meets it: a list that resets a counter to 0 and then waits for another queue to raise it
+    /// keeps its wait.
+    #[test]
+    fn a_wait_after_an_own_write_is_dropped_only_when_the_written_value_meets_it() {
+        let cell64 = AtomicU64::new(0);
+        let cell32 = AtomicU32::new(0);
+        let (va64, va32) = (&cell64 as *const AtomicU64 as u64, &cell32 as *const AtomicU32 as u64);
+        let mut token = 0usize;
+        let list = (&mut token as *mut usize).cast::<c_void>();
+        // records the writes (as `write` does) and the wait, and returns the waits left on the list
+        let kept = |writes: &[(u64, &[u32])], wait: &dyn Fn()| -> usize {
+            for &(va, words) in writes {
+                note_write_value(list as usize, va, words);
+            }
+            wait();
+            let n = recording(list as usize).lock().unwrap().as_ref().and_then(|m| m.get(&(list as usize))).map_or(0, |s| s.pending_waits.len());
+            on_release(list as usize);
+            n
+        };
+        let w64 = |v: u64| [v as u32, (v >> 32) as u32];
+        use D3D12_COMPARISON_FUNC as F;
+        // (value written, comparison, value waited for, wait kept)
+        for (written, op, wanted, keep) in [
+            (0u64, D3D12_COMPARISON_FUNC_GREATER_EQUAL, 1u64, true),
+            (5, D3D12_COMPARISON_FUNC_GREATER_EQUAL, 1, false),
+            (0xFFFF_FFFF, D3D12_COMPARISON_FUNC_GREATER_EQUAL, 1 << 32, true),
+            (0, D3D12_COMPARISON_FUNC_EQUAL, 1, true),
+            (1, D3D12_COMPARISON_FUNC_EQUAL, 1, false),
+            (1, D3D12_COMPARISON_FUNC_NOT_EQUAL, 1, true),
+            (0, D3D12_COMPARISON_FUNC_NOT_EQUAL, 1, false),
+            (1, D3D12_COMPARISON_FUNC_LESS, 1, true),
+            (0, D3D12_COMPARISON_FUNC_LESS, 1, false),
+            (2, D3D12_COMPARISON_FUNC_LESS_EQUAL, 1, true),
+            (1, D3D12_COMPARISON_FUNC_LESS_EQUAL, 1, false),
+            (1, D3D12_COMPARISON_FUNC_GREATER, 1, true),
+            (2, D3D12_COMPARISON_FUNC_GREATER, 1, false),
+            (0, D3D12_COMPARISON_FUNC_ALWAYS, 1, false),
+            (0, D3D12_COMPARISON_FUNC_NEVER, 1, false),
+        ] {
+            let F(op) = op;
+            let got = kept(&[(va64, &w64(written))], &|| unsafe { wait64_x(list, va64, op as u32, wanted, 0, 0) });
+            assert_eq!(got, keep as usize, "64-bit: wrote {written:#x}, wait op {op} {wanted:#x}");
+            if wanted <= u32::MAX as u64 && written <= u32::MAX as u64 {
+                let got = kept(&[(va32, &[written as u32])], &|| unsafe { wait32_x(list, va32, op as u32, wanted as u32, u32::MAX, 0) });
+                assert_eq!(got, keep as usize, "32-bit: wrote {written:#x}, wait op {op} {wanted:#x}");
+            }
+        }
+        let ge = D3D12_COMPARISON_FUNC_GREATER_EQUAL.0 as u32;
+        let eq = D3D12_COMPARISON_FUNC_EQUAL.0 as u32;
+        // the mask applies to the written value too
+        assert_eq!(kept(&[(va32, &[0x1234_00FF])], &|| unsafe { wait32_x(list, va32, eq, 0xFF, 0xFF, 0) }), 0);
+        assert_eq!(kept(&[(va32, &[0x0000_12FE])], &|| unsafe { wait32_x(list, va32, eq, 0xFF, 0xFF, 0) }), 1);
+        // the last write before the wait counts
+        assert_eq!(kept(&[(va64, &w64(5)), (va64, &w64(0))], &|| unsafe { wait64_x(list, va64, ge, 1, 0, 0) }), 1);
+        assert_eq!(kept(&[(va64, &w64(0)), (va64, &w64(5))], &|| unsafe { wait64_x(list, va64, ge, 1, 0, 0) }), 0);
+        // a write to another address leaves the wait alone
+        assert_eq!(kept(&[(va32, &[5])], &|| unsafe { wait64_x(list, va64, ge, 1, 0, 0) }), 1);
+        // a write of unknown value over it (a fill or a copy) still drops the wait, as before
+        let fill = || {
+            note_write_value(list as usize, va64, &w64(0));
+            note_write(list as usize, va64, 8);
+            unsafe { wait64_x(list, va64, ge, 1, 0, 0) }
+        };
+        assert_eq!(kept(&[], &fill), 0);
     }
 
     #[test]
