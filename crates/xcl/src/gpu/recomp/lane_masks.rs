@@ -256,6 +256,8 @@ pub struct Block {
     pub preds: Vec<usize>,
     /// it ends in a branch on a lane mask: each lane takes it on its own bit
     pub lane_branch: bool,
+    /// WREXEC destination to reset along with SCC on a proven empty wave32 loop exit.
+    pub(super) empty_loop_wrexec: Option<u8>,
 }
 
 /// What the analysis found in a program.
@@ -819,13 +821,34 @@ impl<'a> Lanes<'a> {
         Ok((reach, st))
     }
 
-    fn analyze(mut self) -> R<Summary> {
+    /// WREXEC copied the final EXEC to its destination and set SCC to any(EXEC).
+    /// With this sole predecessor, the whole wave reaches b only once EXEC is empty.
+    fn empty_loop_wrexec(&self, b: usize) -> Option<u8> {
+        let &[(pred, _)] = self.preds[b].as_slice() else { return None };
+        if pred == b || self.succ[pred] != [(pred, Edge::Taken), (b, Edge::NotTaken)] {
+            return None;
+        }
+        let (start, end) = self.blocks[pred];
+        let [.., write, branch] = &self.insts[start..end] else { return None };
+        if branch.inst.name != "S_CBRANCH_EXECNZ" || !write.inst.name.ends_with("_WREXEC_B32") {
+            return None;
+        }
+        rdna2::field_value(write.enc, &write.words, "SDST").map(|r| r as u8)
+    }
+
+    fn analyze(mut self, repair_empty_exits: bool) -> R<Summary> {
         let n = self.blocks.len();
         let mut entry = State { regs: vec![None; 128], scc: None };
         entry.regs[EXEC] = Some(match self.launch {
             LaunchExec::All => TRUE,
             LaunchExec::Unknown => self.atom(Atom::Launch, 0)?,
         });
+        let mut empty_exits = vec![None; n];
+        if repair_empty_exits && !self.wave64 {
+            for &b in &self.order {
+                empty_exits[b] = self.empty_loop_wrexec(b);
+            }
+        }
         let mut forced = HashSet::new();
         let mut reach = vec![FALSE; n];
         let mut ins: Vec<Option<State>> = vec![None; n];
@@ -850,7 +873,13 @@ impl<'a> Lanes<'a> {
                     if !std::mem::take(&mut dirty[b]) {
                         continue;
                     }
-                    let (r, st) = if b == 0 { (TRUE, entry.clone()) } else { self.join(b, &outs, &forced, false)? };
+                    let (r, mut st) = if b == 0 { (TRUE, entry.clone()) } else { self.join(b, &outs, &forced, false)? };
+                    if let Some(dst) = empty_exits[b] {
+                        st.scc = Some((FALSE, SccKind::Uniform));
+                        if dst != 125 {
+                            st.regs[dst as usize] = Some(FALSE);
+                        }
+                    }
                     if ins[b].as_ref() == Some(&st) && reach[b] == r {
                         continue;
                     }
@@ -951,6 +980,7 @@ impl<'a> Lanes<'a> {
                 succ: self.succ[b].clone(),
                 preds: self.preds[b].iter().map(|p| p.0).collect(),
                 lane_branch: lane_branch[b],
+                empty_loop_wrexec: empty_exits[b],
             })
             .collect();
         sum.order = self.order.clone();
@@ -967,16 +997,17 @@ pub fn analyze(insts: &[Decoded], wave64: bool) -> R<Summary> {
 
 /// Analyses a decoded program (far jumps resolved) that starts with EXEC as `launch` says.
 pub fn analyze_launch(insts: &[Decoded], wave64: bool, launch: LaunchExec) -> R<Summary> {
-    analyze_branches(insts, wave64, launch, false)
+    // Without a lowering stage, rely only on facts that hold without exit repairs.
+    analyze_branches(insts, wave64, launch, false, false)
 }
 
-pub(super) fn analyze_branches(insts: &[Decoded], wave64: bool, launch: LaunchExec, wave_branches: bool) -> R<Summary> {
+pub(super) fn analyze_branches(insts: &[Decoded], wave64: bool, launch: LaunchExec, wave_branches: bool, repair_empty_exits: bool) -> R<Summary> {
     if insts.is_empty() {
         return Ok(Summary::default());
     }
     let mut lanes = Lanes::new(insts, wave64, launch)?;
     lanes.wave_branches = wave_branches;
-    lanes.analyze()
+    lanes.analyze(repair_empty_exits)
 }
 
 /// Decodes and analyses a program.

@@ -1177,22 +1177,6 @@ fn partial_blocks(sum: &Summary) -> Vec<bool> {
     partial
 }
 
-/// The WREXEC destination when wave32 block b can only be reached by exhausting a
-/// self-loop's EXEC. Both the mask it copied and SCC are then zero for the console
-/// wave, including lanes that left the loop on an earlier iteration.
-fn empty_loop_wrexec(sum: &Summary, insts: &[Decoded], b: usize) -> Option<u8> {
-    let [pred] = sum.blocks[b].preds[..] else { return None };
-    let block = &sum.blocks[pred];
-    if pred == b || block.succ != [(pred, Edge::Taken), (b, Edge::NotTaken)] {
-        return None;
-    }
-    let [.., write, branch] = &insts[block.insts.clone()] else { return None };
-    if branch.inst.name != "S_CBRANCH_EXECNZ" || !write.inst.name.ends_with("_WREXEC_B32") {
-        return None;
-    }
-    rdna2::field_value(write.enc, &write.words, "SDST").map(|r| r as u8)
-}
-
 /// Lowers a kernel-mode program (far jumps resolved) into `ir`, which gets it complete, with
 /// the mask registers whose value at the end may differ from the console's: written in a block
 /// some lanes skipped, so those lanes still hold their own older bits (`stale`). Nothing reads
@@ -1284,7 +1268,7 @@ fn lower_with<I: Ir>(insts: &[Decoded], stage: Stage, wave64: bool, mut ir: I, s
     // Ballots reconstruct every bit only when the entire console wave is present.
     let wave_branches = matches!(stage, Stage::Compute(cs) if cs.threads.iter().product::<u32>() % (if wave64 { 64 } else { 32 }) == 0)
         && ir.can_wave_branch();
-    let sum = lane_masks::analyze_branches(insts, wave64, launch, wave_branches).map_err(|e| e.to_string())?;
+    let sum = lane_masks::analyze_branches(insts, wave64, launch, wave_branches, !graphics).map_err(|e| e.to_string())?;
     let scc_live_after = if wave_branches {
         compute_scc_liveness(insts, &sum)
     } else {
@@ -1530,13 +1514,11 @@ fn lower_with<I: Ir>(insts: &[Decoded], stage: Stage, wave64: bool, mut ir: I, s
         if !sealed[ib] {
             sealed[ib] = seal_ready(&mut l, &done, ib);
         }
-        if !graphics && !wave64 {
-            if let Some(r) = empty_loop_wrexec(&sum, insts, b) {
-                let zero = l.ir.boolean(false);
-                l.write_scc(ib, zero);
-                if r != 125 {
-                    l.write_bit(ib, r, zero);
-                }
+        if let Some(r) = sum.blocks[b].empty_loop_wrexec {
+            let zero = l.ir.boolean(false);
+            l.write_scc(ib, zero);
+            if r != 125 {
+                l.write_bit(ib, r, zero);
             }
         }
         if b == 0 && !pixel {
@@ -3699,6 +3681,22 @@ pub(crate) mod tests {
         lines.insert(6, ("V_ADD_NC_U32", "ENC_VOP2", &[("VDST", 3), ("SRC0", 4), ("VSRC1", 1)]));
         let err = lower_kernel(&decode(&lines), false, Interp::default()).err().expect("refused");
         assert!(err.contains("some lanes were elsewhere"), "{err}");
+    }
+
+    #[test]
+    fn empty_wrexec_loop_repairs_the_mask_and_scc_only_on_exhaustion() {
+        let (s, v) = state(32);
+        let (s, v) = run(EMPTY_LOOP_SCC, false, &s, &v);
+        assert_eq!(s[4], 0);
+        assert!(v.iter().all(|regs| regs[2] == 11));
+
+        // Falling through EXECZ instead means at least one bit is still set.
+        let mut lines = EMPTY_LOOP_SCC.to_vec();
+        lines[6] = ("S_CBRANCH_EXECZ", "ENC_SOPP", &[("SIMM16", 0xFFFB)]);
+        let insts = decode(&lines);
+        let sum = lane_masks::analyze_branches(&insts, false, lane_masks::LaunchExec::All, false, true).unwrap();
+        assert!(sum.blocks.iter().all(|b| b.empty_loop_wrexec.is_none()));
+        assert!(lower_kernel(&insts, false, Interp::default()).is_err());
     }
 
     #[test]
