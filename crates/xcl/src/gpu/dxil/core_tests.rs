@@ -847,7 +847,10 @@ fn outlined_scalar_loads_validate() {
         let blob = super::kernel::translate_outline_fixture(&scalar_load_fixture(), opts, true).unwrap();
         super::validate::validate(&blob).unwrap();
         let ir = super::validate::disassemble(&blob).unwrap();
-        assert!(ir.contains("define internal") && ir.contains("@xcl_buffer_load_4"));
+        for name in ["@xcl_buffer_load_4(", "@xcl_scalar_load_2("] {
+            let definition = ir.lines().find(|l| l.starts_with("define internal") && l.contains(name)).expect("wide load helper");
+            assert!(definition.contains("[16 x i32]* noalias"), "{definition}");
+        }
     }
 }
 

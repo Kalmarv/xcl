@@ -1241,7 +1241,8 @@ impl Lw {
             let word = self.s.m.i32();
             let params: Vec<_> = args.iter().map(|&a| self.s.m.type_of(a)).collect();
             let signature = self.s.m.func_ty(word, &params);
-            let f = self.s.m.declare(&name, signature, FnAttrs::NoInline);
+            let attrs = if slot.is_some() { FnAttrs::NoInlineScalarLoadOut } else { FnAttrs::NoInline };
+            let f = self.s.m.declare(&name, signature, attrs);
             let body = self.s.m.declarations();
             let caller = std::mem::replace(&mut self.s.m, body);
             let ssa = std::mem::replace(&mut self.ssa, Ssa::new(word));

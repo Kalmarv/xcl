@@ -82,6 +82,8 @@ pub enum FnAttrs {
     /// `noduplicate nounwind` (barriers)
     NoDuplicate,
     NoInline,
+    /// A wide scalar load takes six words and a private, non-aliasing output pointer.
+    NoInlineScalarLoadOut,
 }
 
 impl FnAttrs {
@@ -89,6 +91,7 @@ impl FnAttrs {
     fn index(self) -> u64 {
         match self {
             FnAttrs::NoInline => 5,
+            FnAttrs::NoInlineScalarLoadOut => 6,
             FnAttrs::None => 0,
             FnAttrs::ReadNone => 1,
             FnAttrs::ReadOnly => 2,
@@ -976,14 +979,22 @@ impl Module {
         w.record(PARAMATTR_GRP_CODE_ENTRY, &[2, FN, 0, ATTR_NOUNWIND, 0, ATTR_READONLY]);
         w.record(PARAMATTR_GRP_CODE_ENTRY, &[3, FN, 0, ATTR_NOUNWIND]);
         w.record(PARAMATTR_GRP_CODE_ENTRY, &[4, FN, 0, ATTR_NODUPLICATE, 0, ATTR_NOUNWIND]);
+        let scalar_out = self.funcs.iter().zip(&fused).any(|(f, used)| *used && f.attrs == FnAttrs::NoInlineScalarLoadOut);
         let groups = if self.helpers.is_empty() { 4 } else {
-            w.record(PARAMATTR_GRP_CODE_ENTRY, &[5, FN, 0, 14, 0, ATTR_NOUNWIND]);
+            w.record(PARAMATTR_GRP_CODE_ENTRY, &[5, FN, 0, ATTR_NOINLINE, 0, ATTR_NOUNWIND]);
             5
         };
+        if scalar_out {
+            // LLVM attribute index 0 is the return value, 1 is the first parameter.
+            w.record(PARAMATTR_GRP_CODE_ENTRY, &[6, 7, 0, ATTR_NOALIAS]);
+        }
         w.end_block();
         w.enter_block(BLOCK_PARAMATTR);
         for g in 1..=groups {
             w.record(PARAMATTR_CODE_ENTRY, &[g]);
+        }
+        if scalar_out {
+            w.record(PARAMATTR_CODE_ENTRY, &[6, 5]);
         }
         w.end_block();
 
@@ -1391,7 +1402,9 @@ const MODULE_CODE_FUNCTION: u32 = 8;
 
 const PARAMATTR_CODE_ENTRY: u32 = 2;
 const PARAMATTR_GRP_CODE_ENTRY: u32 = 3;
+const ATTR_NOALIAS: u64 = 9;
 const ATTR_NODUPLICATE: u64 = 12;
+const ATTR_NOINLINE: u64 = 14;
 const ATTR_NOUNWIND: u64 = 18;
 const ATTR_READNONE: u64 = 20;
 const ATTR_READONLY: u64 = 21;
