@@ -243,6 +243,8 @@ pub struct Lw {
     pub has_f64_round_op: bool,
     /// the T# SGPRs of the program's image stores and atomics (`recomp::emit::image_write_srsrcs`)
     pub img_writes: Vec<u64>,
+    /// program writes/atomics global or image UAVs or uses `GLC=1`: `s_barrier` emits `ALL_SYNC`
+    pub barrier_uav_fence: bool,
     /// static samplers bound so far: (S#, comparison, handle) at `s<i>, space1`
     pub static_used: Vec<([u32; 4], bool, super::ops::Sampler)>,
     pub sampler_base: u32,
@@ -1072,7 +1074,12 @@ impl Lw {
                     }
                     return err(d, "s_barrier in a group of several hardware waves");
                 }
-                self.s.barrier(super::ops::barrier::GROUP_SYNC);
+                let mode = if self.barrier_uav_fence {
+                    super::ops::barrier::ALL_SYNC
+                } else {
+                    super::ops::barrier::GROUP_SYNC
+                };
+                self.s.barrier(mode);
                 // (split form: both halves made their LDS writes before it)
                 self.lds_met();
                 Ok(())
