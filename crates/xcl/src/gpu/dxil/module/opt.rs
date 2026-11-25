@@ -68,6 +68,12 @@ impl Op {
     }
 }
 
+#[cfg(test)]
+thread_local! {
+    /// Tests: leave out `fold_guarded_selects` on this thread (the form to compare against).
+    pub(crate) static NO_SELECT_FOLD: std::cell::Cell<bool> = const { std::cell::Cell::new(false) };
+}
+
 /// How an instruction may be merged with an identical one.
 #[derive(PartialEq)]
 enum Cse {
@@ -580,7 +586,7 @@ impl Module {
     /// Cleans up the entry function (see the module docs of `opt`). Values
     /// keep their identities; replaced ones simply lose their uses.
     ///
-    /// `XCL_DXIL_NO_OPT=phi,fold,cse,dce,merge` (any subset, or `all`) skips passes, for bisecting.
+    /// `XCL_DXIL_NO_OPT=phi,fold,cse,select,dce,merge` (any subset, or `all`) skips passes, for bisecting.
     pub fn optimize(&mut self) {
         let off = std::env::var("XCL_DXIL_NO_OPT").unwrap_or_default();
         let skip = |p: &str| off.split(',').any(|x| x.trim() == p || x.trim() == "all");
@@ -807,6 +813,14 @@ impl Module {
             }
         }
 
+        #[cfg(test)]
+        let skip_fold = NO_SELECT_FOLD.with(|c| c.get());
+        #[cfg(not(test))]
+        let skip_fold = false;
+        if !skip("select") && !skip_fold {
+            self.fold_guarded_selects(&order, &repl);
+        }
+
         // dead instructions: live = side effects, terminators and their operands, transitively
         let (_, f64t) = self.existing_i64_f64();
         let wide: Vec<Ty> = f64t.into_iter().collect();
@@ -906,6 +920,119 @@ impl Module {
                 }
             }
             debug_assert!(self.uses_well_formed(&order));
+        }
+    }
+
+    /// A lane's result depends only on that lane's operands, and no operand value is undefined
+    /// behaviour (no memory, wave ops, derivatives, integer division).
+    fn lane_local(&self, op: &Op, ty: Ty) -> bool {
+        match op {
+            Op::Bin(BinOp::UDiv | BinOp::URem, ..) => false,
+            Op::Bin(BinOp::SDiv | BinOp::SRem, ..) => self.is_float(ty),
+            Op::Bin(..) | Op::Cast(..) | Op::Cmp(..) | Op::Select(..) | Op::Extract(..) => true,
+            Op::Call(f, args) => {
+                let d = &self.funcs[*f as usize];
+                // unary .. dot4, make / split double, bitcasts and legacy conversions
+                d.attrs == FnAttrs::ReadNone
+                    && d.name.starts_with("dx.op.")
+                    && args.first().and_then(|&a| self.const_u64(a)).is_some_and(|id| matches!(id, 6..=56 | 101 | 102 | 124..=132))
+            }
+            _ => false,
+        }
+    }
+
+    /// Selects whose other arm no lane can observe. The translator writes a VGPR under EXEC as
+    /// `select(exec, new, old)`; a following lane-local instruction under the same EXEC reads
+    /// that select, and its own result is again selected by EXEC. Where a value is only observed
+    /// in lanes where `c` holds, an operand `select(c, x, y)` can be `x`; the false arm of
+    /// `select(c, a, select(c, x, y))` can be `y`, the true arm of `select(c, select(c, x, y), b)`
+    /// `x`. No instruction's value changes in a lane that observes it. Phis, memory, wave ops and
+    /// everything not `lane_local` observe all lanes. The selects left without uses go in DCE.
+    fn fold_guarded_selects(&mut self, order: &[u32], repl: &[Option<Value>]) {
+        #[derive(Clone, Copy, PartialEq)]
+        enum Seen {
+            Unused,
+            Where(Value),
+            All,
+        }
+        fn meet(s: &mut Seen, by: Seen) {
+            *s = match (*s, by) {
+                (x, Seen::Unused) => x,
+                (Seen::Unused, y) => y,
+                (Seen::Where(a), Seen::Where(b)) if a == b => Seen::Where(a),
+                _ => Seen::All,
+            }
+        }
+        let live = |i: u32| repl[i as usize].is_none();
+        let mut seen = vec![Seen::Unused; self.insts.len()];
+        // phis may come before a use's definition (back edges)
+        for &b in order {
+            for &i in &self.blocks[b as usize] {
+                if let (true, Op::Phi(inc)) = (live(i), &self.insts[i as usize].op) {
+                    for &(v, _) in inc {
+                        if let Value::Inst(j) = v {
+                            seen[j as usize] = Seen::All;
+                        }
+                    }
+                }
+            }
+        }
+        // every other use follows its definition: users first
+        for &b in order.iter().rev() {
+            for &i in self.blocks[b as usize].iter().rev() {
+                if !live(i) {
+                    continue;
+                }
+                let (op, ty) = (&self.insts[i as usize].op, self.insts[i as usize].ty);
+                if matches!(op, Op::Phi(_)) {
+                    continue;
+                }
+                let me = if self.lane_local(op, ty) { seen[i as usize] } else { Seen::All };
+                if me == Seen::Unused {
+                    continue;
+                }
+                let mut by = |v: Value, s: Seen| {
+                    if let Value::Inst(j) = v {
+                        meet(&mut seen[j as usize], s);
+                    }
+                };
+                match *op {
+                    Op::Select(c, a, b) => {
+                        by(c, me);
+                        by(a, Seen::Where(c));
+                        by(b, me);
+                    }
+                    _ => op.for_each_operand(|v| by(v, me)),
+                }
+            }
+        }
+        for &b in order {
+            for k in 0..self.blocks[b as usize].len() {
+                let i = self.blocks[b as usize][k];
+                let (op, ty) = (&self.insts[i as usize].op, self.insts[i as usize].ty);
+                if !live(i) || seen[i as usize] == Seen::Unused || !self.lane_local(op, ty) {
+                    continue;
+                }
+                let me = seen[i as usize];
+                let cu = if let Op::Select(c, ..) = *op { Some(c) } else { None };
+                let mut op = op.clone();
+                let mut pos = 0;
+                op.map_operands(|mut v| {
+                    let at = pos;
+                    pos += 1;
+                    while let Value::Inst(j) = v {
+                        let Op::Select(c, x, y) = self.insts[j as usize].op else { break };
+                        v = match (cu, at) {
+                            (Some(cu), 1) if cu == c => x,
+                            (Some(cu), 2) if cu == c => y,
+                            _ if me == Seen::Where(c) => x,
+                            _ => break,
+                        };
+                    }
+                    v
+                });
+                self.insts[i as usize].op = op;
+            }
         }
     }
 
@@ -1600,6 +1727,49 @@ mod tests {
         assert_eq!(m.const_u64(args[10]), Some(u32::MAX as u64), "or(or(x, 0xFFFF), 0xFFFF0000) -> ~0");
         assert_eq!(args[11], z, "and(zext(i1), 0xFF) -> zext(i1)");
         assert_eq!(m.const_u64(args[12]), Some(0), "and(zext(i1), 0xFFFF0000) -> 0");
+        let order: Vec<u32> = m.block_layout().0.into_iter().map(|b| b as u32).collect();
+        assert!(m.uses_well_formed(&order));
+    }
+
+    #[test]
+    fn guarded_selects_fold_where_no_lane_sees_the_other_arm() {
+        let mut m = Module::new();
+        m.define_entry("main");
+        let entry = m.entry_block();
+        m.set_block(entry);
+
+        let void = m.void();
+        let i32t = m.i32();
+        let src_ty = m.func_ty(i32t, &[]);
+        let src = m.declare("dx.op.waveGetLaneIndex", src_ty, FnAttrs::ReadNone);
+        let sink_ty = m.func_ty(void, &[i32t]);
+        let sink = m.declare("dx.op.storeOutput.i32", sink_ty, FnAttrs::NoUnwind);
+
+        let x = m.call(src, &[]);
+        let (c1, c3, c5, k) = (m.i32c(1), m.i32c(3), m.i32c(5), m.i32c(0xA5A5_5A5A));
+        let exec = m.cmp(Pred::ULt, x, c5);
+        let old = m.bin(BinOp::Xor, x, k);
+        // v = exec ? x + 1 : old; v = exec ? v * 3 : v
+        let a = m.bin(BinOp::Add, x, c1);
+        let s1 = m.select(exec, a, old);
+        let p = m.bin(BinOp::Mul, s1, c3);
+        let s2 = m.select(exec, p, s1);
+        // read where every lane counts: stays
+        let s3 = m.select(exec, a, x);
+        let q = m.bin(BinOp::Sub, s3, c1);
+        m.call(sink, &[s2]);
+        m.call(sink, &[q]);
+        m.ret();
+        m.optimize();
+
+        let Value::Inst(s2i) = s2 else { panic!() };
+        let Value::Inst(pi) = p else { panic!() };
+        assert!(matches!(m.insts[s2i as usize].op, Op::Select(c, t, f) if c == exec && t == p && f == old), "s2 = select(exec, p, old)");
+        assert!(matches!(m.insts[pi as usize].op, Op::Bin(BinOp::Mul, v, w, 0) if (v, w) == (a, c3) || (v, w) == (c3, a)), "p = a * 3");
+        let body = &m.blocks[entry.0 as usize];
+        let has = |v: Value| matches!(v, Value::Inst(i) if body.contains(&i));
+        assert!(!has(s1), "s1 has no uses left");
+        assert!(has(s3), "s3 is read in every lane");
         let order: Vec<u32> = m.block_layout().0.into_iter().map(|b| b as u32).collect();
         assert!(m.uses_well_formed(&order));
     }
