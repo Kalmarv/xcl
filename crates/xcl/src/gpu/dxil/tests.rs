@@ -64,6 +64,38 @@ fn expected(io: &[u32], wave: usize) -> Vec<u32> {
 }
 
 #[test]
+fn internal_scalar_helpers_validate_and_unused_definitions_drop() {
+    let mut shader = Shader::new(Stage::Compute, (6, 6));
+    let dst = shader.raw_uav(0, 0);
+    let lane = shader.thread_id_in_group(0);
+    let m = &mut shader.m;
+    let u = m.i32();
+    let unused = m.begin_scalar_helper("unused_helper", &[u], u);
+    let input = unused.args[0];
+    m.end_scalar_helper(unused, input);
+    let inc = m.begin_scalar_helper("increment", &[u], u);
+    let one = m.i32c(1);
+    let value = m.bin(BinOp::Add, inc.args[0], one);
+    let f = inc.function;
+    m.end_scalar_helper(inc, value);
+    let nested = m.begin_scalar_helper("twice", &[u], u);
+    let x = m.call(f, &[nested.args[0]]);
+    let y = m.call(f, &[x]);
+    let twice = nested.function;
+    m.end_scalar_helper(nested, y);
+    let result = m.call(twice, &[lane]);
+    let two = m.i32c(2);
+    let addr = m.bin(BinOp::Shl, lane, two);
+    shader.raw_store(dst, addr, &[result]);
+    let blob = shader.finish([32, 1, 1], Some(32));
+    validate::validate(&blob).unwrap();
+    let ir = validate::disassemble(&blob).unwrap();
+    assert!(ir.contains("define internal i32 @increment("));
+    assert!(ir.contains("define internal i32 @twice("));
+    assert!(!ir.contains("@unused_helper"));
+}
+
+#[test]
 fn emitted_kernel_passes_the_sdk_validator() {
     let c = sample_kernel(64);
     if let Err(e) = validate::validate(&c) {

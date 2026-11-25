@@ -46,6 +46,8 @@ pub enum Value {
     Func(u32),
     Const(u32),
     Inst(u32),
+    /// A scalar helper parameter (owner, zero-based index, type).
+    Param(u32, u32, Ty),
 }
 
 #[derive(Debug, Clone, PartialEq, Eq, Hash)]
@@ -57,6 +59,21 @@ enum ConstDef {
     Undef(Ty),
     Null(Ty),
     Aggregate(Ty, Vec<Value>),
+}
+
+/// Insertion state for a straight-line scalar helper definition.
+pub struct ScalarHelper {
+    pub function: u32,
+    pub args: Vec<Value>,
+    previous: Block,
+    previous_insert: bool,
+    body: Block,
+}
+
+struct HelperBody {
+    insts: Vec<u32>,
+    result: Value,
+    arity: usize,
 }
 
 struct FuncDecl {
@@ -246,6 +263,7 @@ pub struct Module {
     consts: Vec<ConstDef>,
     const_ids: HashMap<ConstDef, u32>,
     funcs: Vec<FuncDecl>,
+    helpers: HashMap<u32, HelperBody>,
     func_ids: HashMap<String, u32>,
     globals: Vec<GlobalDef>,
     insts: Vec<InstDef>,
@@ -274,6 +292,7 @@ impl Module {
             consts: Vec::new(),
             const_ids: HashMap::new(),
             funcs: Vec::new(),
+            helpers: HashMap::new(),
             func_ids: HashMap::new(),
             globals: Vec::new(),
             insts: Vec::new(),
@@ -484,6 +503,48 @@ impl Module {
         f
     }
 
+    /// Define a pure, straight-line scalar function using the normal instruction builder.
+    /// Only its parameters, module constants and local intermediates may feed its result.
+    pub fn begin_scalar_helper(&mut self, name: &str, params: &[Ty], result: Ty) -> ScalarHelper {
+        let ty = self.func_ty(result, params);
+        let function = self.declare(name, ty, FnAttrs::ReadNone);
+        if self.funcs[function as usize].defined || self.helpers.contains_key(&function) {
+            self.fail(format!("duplicate definition of {name}"));
+        }
+        let previous = self.current_block();
+        let previous_insert = self.set_insert_before_term(false);
+        let body = self.new_block();
+        self.set_block(body);
+        let args = params.iter().enumerate().map(|(i, &t)| Value::Param(function, i as u32, t)).collect();
+        ScalarHelper { function, args, previous, previous_insert, body }
+    }
+
+    /// Return a scalar from the helper and restore the caller's insertion point.
+    pub fn end_scalar_helper(&mut self, helper: ScalarHelper, result: Value) {
+        let function_type = self.funcs[helper.function as usize].ty;
+        let result_type = self.type_of(result);
+        if self.current_block() != helper.body || !matches!(self.types[function_type.0 as usize], TypeDef::Func(t, _) if t == result_type) {
+            self.fail("invalid scalar helper result or control flow".to_string());
+        }
+        let insts = std::mem::take(&mut self.blocks[helper.body.0 as usize]);
+        let local = |v: Value| match v {
+            Value::Param(owner, _, _) => owner == helper.function,
+            Value::Inst(i) => self.def_block[i as usize] == helper.body,
+            Value::Const(_) => true,
+            _ => false,
+        };
+        if !local(result) || insts.iter().any(|&i| {
+            let mut valid = true;
+            self.insts[i as usize].op.for_each_operand(|v| valid &= local(v));
+            !valid
+        }) {
+            self.fail("scalar helper captures a nonlocal operand".to_string());
+        }
+        self.helpers.insert(helper.function, HelperBody { insts, result, arity: helper.args.len() });
+        self.set_block(helper.previous);
+        self.set_insert_before_term(helper.previous_insert);
+    }
+
     pub fn func_value(&self, f: u32) -> Value {
         Value::Func(f)
     }
@@ -507,6 +568,7 @@ impl Module {
                 ConstDef::Int(t, _) | ConstDef::Float(t, _) | ConstDef::Undef(t) | ConstDef::Null(t) | ConstDef::Aggregate(t, _) => *t,
             },
             Value::Inst(i) => self.insts[i as usize].ty,
+            Value::Param(_, _, t) => t,
         }
     }
 
@@ -845,6 +907,18 @@ impl Module {
                 }
             }
         }
+        // Include declarations used only inside a reachable helper.
+        let mut visited = vec![false; self.funcs.len()];
+        let mut pending: Vec<_> = self.helpers.keys().copied().filter(|&f| fused[f as usize]).collect();
+        while let Some(f) = pending.pop() {
+            if std::mem::replace(&mut visited[f as usize], true) { continue; }
+            for &i in &self.helpers[&f].insts {
+                if let Op::Call(callee, _) = self.insts[i as usize].op {
+                    fused[callee as usize] = true;
+                    if self.helpers.contains_key(&callee) { pending.push(callee); }
+                }
+            }
+        }
         let mut gmap: Vec<Option<u64>> = vec![None; self.globals.len()];
         let mut n_globals = 0u64;
         for (g, used) in gused.iter().enumerate() {
@@ -880,11 +954,22 @@ impl Module {
                 }
             }
         }
+        for (&f, helper) in &self.helpers {
+            if !fused[f as usize] { continue; }
+            let mut next = inst_base + helper.arity as u64;
+            for &i in &helper.insts {
+                if !self.is_void(self.insts[i as usize].ty) {
+                    inst_ids[i as usize] = Some(next);
+                    next += 1;
+                }
+            }
+        }
         let abs = |v: Value| -> u64 {
             match v {
                 Value::Global(g) => gmap[g as usize].expect("use of a dropped global"),
                 Value::Func(f) => n_globals + fmap[f as usize].expect("use of a dropped function"),
                 Value::Const(c) => const_base + c as u64,
+                Value::Param(_, index, _) => inst_base + index as u64,
                 Value::Inst(i) => inst_ids[i as usize].unwrap_or_else(|| {
                     self.fail(format!("use of a void instruction %{i}"));
                     0
@@ -907,9 +992,13 @@ impl Module {
         w.record(PARAMATTR_GRP_CODE_ENTRY, &[2, FN, 0, ATTR_NOUNWIND, 0, ATTR_READONLY]);
         w.record(PARAMATTR_GRP_CODE_ENTRY, &[3, FN, 0, ATTR_NOUNWIND]);
         w.record(PARAMATTR_GRP_CODE_ENTRY, &[4, FN, 0, ATTR_NODUPLICATE, 0, ATTR_NOUNWIND]);
+        let has_helpers = visited.iter().any(|&used| used);
+        if has_helpers {
+            w.record(PARAMATTR_GRP_CODE_ENTRY, &[5, FN, 0, ATTR_NOINLINE, 0, ATTR_NOUNWIND, 0, ATTR_READNONE]);
+        }
         w.end_block();
         w.enter_block(BLOCK_PARAMATTR);
-        for g in 1..=4 {
+        for g in 1..=if has_helpers { 5 } else { 4 } {
             w.record(PARAMATTR_CODE_ENTRY, &[g]);
         }
         w.end_block();
@@ -929,12 +1018,13 @@ impl Module {
                 &[g.ty.0 as u64, ((g.addrspace as u64) << 2) | 2 | g.constant as u64, init, linkage, align, 0, 0, 0, 0, 0, 0, 0],
             );
         }
-        for f in self.funcs.iter().enumerate().filter(|(i, _)| fused[*i]).map(|x| x.1) {
+        for (i, f) in self.funcs.iter().enumerate().filter(|(i, _)| fused[*i]) {
+            let helper = self.helpers.contains_key(&(i as u32));
             // [type, cc, isproto, linkage, paramattr, align, section, visibility,
             //  gc, unnamed_addr, prologue, dllstorage, comdat, prefix, personality]
             w.record(
                 MODULE_CODE_FUNCTION,
-                &[f.ty.0 as u64, 0, (!f.defined) as u64, LINKAGE_EXTERNAL, f.attrs.index(), 0, 0, 0, 0, 0, 0, 0, 0, 0, 0],
+                &[f.ty.0 as u64, 0, (!f.defined && !helper) as u64, if helper { LINKAGE_INTERNAL } else { LINKAGE_EXTERNAL }, if helper { 5 } else { f.attrs.index() }, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0],
             );
         }
 
@@ -999,20 +1089,35 @@ impl Module {
         }
         w.end_block();
 
-        // The entry's body.
-        w.enter_block(BLOCK_FUNCTION);
-        w.record(FUNC_CODE_DECLAREBLOCKS, &[order.len() as u64]);
-        let mut inst_id = inst_base;
-        for &b in &order {
-            for k in 0..self.blocks[b].len() {
-                let i = self.blocks[b][k] as usize;
-                self.write_inst(&mut w, i, inst_id, &abs, &pos);
-                if !self.is_void(self.insts[i].ty) {
-                    inst_id += 1;
+        // LLVM pairs bodies with non-prototype declarations in declaration order.
+        for (f, decl) in self.funcs.iter().enumerate() {
+            if !fused[f] { continue; }
+            if let Some(helper) = self.helpers.get(&(f as u32)) {
+                w.enter_block(BLOCK_FUNCTION);
+                w.record(FUNC_CODE_DECLAREBLOCKS, &[1]);
+                let mut next = inst_base + helper.arity as u64;
+                for &i in &helper.insts {
+                    self.write_inst(&mut w, i as usize, next, &abs, &[]);
+                    if !self.is_void(self.insts[i as usize].ty) { next += 1; }
                 }
+                w.record(FUNC_CODE_INST_RET, &[next - abs(helper.result)]);
+                w.end_block();
+            } else if decl.defined {
+                w.enter_block(BLOCK_FUNCTION);
+                w.record(FUNC_CODE_DECLAREBLOCKS, &[order.len() as u64]);
+                let mut inst_id = inst_base;
+                for &b in &order {
+                    for k in 0..self.blocks[b].len() {
+                        let i = self.blocks[b][k] as usize;
+                        self.write_inst(&mut w, i, inst_id, &abs, &pos);
+                        if !self.is_void(self.insts[i].ty) {
+                            inst_id += 1;
+                        }
+                    }
+                }
+                w.end_block();
             }
         }
-        w.end_block();
 
         w.end_block(); // module
         w.finish()
@@ -1254,6 +1359,7 @@ impl Module {
                 ConstDef::Int(t, _) | ConstDef::Float(t, _) | ConstDef::Undef(t) | ConstDef::Null(t) | ConstDef::Aggregate(t, _) => *t,
             },
             Value::Inst(i) => self.insts[i as usize].ty,
+            Value::Param(_, _, t) => t,
         }
     }
 }
@@ -1277,6 +1383,7 @@ const MODULE_CODE_FUNCTION: u32 = 8;
 const PARAMATTR_CODE_ENTRY: u32 = 2;
 const PARAMATTR_GRP_CODE_ENTRY: u32 = 3;
 const ATTR_NODUPLICATE: u64 = 12;
+const ATTR_NOINLINE: u64 = 14;
 const ATTR_NOUNWIND: u64 = 18;
 const ATTR_READNONE: u64 = 20;
 const ATTR_READONLY: u64 = 21;
