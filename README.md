@@ -256,8 +256,12 @@ xcl rpf D:\data\shaders.rpf --extract NAME --out folder
   four builds at once and 656 s at seven, so the default stops at four. Pipelines of 4 MiB or more
   use a separate one-wide lane so
   they cannot occupy the ordinary huge-pipeline slot; one of them can therefore run next to the
-  ordinary ones, and each gated compile checks for at least 3 GiB of free commit. Smaller pipelines
-  and those a game thread waits for never wait. `xcl.log` shows each huge one as a numbered
+  ordinary ones. A background compile starts only when its commit headroom (3 GiB, or 512 times
+  its DXIL above 6 MiB) is free on top of what the huge compiles already running reserved, and it
+  reserves that headroom until it finishes. One that a game thread waits for skips the commit
+  check (it still reserves), and up to `XCL_HUGE_PSO_WANTED_CONCURRENCY` of the lane's compiles
+  run at once then (default: the concurrency above, at least 2). Smaller pipelines and those
+  built on a game thread never wait. `xcl.log` shows each huge one as a numbered
   `driver compile start #K` / `driver compile finish #K: … PSO, N B DXIL, M ms` pair (compute
   ones with `record HASH`, the console record's hash that `--measure-pso` and
   `--export-hlsl --record-hash` take), with whether it was gated and how long it waited;
