@@ -315,9 +315,14 @@ pub(super) unsafe extern "system" fn execute_indirect(this: *mut c_void, sig: us
     match bind_abi(this, list, pso, gfx) {
         Ok(()) => {
             if compute {
+                use super::real::dispatch_chain::Whole;
                 match super::real::dispatch_chain::whole(pso) {
-                    Ok(Some(whole)) => list.SetPipelineState(&whole),
-                    Ok(None) => {}
+                    Ok(Whole::Built(whole)) => list.SetPipelineState(&whole),
+                    Ok(Whole::NotSplit) => {}
+                    Ok(Whole::Building) => {
+                        count(DISPATCHES_SKIPPED);
+                        return;
+                    }
                     Err(e) => {
                         crate::xlog_warn!("D3D12.X: ExecuteIndirect whole compute PSO: {e}");
                         count(DISPATCHES_SKIPPED);
@@ -860,7 +865,9 @@ pub(super) unsafe extern "system" fn dispatch(this: *mut c_void, x: u32, y: u32,
         return;
     }
     match translated_dispatch(this, list, pso, x, y, z) {
-        Ok(()) => count(DISPATCHES),
+        Ok(true) => count(DISPATCHES),
+        // the whole form of a split program, still being built (`dispatch_chain::dispatch`)
+        Ok(false) => count(DISPATCHES_SKIPPED),
         Err(e) => {
             count(DISPATCHES_SKIPPED);
             static N: std::sync::atomic::AtomicU32 = std::sync::atomic::AtomicU32::new(0);
@@ -976,7 +983,7 @@ pub(super) unsafe extern "system" fn allocate_upload_memory(this: *mut c_void, s
     }
 }
 
-unsafe fn translated_dispatch(this: *mut c_void, list: &ID3D12GraphicsCommandList, pso: usize, x: u32, y: u32, z: u32) -> Result<(), String> {
+unsafe fn translated_dispatch(this: *mut c_void, list: &ID3D12GraphicsCommandList, pso: usize, x: u32, y: u32, z: u32) -> Result<bool, String> {
     if super::present::trace_frame() {
         trace_fullscreen(this, pso, [x, y, z]);
     }

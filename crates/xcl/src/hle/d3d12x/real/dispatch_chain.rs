@@ -1,12 +1,16 @@
 //! PSOs for a split compute entry. The first piece is the real PSO returned
 //! to the caller. Other pieces and the lazily built whole form belong to it.
 use super::*;
+use super::super::pso_async;
 use crate::gpu::{dxil::kernel::DispatchChain, recomp::pso};
 use std::sync::{Arc, LazyLock, OnceLock};
 
 static PROGRAMS: AtomicU64 = AtomicU64::new(0);
 static PIECES: AtomicU64 = AtomicU64::new(0);
 static DISPATCHES: AtomicU64 = AtomicU64::new(0);
+static WHOLES_ASKED: AtomicU64 = AtomicU64::new(0);
+static WHOLES_BUILT: AtomicU64 = AtomicU64::new(0);
+static WHOLE_SKIPS: AtomicU64 = AtomicU64::new(0);
 /// slabs dispatched (`pso::dispatch_slabs`)
 static SLABS: AtomicU64 = AtomicU64::new(0);
 /// scratch alive now, the most there was, and the most a dispatch would have needed at once (bytes)
@@ -16,9 +20,10 @@ static WANTED: AtomicU64 = AtomicU64::new(0);
 
 pub(crate) fn log_counts() {
     let mib = |a: &AtomicU64| a.load(Ordering::Relaxed) >> 20;
-    crate::xlog_info!("compute split: {} programs split, {} pieces built, {} chained dispatches issued in {} slabs; scratch {} MiB (most {}, largest dispatch {} in one slab)",
+    crate::xlog_info!("compute split: {} programs split, {} pieces built, {} chained dispatches issued in {} slabs; scratch {} MiB (most {}, largest dispatch {} in one slab); whole form: {} asked for, {} built, {} dispatches skipped while it was being built",
         PROGRAMS.load(Ordering::Relaxed), PIECES.load(Ordering::Relaxed), DISPATCHES.load(Ordering::Relaxed), SLABS.load(Ordering::Relaxed),
-        mib(&LIVE), mib(&PEAK), mib(&WANTED));
+        mib(&LIVE), mib(&PEAK), mib(&WANTED),
+        WHOLES_ASKED.load(Ordering::Relaxed), WHOLES_BUILT.load(Ordering::Relaxed), WHOLE_SKIPS.load(Ordering::Relaxed));
 }
 
 /// The scratch a dispatch uses at once, `XCL_SPLIT_SCRATCH_MB` (256): more groups than fit run in
@@ -48,31 +53,70 @@ impl PipelineBuilder {
     }
 }
 
+/// The whole program's pipeline, for what the pieces cannot run (`Chain::whole`).
+pub(in crate::hle::d3d12x) enum Whole {
+    /// not a split program: its own pipeline runs it
+    NotSplit,
+    Built(ID3D12PipelineState),
+    /// still being built and not waited for (`XCL_PSO_WAIT_MS`): the dispatch is skipped, as
+    /// one of an unsplit pipeline still being built
+    Building,
+}
+
 struct Chain {
     builder: Arc<PipelineBuilder>,
     tail: Vec<ID3D12PipelineState>,
     words: u32,
-    whole_code: Vec<u8>,
-    whole: OnceLock<ID3D12PipelineState>,
-    build_whole: Mutex<()>,
+    /// the whole form was asked for (`WHOLES_ASKED`)
+    asked: std::sync::atomic::AtomicBool,
 }
 
 impl Chain {
-    unsafe fn whole(&self) -> Result<ID3D12PipelineState, String> {
-        if let Some(p) = self.whole.get() { return Ok(p.clone()); }
-        let _guard = self.build_whole.lock().unwrap();
-        if let Some(p) = self.whole.get() { return Ok(p.clone()); }
-        let p = self.builder.pipeline(&self.whole_code, &pc_iid(Kind::PipelineState)).ok_or("whole compute pipeline")?;
-        let _ = self.whole.set(p.clone());
-        Ok(p)
+    /// The whole form is built as a pipeline behind a stand-in is (`pso_async`), with this
+    /// address as its stand-in's: sent to the workers when first needed, released with the
+    /// chain (`forget`).
+    fn key(&self) -> usize {
+        self as *const Chain as usize
+    }
+
+    /// The whole form, waited for as a bind waits for an unsplit pipeline (`budget`: as
+    /// `pso_async::resolve_wait`'s).
+    fn whole(&self, budget: Option<std::time::Duration>) -> Result<Whole, String> {
+        if !self.asked.swap(true, Ordering::Relaxed) {
+            WHOLES_ASKED.fetch_add(1, Ordering::Relaxed);
+        }
+        let key = self.key();
+        let mut p = pso_async::resolve_wait_for(key, budget);
+        if p == key && pso_async::is_pending(key) {
+            WHOLE_SKIPS.fetch_add(1, Ordering::Relaxed);
+            return Ok(Whole::Building);
+        }
+        if p == key {
+            // (built since the wait gave up on it, or failed)
+            p = pso_async::resolve(key);
+        }
+        if p == key {
+            return Err("whole compute pipeline".into());
+        }
+        unsafe { Ok(Whole::Built(ID3D12PipelineState::from_raw_borrowed(&(p as *mut c_void)).ok_or("whole compute pipeline")?.clone())) }
+    }
+
+    /// Hand the whole form's build to `pso_async`, not sent before it is needed (`spared`:
+    /// `pso_async::image_only`).
+    fn queue_whole(&self, job: pso_async::Job, spared: bool) {
+        pso_async::submit_lazy(self.key(), true, job, 0);
+        if spared {
+            pso_async::image_only(self.key());
+        }
     }
 }
 
 static CHAINS: LazyLock<Mutex<HashMap<usize, Arc<Chain>>>> = LazyLock::new(Default::default);
 
+/// `spared`: binds need not wait for the whole form (`pso_async::image_only`).
 pub(super) unsafe fn build(this: *mut c_void, create: PsoFn, desc: &D3D12_COMPUTE_PIPELINE_STATE_DESC,
     iid: *const GUID, result: *mut *mut c_void, record: u64, whole: &[u8], samplers: &[pso::StaticSampler],
-    plan: Arc<DispatchChain>) -> Option<usize> {
+    plan: Arc<DispatchChain>, spared: bool) -> Option<usize> {
     if result.is_null() || iid.is_null() || plan.pieces.len() < 2 { return None; }
     let dev = ID3D12Device::from_raw_borrowed(&this)?;
     let signature = pso::dispatch_chain_root_signature(dev, samplers).ok()?;
@@ -83,15 +127,21 @@ pub(super) unsafe fn build(this: *mut c_void, create: PsoFn, desc: &D3D12_COMPUT
         let plan = plan.clone();
         let builder = builder.clone();
         let iid = if i == 0 { *iid } else { pc_iid(Kind::PipelineState) };
-        Box::new(move || builder.pipeline(&plan.pieces[i], &iid).map_or(0, |p| p.into_raw() as usize)) as super::super::pso_async::Job
+        Box::new(move || builder.pipeline(&plan.pieces[i], &iid).map_or(0, |p| p.into_raw() as usize)) as pso_async::Job
     }).collect();
     // Take ownership of every success, including when a different piece failed.
-    let built: Vec<_> = super::super::pso_async::build_pieces(jobs).into_iter()
+    let built: Vec<_> = pso_async::build_pieces(jobs).into_iter()
         .map(|p| (p != 0).then(|| ID3D12PipelineState::from_raw(p as *mut c_void))).collect();
     let mut pieces = built.into_iter().collect::<Option<Vec<_>>>()?.into_iter();
     let first = pieces.next()?;
-    let chain = Arc::new(Chain { builder, tail: pieces.collect(), words: plan.dwords_per_group,
-        whole_code: whole.to_vec(), whole: OnceLock::new(), build_whole: Mutex::new(()) });
+    let whole_code = whole.to_vec();
+    let whole_builder = builder.clone();
+    let chain = Arc::new(Chain { builder, tail: pieces.collect(), words: plan.dwords_per_group, asked: Default::default() });
+    chain.queue_whole(Box::new(move || {
+        let p = whole_builder.pipeline(&whole_code, &pc_iid(Kind::PipelineState)).map_or(0, |p| p.into_raw() as usize);
+        if p != 0 { WHOLES_BUILT.fetch_add(1, Ordering::Relaxed); }
+        p
+    }), spared);
     PROGRAMS.fetch_add(1, Ordering::Relaxed);
     PIECES.fetch_add(plan.pieces.len() as u64, Ordering::Relaxed);
     *result = first.into_raw();
@@ -101,12 +151,15 @@ pub(super) unsafe fn build(this: *mut c_void, create: PsoFn, desc: &D3D12_COMPUT
 
 pub(super) fn forget(pso: usize) {
     let gone = CHAINS.lock().unwrap().remove(&pso);
+    // the whole form now, or when its build ends (`pso_async::released`)
+    if let Some(c) = &gone { pso_async::release(pso_async::released(c.key())); }
     drop(gone); // releasing a tail PSO also goes through forget_pso
 }
 
-pub(in crate::hle::d3d12x) unsafe fn whole(pso: usize) -> Result<Option<ID3D12PipelineState>, String> {
+/// The whole form of `pso` for an ExecuteIndirect (`Chain::whole`).
+pub(in crate::hle::d3d12x) fn whole(pso: usize) -> Result<Whole, String> {
     let chain = CHAINS.lock().unwrap().get(&pso).cloned();
-    chain.map(|c| c.whole()).transpose()
+    chain.map_or(Ok(Whole::NotSplit), |c| c.whole(pso_async::wait_budget()))
 }
 
 struct Scratch {
@@ -194,11 +247,12 @@ unsafe fn scratch_buffer(dev: &ID3D12Device, bytes: u64) -> Option<ID3D12Resourc
 /// Called with the original six ABI views bound. The extended signature is
 /// common to every piece and the whole fallback. Choose before recording any
 /// part of the dispatch, including when scratch allocation fails.
-pub(in crate::hle::d3d12x) unsafe fn dispatch(list: &ID3D12GraphicsCommandList, pso: usize, allocator: usize, grid: [u32; 3]) -> Result<(), String> {
+/// Ok(false): skipped, the whole form it needs is still being built (`Whole::Building`).
+pub(in crate::hle::d3d12x) unsafe fn dispatch(list: &ID3D12GraphicsCommandList, pso: usize, allocator: usize, grid: [u32; 3]) -> Result<bool, String> {
     let [x, y, z] = grid;
     let chain = CHAINS.lock().unwrap().get(&pso).cloned();
-    let Some(chain) = chain else { list.Dispatch(x, y, z); return Ok(()) };
-    if grid.contains(&0) { return Ok(()); }
+    let Some(chain) = chain else { list.Dispatch(x, y, z); return Ok(true) };
+    if grid.contains(&0) { return Ok(true); }
     // A title Reset can switch to a different PC allocator while this
     // recording is still submitted on the old one. Retain by backing.
     let allocator = if super::super::alloc_pool::enabled() {
@@ -212,9 +266,10 @@ pub(in crate::hle::d3d12x) unsafe fn dispatch(list: &ID3D12GraphicsCommandList, 
     let most = scratch.as_ref().map_or(1, |(s, _)| (s.bytes / group).max(1));
     let slabs = pso::dispatch_slabs(grid, most);
     let Some((scratch, used)) = scratch else {
-        list.SetPipelineState(&chain.whole()?);
+        let Whole::Built(whole) = chain.whole(pso_async::wait_budget())? else { return Ok(false) };
+        list.SetPipelineState(&whole);
         list.Dispatch(x, y, z);
-        return Ok(());
+        return Ok(true);
     };
     let first = ID3D12PipelineState::from_raw_borrowed(&(pso as *mut c_void)).ok_or("first compute piece")?.clone();
     let held = Arc::new(Recording { scratch, first, chain });
@@ -222,7 +277,7 @@ pub(in crate::hle::d3d12x) unsafe fn dispatch(list: &ID3D12GraphicsCommandList, 
     DISPATCHES.fetch_add(1, Ordering::Relaxed);
     SLABS.fetch_add(slabs.len() as u64, Ordering::Relaxed);
     pso::record_dispatch_chain(list, grid, most, &held.scratch.buffer, used, std::iter::once(&held.first).chain(&held.chain.tail));
-    Ok(())
+    Ok(true)
 }
 
 #[cfg(test)]
@@ -248,5 +303,102 @@ mod tests {
         // one group always fits, whatever the bounds say
         assert_eq!(scratch_bytes(9 * MB, 9 * MB, 4 * MB, None, 400 * MB, 384 * MB), (9 * MB, true));
         assert_eq!(scratch_bytes(9 * MB, 9 * MB, 4 * MB, Some(MB), 400 * MB, 384 * MB), (9 * MB, true));
+    }
+}
+
+#[cfg(test)]
+mod whole_tests {
+    use super::*;
+    use std::sync::mpsc;
+    use std::time::{Duration, Instant};
+
+    unsafe extern "system" fn no_create(_: *mut c_void, _: *const c_void, _: *const GUID, _: *mut *mut c_void) -> HRESULT {
+        E_INVALIDARG
+    }
+
+    /// The references held on `pso` (by calling AddRef and Release on it).
+    unsafe fn refs(pso: &ID3D12PipelineState) -> u32 {
+        let raw = pso.as_raw();
+        let vt = *(raw as *const *const usize);
+        let add_ref: unsafe extern "system" fn(*mut c_void) -> u32 = std::mem::transmute(*vt.add(1));
+        let release: unsafe extern "system" fn(*mut c_void) -> u32 = std::mem::transmute(*vt.add(2));
+        add_ref(raw);
+        release(raw)
+    }
+
+    /// A split program's whole form asked for while it is still being built (an ExecuteIndirect
+    /// of it, `bind::execute_indirect`) is not built on the asking thread and not waited for
+    /// past the bind's budget: the dispatch is skipped, a worker builds it, a later ask gets
+    /// it, and `forget` releases it.
+    #[test]
+    fn a_whole_form_still_being_built_is_not_waited_for_past_the_budget() {
+        unsafe {
+            let mut dev: Option<ID3D12Device> = None;
+            if D3D12CreateDevice(None, D3D_FEATURE_LEVEL_11_0, &mut dev).is_err() {
+                let warp = CreateDXGIFactory1::<IDXGIFactory4>().and_then(|f| f.EnumWarpAdapter::<IDXGIAdapter>());
+                if let Ok(warp) = warp {
+                    let _ = D3D12CreateDevice(&warp, D3D_FEATURE_LEVEL_11_0, &mut dev);
+                }
+            }
+            let Some(dev) = dev else { return crate::gpu::recomp::runner::skip_test("no D3D12 device") };
+            let mut ser = None;
+            D3D12SerializeRootSignature(&D3D12_ROOT_SIGNATURE_DESC::default(), D3D_ROOT_SIGNATURE_VERSION_1, &mut ser, None).expect("serialize RS");
+            let ser = ser.unwrap();
+            let rs: ID3D12RootSignature = dev
+                .CreateRootSignature(0, std::slice::from_raw_parts(ser.GetBufferPointer() as *const u8, ser.GetBufferSize()))
+                .expect("CreateRootSignature");
+            let cs = dummy_cs_bytecode();
+            let mut desc = D3D12_COMPUTE_PIPELINE_STATE_DESC {
+                pRootSignature: std::mem::ManuallyDrop::new(Some(rs.clone())),
+                CS: D3D12_SHADER_BYTECODE { pShaderBytecode: cs.as_ptr() as *const c_void, BytecodeLength: cs.len() },
+                ..Default::default()
+            };
+            let whole: ID3D12PipelineState = dev.CreateComputePipelineState(&desc).expect("CreateComputePipelineState");
+            std::mem::ManuallyDrop::drop(&mut desc.pRootSignature);
+
+            let builder = Arc::new(PipelineBuilder { device: dev.clone(), create: no_create, signature: rs, flags: Default::default(), node: 0, record: 0 });
+            let chain = Arc::new(Chain { builder, tail: Vec::new(), words: 1, asked: Default::default() });
+            let (started_tx, started) = mpsc::channel();
+            let (go, finish) = mpsc::channel::<()>();
+            let built = whole.clone().into_raw() as usize;
+            chain.queue_whole(Box::new(move || {
+                let _ = started_tx.send(std::thread::current().name().map(str::to_owned));
+                let _ = finish.recv();
+                built
+            }), false);
+            let first = 0x7E57_C4A1usize;
+            CHAINS.lock().unwrap().insert(first, chain.clone());
+            assert!(pso_async::is_pending(chain.key()), "queued, not built before it is needed");
+
+            let budget = Some(Duration::from_millis(30));
+            let t = Instant::now();
+            let asked = chain.whole(budget);
+            if asked.is_err() || t.elapsed() >= Duration::from_millis(400) {
+                let _ = go.send(());
+            }
+            assert!(matches!(asked, Ok(Whole::Building)), "still being built: the dispatch is skipped");
+            assert!(t.elapsed() < Duration::from_millis(400), "waited {:?}", t.elapsed());
+            let builder_thread = started.recv_timeout(Duration::from_secs(10)).expect("a worker builds the whole form");
+            assert!(builder_thread.as_deref().is_some_and(|n| n.starts_with("xcl-pso")), "built on {builder_thread:?}, not on a PSO worker");
+            let t = Instant::now();
+            assert!(matches!(chain.whole(budget), Ok(Whole::Building)));
+            assert!(t.elapsed() < Duration::from_millis(20), "a late whole form is not waited for again ({:?})", t.elapsed());
+
+            go.send(()).unwrap();
+            let t = Instant::now();
+            while pso_async::is_pending(chain.key()) && t.elapsed() < Duration::from_secs(10) {
+                std::thread::sleep(Duration::from_millis(5));
+            }
+            match chain.whole(budget) {
+                Ok(Whole::Built(p)) => assert_eq!(p.as_raw(), whole.as_raw()),
+                _ => panic!("the whole form was built, but not handed out"),
+            }
+            assert!(matches!(super::whole(first), Ok(Whole::Built(_))), "built: an ExecuteIndirect gets it");
+            assert!(matches!(super::whole(0x7E57_C4A3), Ok(Whole::NotSplit)));
+            assert_eq!(refs(&whole), 2, "this test's and the build's");
+            forget(first);
+            assert_eq!(refs(&whole), 1, "forget released the whole form");
+            assert_eq!(pso_async::resolve(chain.key()), chain.key(), "forgotten by pso_async too");
+        }
     }
 }

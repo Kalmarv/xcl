@@ -4320,7 +4320,9 @@ unsafe fn translated_compute_pso_once(this: *mut c_void, f: PsoFn, desc: *const 
     }
     let record = crate::gpu::shader::fnv64(cs);
     if let Some(plan) = compiled.dispatch_chain {
-        if let Some(rs) = dispatch_chain::build(this, f, d, riid, ppv, record, &dxil, &compiled.samplers, plan) {
+        // (its whole form is waited for as the unsplit pipeline would be: `go_background`)
+        let spared = super::pso_async::image_skip() && crate::gpu::effects::big_and_image_only(cs);
+        if let Some(rs) = dispatch_chain::build(this, f, d, riid, ppv, record, &dxil, &compiled.samplers, plan, spared) {
             LAST_COMPUTE_RS.with(|c| c.set(rs));
             note_pso_rs(*ppv, rs as *mut c_void);
             super::dred::label(*ppv as usize, &[("cs", Some(cs))]);
