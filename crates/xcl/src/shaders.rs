@@ -2124,7 +2124,7 @@ mod tests {
     /// setting runs in a new process.
     #[test]
     fn precompile_windows_are_the_runtimes() {
-        use crate::gpu::recomp::{pso, HEAP_FLAT, HEAP_WINDOWS};
+        use crate::gpu::recomp::{HEAP_FLAT, HEAP_WINDOWS};
         const RUN: &str = "XCL_TEST_PRECOMPILE_WINDOWS";
         if let Ok(case) = std::env::var(RUN) {
             let n: Vec<u32> = case.split(':').map(|v| v.parse().unwrap()).collect();

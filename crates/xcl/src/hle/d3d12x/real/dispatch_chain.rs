@@ -565,8 +565,8 @@ mod tests {
     fn the_whole_form_built_in_the_background_waits_for_a_huge_compiles_turn() {
         use super::super::{big_compile_turn, driver_compile, huge_pso_bytes, huge_pso_concurrency, BIG_COMPILES, GIANT_COMPILES};
         // every slot taken: a huge compile on `want_whole`'s thread waits for one
-        let mut held: Vec<_> = (0..huge_pso_concurrency()).map(|_| big_compile_turn(&BIG_COMPILES, || true, || false)).collect();
-        held.push(big_compile_turn(&GIANT_COMPILES, || true, || false));
+        let mut held: Vec<_> = (0..huge_pso_concurrency()).map(|_| big_compile_turn(&BIG_COMPILES, 0, |_| true, || false)).collect();
+        held.push(big_compile_turn(&GIANT_COMPILES, 0, |_| true, || false));
         let t = super::whole_thread().spawn(|| driver_compile("test", huge_pso_bytes(), true, || 7)).unwrap();
         std::thread::sleep(std::time::Duration::from_millis(300));
         assert!(!t.is_finished(), "a huge compile on the whole form's thread did not wait for a slot");
@@ -687,7 +687,7 @@ mod tests {
             code[..16].copy_from_slice(&nonce.to_le_bytes());
             let chain = Arc::new(Chain { builder, tail: Vec::new(), words: 4, whole_code: code, whole: OnceLock::new(),
                 build_whole: Mutex::new(()), waiting: Default::default(), slabs: Default::default(), last: Default::default(), measured: Default::default(), wanted: Default::default(), warned: Default::default() });
-            let held: Vec<_> = (0..huge_pso_concurrency()).map(|_| big_compile_turn(&BIG_COMPILES, || true, || false)).collect();
+            let held: Vec<_> = (0..huge_pso_concurrency()).map(|_| big_compile_turn(&BIG_COMPILES, 0, |_| true, || false)).collect();
             chain.want_whole();
             let started = Instant::now();
             while chain.build_whole.try_lock().is_ok() {

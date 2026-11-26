@@ -6049,7 +6049,7 @@ unsafe fn warm_once<G>(dev: &ID3D12Device, r: &super::pso_journal::Replay, drive
             // a big one as the title's background makes it: in its size class's slots, within
             // the commit it asks for (no title thread waits for the tool's pipelines)
             let n = compiled.dxil.len();
-            let _big = (n >= huge_pso_bytes()).then(|| big_compile_turn(compile_slots(n), || big_compile_commit_free(big_compile_headroom(n)), || false));
+            let _big = (n >= huge_pso_bytes()).then(|| big_compile_turn(compile_slots(n), big_compile_headroom(n), big_compile_commit_free, || false));
             let _slot = driver();
             let started = std::time::Instant::now();
             let made = dev.CreateComputePipelineState::<ID3D12PipelineState>(&copy);
