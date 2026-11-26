@@ -1355,6 +1355,57 @@ pub(super) unsafe fn map_levels(res: &ID3D12Resource, levels: Option<&[u32]>) ->
     Vec::new()
 }
 
+/// `res`, placed again at the address and with the layout of `donor` while `donor` still holds
+/// its tiles, gets the tiles `donor` has – no others: a texture with lazy levels gets those of the
+/// levels `donor` has pages for (the rest have no texels there), mapped now. True when `res` then
+/// has exactly `donor`'s tiles, so what was uploaded to `donor` is in `res`'s video memory; false
+/// (and nothing mapped) when a tile would come fresh from the pool.
+pub(super) unsafe fn adopt_tiles(res: &ID3D12Resource, donor: usize) -> bool {
+    let key = res.as_raw() as usize;
+    let mut g = PAGES.lock().unwrap();
+    for (&dev_key, pages) in g.iter_mut() {
+        let Some(pages) = pages.as_mut() else { continue };
+        let (Some(n), Some(o)) = (pages.targets.get(&key), pages.targets.get(&donor)) else { continue };
+        if !n.mapped || !o.mapped || n.va != o.va || n.total != o.total || n.console_bytes != o.console_bytes {
+            return false;
+        }
+        // (lazy levels: the groups `donor` has pages for and `res` not yet)
+        let todo: Vec<(usize, u32, u32, u32)> = match (&n.levels, &o.levels) {
+            (None, _) => Vec::new(),
+            (Some(nl), Some(ol)) if nl.groups.len() == ol.groups.len() => {
+                (0..nl.groups.len()).filter(|&k| ol.groups[k].3 && !nl.groups[k].3).map(|k| (k, nl.groups[k].0, nl.groups[k].1, nl.groups[k].2)).collect()
+            }
+            (Some(nl), None) => (0..nl.groups.len()).filter(|&k| !nl.groups[k].3).map(|k| (k, nl.groups[k].0, nl.groups[k].1, nl.groups[k].2)).collect(),
+            (Some(_), Some(_)) => return false,
+        };
+        let (va, console_bytes, total) = (n.va, n.console_bytes, n.total);
+        let Some((first, own)) = owned_pages(va, console_bytes, total as usize) else { return false };
+        let (held, held_extra): (std::collections::HashSet<usize>, std::collections::HashSet<(usize, usize)>) = (o.used.iter().copied().collect(), o.used_extra.iter().copied().collect());
+        // every tile to map is one `donor` holds: none comes fresh from the pool
+        let all_held = todo.iter().all(|&(_, _, t0, cnt)| (t0 as usize..(t0 + cnt) as usize).all(|i| if i < own { held.contains(&(first + i * PAGE)) } else { held_extra.contains(&(va, i)) }));
+        if !all_held {
+            return false;
+        }
+        let d = dev_key as *mut c_void;
+        let Some(dev) = ID3D12Device::from_raw_borrowed(&d) else { return false };
+        for (k, sub, t0, cnt) in todo {
+            let Some((used, used_extra)) = pages.bind_range(dev, res, va, console_bytes, total, sub, t0 as usize..(t0 + cnt) as usize) else { return false };
+            let Some(t) = pages.targets.get_mut(&key) else { return false };
+            t.used.extend(used);
+            t.used_extra.extend(used_extra);
+            if let Some(l) = t.levels.as_mut() {
+                l.groups[k].3 = true;
+            }
+            LEVEL_STATS[2].fetch_add(cnt as u64, std::sync::atomic::Ordering::Relaxed);
+        }
+        let (Some(n), Some(o)) = (pages.targets.get(&key), pages.targets.get(&donor)) else { return false };
+        let mine: std::collections::HashSet<usize> = n.used.iter().copied().collect();
+        let mine_extra: std::collections::HashSet<(usize, usize)> = n.used_extra.iter().copied().collect();
+        return mine == o.used.iter().copied().collect::<std::collections::HashSet<_>>() && mine_extra == o.used_extra.iter().copied().collect::<std::collections::HashSet<_>>();
+    }
+    false
+}
+
 /// Whether `resource` is a texture whose levels get their pages one by one (`map_levels`).
 pub(super) fn has_lazy_levels(resource: usize) -> bool {
     PAGES.lock().unwrap().values().flatten().any(|p| p.targets.get(&resource).is_some_and(|t| t.levels.is_some()))

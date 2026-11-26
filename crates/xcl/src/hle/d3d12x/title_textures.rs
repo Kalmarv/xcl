@@ -46,6 +46,10 @@ struct Upload {
     states: Vec<D3D12_RESOURCE_STATES>,
     dirty_pages: Option<Vec<usize>>,
     page_size: usize,
+    /// the title's address of the texture (where its tiles are)
+    va: usize,
+    /// its first upload, with per-page hashes taken over from an earlier placement (`carry_from`)
+    carried: bool,
 }
 
 struct Entry {
@@ -74,6 +78,12 @@ struct Entry {
     unmapped: bool,
     /// monotonic registration order (newest wins when uncovering shadowed textures)
     seq: u64,
+    /// `fnv64` of the console description: placed again at `va` with the same one, a texture
+    /// lays its texels out on the same tiles the same way
+    layout: u64,
+    /// pending, and its first upload may be left out: it took over the per-page hashes of an
+    /// earlier placement whose tiles it shares (`carry_from`)
+    carried: bool,
 }
 
 /// textures waiting for their first upload
@@ -236,6 +246,23 @@ impl Table {
         (pending_delta, to_unmap)
     }
 
+    /// The texture whose upload `entry` (placed at its `va`) may take over: the newest active one
+    /// placed over exactly its range with the same layout, source and device, uploaded since it
+    /// was made and not written by the GPU – its tiles are the ones the new placement shares.
+    fn donor_for(&self, entry: &Entry) -> Option<usize> {
+        if !entry.placed || entry.layout == 0 {
+            return None;
+        }
+        let end = entry.va.saturating_add(entry.tex.size() as usize);
+        self.active_overlaps(entry.va, end)
+            .into_iter()
+            .filter(|&(ova, _, oend)| ova == entry.va && oend == end)
+            .filter_map(|(_, ores, _)| self.by_res.get(&ores).map(|e| (ores, e)))
+            .filter(|(_, e)| e.placed && !e.pending && !e.gpu_written && !e.unmapped && e.layout == entry.layout && e.src == entry.src && e.device == entry.device)
+            .max_by_key(|(_, e)| e.seq)
+            .map(|(ores, _)| ores)
+    }
+
     /// Remove `res` on COM release, reactivating any shadowed older textures it uncovered (newest
     /// first). Returns `(was_present, pending_delta, unmapped_res_to_remap)`.
     fn remove(&mut self, res: usize) -> (bool, isize, Vec<usize>) {
@@ -395,19 +422,96 @@ pub(super) unsafe fn register(device: *mut c_void, res: *mut c_void, va: usize, 
         placed: super::vram::is_placed_texture(res as usize),
         unmapped: false,
         seq: 0,
+        layout: crate::gpu::shader::fnv64(desc),
+        carried: false,
     };
-    let to_unmap = {
+    let (end, src) = (va.saturating_add(e.tex.size() as usize), e.src);
+    let (to_unmap, donor) = {
         let mut t = TEXTURES.lock().unwrap();
+        let donor = t.donor_for(&e);
         let (delta, unmap_ptrs) = t.insert(res as usize, e);
         adjust_pending(delta);
         TEXTURES_LEN.store(t.by_res.len(), Ordering::Relaxed);
-        clone_resources(&unmap_ptrs)
+        (clone_resources(&unmap_ptrs), donor)
     };
     for r in &to_unmap {
+        unfill(r.as_raw() as usize);
         super::vram::unmap_superseded(r);
+    }
+    if let Some(donor) = donor {
+        if let Some(r) = ID3D12Resource::from_raw_borrowed(&res) {
+            carry_from(r, donor, va, end, src);
+        }
     }
     TEXTURES_GEN.fetch_add(1, Ordering::Release);
     Ok(())
+}
+
+/// The texture whose upload (or whose taken-over one, `carry_from`) last wrote the tiles of each
+/// placed range: start → (end, texture). A range written over by another texture, or by the GPU,
+/// is no longer anyone's.
+static FILLED: Mutex<BTreeMap<usize, (usize, usize)>> = Mutex::new(BTreeMap::new());
+/// first uploads left out: the texture's tiles held what an earlier placement uploaded
+static CARRIED: AtomicU64 = AtomicU64::new(0);
+
+/// `res` filled `[va, end)`: the records it overlaps go.
+fn note_fill(va: usize, end: usize, res: usize) {
+    let mut f = FILLED.lock().unwrap();
+    forget_fills(&mut f, va, end);
+    f.insert(va, (end, res));
+}
+
+/// Forget who filled what overlaps `[va, end)`.
+fn forget_fills(f: &mut BTreeMap<usize, (usize, usize)>, va: usize, end: usize) {
+    // (the records do not overlap: going down from `end`, theirs end before `va` from the first that does)
+    let gone: Vec<usize> = f.range(..end).rev().take_while(|(_, &(e, _))| e > va).map(|(&a, _)| a).collect();
+    for a in gone {
+        f.remove(&a);
+    }
+}
+
+/// `res` gives its tiles back (unmapped: remapped, it has tiles its upload did not fill): its
+/// record goes.
+fn unfill(res: usize) {
+    let range = {
+        let t = TEXTURES.lock().unwrap();
+        t.by_res.get(&res).or_else(|| t.shadowed.get(&res)).map(|e| (e.va, e.va.saturating_add(e.tex.size() as usize)))
+    };
+    if let Some((va, end)) = range {
+        let mut f = FILLED.lock().unwrap();
+        if f.get(&va) == Some(&(end, res)) {
+            f.remove(&va);
+        }
+    }
+}
+
+/// Whether `res`'s upload is the last thing that wrote exactly `[va, end)`.
+fn filled_by(va: usize, end: usize, res: usize) -> bool {
+    FILLED.lock().unwrap().get(&va) == Some(&(end, res))
+}
+
+/// `res`, just placed at `va` over exactly `donor`'s range with its layout: when `donor`'s upload
+/// is what its tiles hold and `res` shares all of them (`vram::adopt_tiles`), `res` takes over
+/// `donor`'s per-page hashes, so its first upload hashes only the pages written since (#2484) and
+/// is left out when none changed.
+unsafe fn carry_from(res: &ID3D12Resource, donor: usize, va: usize, end: usize, src: usize) {
+    if !unchanged_skip() || !filled_by(va, end, donor) || !super::vram::adopt_tiles(res, donor) {
+        return;
+    }
+    let key = res.as_raw() as usize;
+    {
+        let mut last = LAST_CONTENT.lock().unwrap();
+        let Some(h) = last.get(&donor).filter(|h| h.src == src && h.size == end - va) else { return };
+        let h = PageHashes { src: h.src, size: h.size, page_size: h.page_size, hashes: h.hashes.clone() };
+        // (an upload of `res` since its registration has hashes of its own: they stay)
+        if last.contains_key(&key) {
+            return;
+        }
+        last.insert(key, h);
+    }
+    if let Some(e) = TEXTURES.lock().unwrap().by_res.get_mut(&key).filter(|e| e.pending) {
+        e.carried = true;
+    }
 }
 
 /// Where a texture at `va` is read from: the CPU view behind a GPU view (`kernelx::mirrors`)
@@ -494,6 +598,8 @@ pub fn note_gpu_write(res: usize) {
                 e.gpu_written = true;
                 GPU_WRITTEN.fetch_add(1, Ordering::Relaxed);
                 marked = true;
+                let (va, end) = (e.va, e.va.saturating_add(e.tex.size() as usize));
+                forget_fills(&mut FILLED.lock().unwrap(), va, end);
             }
         }
     }
@@ -541,6 +647,7 @@ pub(super) unsafe fn retire_overlapping(va: usize, len: usize) {
         (retired, clone_resources(&unmap_ptrs))
     };
     for r in &to_unmap {
+        unfill(r.as_raw() as usize);
         super::vram::unmap_superseded(r);
     }
     if retired > 0 {
@@ -554,6 +661,12 @@ pub fn forget(res: usize) {
     STREAM_RECHECK.lock().unwrap().remove(&res);
     let (removed, to_remap) = {
         let mut t = TEXTURES.lock().unwrap();
+        if let Some((va, end)) = t.by_res.get(&res).or_else(|| t.shadowed.get(&res)).map(|e| (e.va, e.va.saturating_add(e.tex.size() as usize))) {
+            let mut f = FILLED.lock().unwrap();
+            if f.get(&va) == Some(&(end, res)) {
+                f.remove(&va);
+            }
+        }
         let (removed, delta, remap_ptrs) = t.remove(res);
         adjust_pending(delta);
         TEXTURES_LEN.store(t.by_res.len(), Ordering::Relaxed);
@@ -821,20 +934,28 @@ unsafe fn refresh_once(queue: *mut c_void) {
         t.by_res
             .iter_mut()
             .filter_map(|(&res, e)| {
+                let end = e.src.saturating_add(e.tex.size() as usize);
+                let written = || {
+                    let lo = dirty.partition_point(|&p| p.saturating_add(page_size) <= e.src);
+                    let hi = lo + dirty[lo..].partition_point(|&p| p < end);
+                    dirty[lo..hi].to_vec()
+                };
+                // (only where the write watch sees all of it: elsewhere nothing says what was
+                // written since, `recheck_streamed_unwatched`)
+                let carried = std::mem::take(&mut e.carried) && e.pending && range_is_fully_watched(e.src, e.tex.size() as usize, &ranges);
                 let dirty_pages = if e.pending {
                     e.pending = false;
                     PENDING.fetch_sub(1, Ordering::Relaxed);
-                    None
+                    // (hashes taken over from an earlier placement: only what was written since)
+                    carried.then(written)
                 } else if e.gpu_written {
                     return None;
                 } else {
-                    let end = e.src.saturating_add(e.tex.size() as usize);
-                    let lo = dirty.partition_point(|&p| p.saturating_add(page_size) <= e.src);
-                    let hi = lo + dirty[lo..].partition_point(|&p| p < end);
-                    if lo == hi {
+                    let w = written();
+                    if w.is_empty() {
                         return None;
                     }
-                    Some(dirty[lo..hi].to_vec())
+                    Some(w)
                 };
                 let p = res as *mut c_void;
                 ID3D12Resource::from_raw_borrowed(&p).map(|r| {
@@ -847,6 +968,8 @@ unsafe fn refresh_once(queue: *mut c_void) {
                             states: e.states.clone(),
                             dirty_pages,
                             page_size,
+                            va: e.va,
+                            carried,
                         },
                     )
                 })
@@ -1240,6 +1363,7 @@ unsafe fn upload_all(todo: Vec<(ID3D12Resource, Upload)>) {
         let mut picked = Vec::new();
         let mut bytes = 0usize;
         let mut device = 0usize;
+        let mut fills = Vec::new();
         while let Some((_, u)) = todo.peek() {
             if !batch_fits(picked.len(), bytes, device, u.device, u.tex.size() as usize) {
                 break;
@@ -1252,6 +1376,14 @@ unsafe fn upload_all(todo: Vec<(ID3D12Resource, Upload)>) {
             if unchanged_skip()
                 && changed_pages_since_last_upload(r.as_raw() as usize, u.src, u.tex.size() as usize, u.dirty_pages.as_deref(), u.page_size).is_none()
             {
+                if u.carried {
+                    note_fill(u.va, u.va.saturating_add(u.tex.size() as usize), r.as_raw() as usize);
+                    let n = CARRIED.fetch_add(1, Ordering::Relaxed) + 1;
+                    if n == 1 || (n.is_power_of_two() && n >= 1024) {
+                        crate::xlog_info!("title textures: {n} first uploads left out so far – the tiles held what an earlier placement at the address uploaded");
+                    }
+                    continue;
+                }
                 let n = UNCHANGED.fetch_add(1, Ordering::Relaxed) + 1;
                 if n == 1 || (n.is_power_of_two() && n >= 1024) {
                     crate::xlog_info!("title textures: {n} uploads left out so far – the texture's memory held what it held at its last upload");
@@ -1260,6 +1392,7 @@ unsafe fn upload_all(todo: Vec<(ID3D12Resource, Upload)>) {
             }
             device = u.device;
             bytes += u.tex.size() as usize;
+            fills.push((u.va, u.va.saturating_add(u.tex.size() as usize)));
             picked.push((r, u.src, u.tex, u.states));
         }
         if picked.is_empty() {
@@ -1291,12 +1424,22 @@ unsafe fn upload_all(todo: Vec<(ID3D12Resource, Upload)>) {
             texture::upload_batch(dev, &queue, &batch)
         }) {
             Ok(failed) => {
+                for (k, (r, _, _)) in batch.iter().enumerate() {
+                    if !failed.iter().any(|f| f.0 == k) {
+                        note_fill(fills[k].0, fills[k].1, r.as_raw() as usize);
+                    }
+                }
                 for (_, e) in failed {
                     warn(&e);
                 }
                 UPLOADS.fetch_add(batch.len() as u64, Ordering::Relaxed);
             }
-            Err(e) => warn(&e),
+            Err(e) => {
+                for &(va, end) in &fills {
+                    forget_fills(&mut FILLED.lock().unwrap(), va, end);
+                }
+                warn(&e)
+            }
         }
     }
 }
@@ -2079,7 +2222,7 @@ mod tests {
             d[0x24..0x28].copy_from_slice(&1u32.to_le_bytes());
             d[0x2C..0x30].copy_from_slice(&0x105u32.to_le_bytes());
             let tex = Arc::new(xg::Texture::new(&d).unwrap());
-            let mut e = Entry { device: 0, va: at, src: mirror_source(at), in_gpu_view: true, tex, states: vec![D3D12_RESOURCE_STATE_COMMON], pending: false, gpu_written: false, placed: false, unmapped: false, seq: 0 };
+            let mut e = Entry { device: 0, va: at, src: mirror_source(at), in_gpu_view: true, tex, states: vec![D3D12_RESOURCE_STATE_COMMON], pending: false, gpu_written: false, placed: false, unmapped: false, seq: 0, layout: 0, carried: false };
             assert_eq!(e.src, cpu + 0x2_0000);
             assert!(!recheck_source(&mut e), "nothing changed yet");
             assert_eq!(kernelx::MapTitlePhysicalPages(at as *mut c_void, 1, 0, 4, pages.as_mut_ptr()) as usize, at);
@@ -2177,7 +2320,7 @@ mod tests {
         assert_eq!(subresource_count(&tex), 6);
         // fake resource / list keys, never dereferenced: GPU-written, so no refresh uploads it
         let (res, other, l1, l2) = (0x7E57_0000_1000usize, 0x7E57_0000_2000usize, 0x7E57_0000_3000usize, 0x7E57_0000_4000usize);
-        TEXTURES.lock().unwrap().insert(res, Entry { device: 0, va: 0x7E57_0000_0000, src: 0x7E57_0000_0000, in_gpu_view: false, tex, states: vec![D3D12_RESOURCE_STATE_COMMON], pending: false, gpu_written: true, placed: false, unmapped: false, seq: 0 });
+        TEXTURES.lock().unwrap().insert(res, Entry { device: 0, va: 0x7E57_0000_0000, src: 0x7E57_0000_0000, in_gpu_view: false, tex, states: vec![D3D12_RESOURCE_STATE_COMMON], pending: false, gpu_written: true, placed: false, unmapped: false, seq: 0, layout: 0, carried: false });
         TEXTURES_LEN.fetch_add(1, Ordering::Relaxed);
         let states = || TEXTURES.lock().unwrap().by_res.get(&res).unwrap().states.clone();
         let (p1, p2) = (l1 as *mut c_void, l2 as *mut c_void);
@@ -2321,6 +2464,8 @@ mod tests {
             placed,
             unmapped: false,
             seq: 0,
+            layout: 0,
+            carried: false,
         };
         let mut tbl = Table::new();
         // Two adjacent placed 16 KiB textures + one placed 64 KiB texture after them.
@@ -2731,6 +2876,8 @@ mod tests {
             placed: false,
             unmapped: false,
             seq: 0,
+            layout: 0,
+            carried: false,
         };
         let e_gpu = Entry {
             device: 0,
@@ -2744,6 +2891,8 @@ mod tests {
             placed: false,
             unmapped: false,
             seq: 0,
+            layout: 0,
+            carried: false,
         };
         {
             let mut t = TEXTURES.lock().unwrap();
@@ -3025,5 +3174,264 @@ mod tests {
 
         // Different device always starts a new batch.
         assert!(!batch_fits(1, 4096, 1, 2, 4096));
+    }
+
+    /// A device with tiled resources tier 2 and the shared pages, a queue and 16 MiB of the
+    /// title's memory (UMA, write-watched) for the tests of a placement again over the same tiles.
+    struct Placed {
+        dev: ID3D12Device,
+        queue: ID3D12CommandQueue,
+        base: usize,
+    }
+
+    impl Placed {
+        unsafe fn new(name: &str) -> Option<Placed> {
+            use windows::Win32::Graphics::Direct3D::D3D_FEATURE_LEVEL_11_0;
+            use windows::Win32::Graphics::Dxgi::*;
+            let factory: IDXGIFactory4 = CreateDXGIFactory1().ok()?;
+            let Ok(adapter) = factory.EnumAdapters1(0) else {
+                println!("SKIPPED {name}: no adapter");
+                return None;
+            };
+            if adapter.GetDesc1().is_ok_and(|d| d.Flags & DXGI_ADAPTER_FLAG_SOFTWARE.0 as u32 != 0) {
+                println!("SKIPPED {name}: software adapter");
+                return None;
+            }
+            let mut dev: Option<ID3D12Device> = None;
+            let _ = D3D12CreateDevice(&adapter, D3D_FEATURE_LEVEL_11_0, &mut dev);
+            let Some(dev) = dev else {
+                println!("SKIPPED {name}: no D3D12 device");
+                return None;
+            };
+            let mut opts = D3D12_FEATURE_DATA_D3D12_OPTIONS::default();
+            if dev.CheckFeatureSupport(D3D12_FEATURE_D3D12_OPTIONS, &mut opts as *mut _ as *mut c_void, std::mem::size_of_val(&opts) as u32).is_err()
+                || opts.ResourceHeapTier.0 < 2
+                || opts.TiledResourcesTier.0 < D3D12_TILED_RESOURCES_TIER_2.0
+            {
+                println!("SKIPPED {name}: tiled tier < 2");
+                return None;
+            }
+            super::super::real::adopt(dev.as_raw(), super::super::real::Kind::Device);
+            let queue: ID3D12CommandQueue = dev.CreateCommandQueue(&D3D12_COMMAND_QUEUE_DESC::default()).ok()?;
+            let Some(base) = crate::gpu::uma::get().and_then(|u| u.alloc(16 << 20, 0x1_0000)).map(|p| p as usize) else {
+                println!("SKIPPED {name}: no UMA");
+                return None;
+            };
+            Some(Placed { dev, queue, base })
+        }
+
+        unsafe fn place(&self, va: usize, desc: &[u8; 0x38]) -> ID3D12Resource {
+            let riid = &ID3D12Resource::IID as *const windows::core::GUID as *const windows_sys::core::GUID;
+            let mut p = std::ptr::null_mut();
+            let hr = super::super::device_x::create_placed_resource_x(self.dev.as_raw(), va as u64, desc.as_ptr(), D3D12_RESOURCE_STATE_COMMON.0 as u32, std::ptr::null(), riid, &mut p);
+            assert!(hr >= 0 && !p.is_null(), "CreatePlacedResourceX failed: {hr:#x}");
+            assert!(super::super::vram::is_placed_texture(p as usize), "expected a texture on the shared pages at {va:#x}");
+            ID3D12Resource::from_raw(p)
+        }
+
+        /// The title writes a texture at `va` (every level, `seed` in each texel).
+        unsafe fn write(&self, va: usize, desc: &[u8; 0x38], seed: u8) {
+            let tex = xg::Texture::new(desc).unwrap();
+            let s = tex.texels().unwrap();
+            let bytes = std::slice::from_raw_parts_mut(va as *mut u8, tex.size() as usize);
+            bytes.fill(0);
+            for (m, l) in s.chain.levels.iter().enumerate() {
+                let pat: Vec<u8> = (0..l.width * l.height * s.bpe as usize).map(|k| seed.wrapping_add((m * 7) as u8).wrapping_add((k * 13) as u8)).collect();
+                s.chain.tile_level(&mut bytes[..s.chain.slice_bytes], m, 0, &pat);
+            }
+        }
+
+        /// What the title's memory at `va` holds as subresource `sub` of `desc`.
+        unsafe fn want(&self, va: usize, desc: &[u8; 0x38], sub: usize) -> Vec<u8> {
+            subresources(va, &xg::Texture::new(desc).unwrap()).swap_remove(sub).data
+        }
+
+        /// Subresource `sub` of `r` as the GPU has it.
+        unsafe fn read(&self, r: &ID3D12Resource, sub: u32) -> Vec<u8> {
+            use windows::Win32::Graphics::Dxgi::Common::DXGI_SAMPLE_DESC;
+            let dev = &self.dev;
+            let rd = r.GetDesc();
+            let mut fp = D3D12_PLACED_SUBRESOURCE_FOOTPRINT::default();
+            let (mut rows, mut row_bytes, mut total) = (0u32, 0u64, 0u64);
+            dev.GetCopyableFootprints(&rd, sub, 1, 0, Some(&mut fp), Some(&mut rows), Some(&mut row_bytes), Some(&mut total));
+            let mut rb: Option<ID3D12Resource> = None;
+            dev.CreateCommittedResource(
+                &D3D12_HEAP_PROPERTIES { Type: D3D12_HEAP_TYPE_READBACK, ..Default::default() },
+                D3D12_HEAP_FLAG_NONE,
+                &D3D12_RESOURCE_DESC { Dimension: D3D12_RESOURCE_DIMENSION_BUFFER, Width: total, Height: 1, DepthOrArraySize: 1, MipLevels: 1, SampleDesc: DXGI_SAMPLE_DESC { Count: 1, Quality: 0 }, Layout: D3D12_TEXTURE_LAYOUT_ROW_MAJOR, ..Default::default() },
+                D3D12_RESOURCE_STATE_COPY_DEST,
+                None,
+                &mut rb,
+            )
+            .unwrap();
+            let rb = rb.unwrap();
+            let alloc: ID3D12CommandAllocator = dev.CreateCommandAllocator(D3D12_COMMAND_LIST_TYPE_DIRECT).unwrap();
+            let list: ID3D12GraphicsCommandList = dev.CreateCommandList(0, D3D12_COMMAND_LIST_TYPE_DIRECT, &alloc, None).unwrap();
+            let dst = D3D12_TEXTURE_COPY_LOCATION { pResource: std::mem::transmute_copy(&rb), Type: D3D12_TEXTURE_COPY_TYPE_PLACED_FOOTPRINT, Anonymous: D3D12_TEXTURE_COPY_LOCATION_0 { PlacedFootprint: fp } };
+            let src = D3D12_TEXTURE_COPY_LOCATION { pResource: std::mem::transmute_copy(r), Type: D3D12_TEXTURE_COPY_TYPE_SUBRESOURCE_INDEX, Anonymous: D3D12_TEXTURE_COPY_LOCATION_0 { SubresourceIndex: sub } };
+            list.CopyTextureRegion(&dst, 0, 0, 0, &src, None);
+            list.Close().unwrap();
+            own_work(|| {
+                super::super::vram::before_execute(&self.queue);
+                self.queue.ExecuteCommandLists(&[Some(list.cast().unwrap())]);
+                texture::wait(dev, &self.queue).unwrap();
+            });
+            let mut p = std::ptr::null_mut();
+            rb.Map(0, None, Some(&mut p)).unwrap();
+            let mut out = Vec::with_capacity(rows as usize * row_bytes as usize);
+            for y in 0..rows as usize {
+                out.extend_from_slice(std::slice::from_raw_parts((p as *const u8).add(y * fp.Footprint.RowPitch as usize), row_bytes as usize));
+            }
+            rb.Unmap(0, None);
+            out
+        }
+
+        /// The looks before a submit; what they uploaded and what they left out as a taken-over
+        /// first upload.
+        unsafe fn submit(&self) -> (u64, u64) {
+            let (u0, c0) = (UPLOADS.load(Ordering::Relaxed), CARRIED.load(Ordering::Relaxed));
+            refresh(self.queue.as_raw());
+            (UPLOADS.load(Ordering::Relaxed) - u0, CARRIED.load(Ordering::Relaxed) - c0)
+        }
+    }
+
+    /// A texture placed again at the address and with the layout of one still in use shares its
+    /// tiles: with nothing written since, its first upload is left out and it reads what the
+    /// first one's upload put there – with all its pages, and with lazy levels (the levels the
+    /// first one has pages for).
+    #[test]
+    fn a_placement_again_over_the_same_tiles_takes_over_its_first_upload() {
+        let _vram_guard = super::super::vram::VRAM_TEST_LOCK.lock().unwrap_or_else(|e| e.into_inner());
+        let _guard = TEST_LOCK.lock().unwrap_or_else(|e| e.into_inner());
+        unsafe {
+            let Some(h) = Placed::new("a_placement_again_over_the_same_tiles_takes_over_its_first_upload") else { return };
+            for lazy in [false, true] {
+                super::super::vram::LEVEL_PAGES_FOR_TEST.store(lazy, Ordering::Relaxed);
+                let desc = console_desc(3, 256, 256, 1, 9, 28, 0x109);
+                let va = h.base + if lazy { 4 << 20 } else { 0 };
+                let a = h.place(va, &desc);
+                if lazy && !super::super::vram::has_lazy_levels(a.as_raw() as usize) {
+                    println!("lazy levels: this adapter's texture was not placed with them, not checked");
+                    break;
+                }
+                h.write(va, &desc, 0x1A);
+                assert_eq!(h.submit(), (1, 0), "lazy {lazy}: the first placement is uploaded");
+                let b = h.place(va, &desc);
+                assert_eq!(h.submit(), (0, 1), "lazy {lazy}: the second one's first upload is left out");
+                for sub in [0u32, 4, 8] {
+                    assert_eq!(h.read(&b, sub), h.want(va, &desc, sub as usize), "lazy {lazy}: level {sub} of the second placement");
+                }
+                // and from then on it is kept in step as any texture is
+                h.write(va, &desc, 0x2B);
+                assert_eq!(h.submit().0, 1, "lazy {lazy}: written again: uploaded");
+                assert_eq!(h.read(&b, 0), h.want(va, &desc, 0), "lazy {lazy}: the second placement follows the title's writes");
+                drop((a, b));
+            }
+            super::super::vram::LEVEL_PAGES_FOR_TEST.store(false, Ordering::Relaxed);
+        }
+    }
+
+    /// A placement with no earlier one in use at its address – the first one was released before
+    /// it came – has its first upload, even over the same bytes.
+    #[test]
+    fn a_placement_with_no_earlier_one_in_use_is_uploaded() {
+        let _vram_guard = super::super::vram::VRAM_TEST_LOCK.lock().unwrap_or_else(|e| e.into_inner());
+        let _guard = TEST_LOCK.lock().unwrap_or_else(|e| e.into_inner());
+        unsafe {
+            let Some(h) = Placed::new("a_placement_with_no_earlier_one_in_use_is_uploaded") else { return };
+            let desc = console_desc(3, 256, 256, 1, 1, 28, 0x109);
+            let va = h.base + (1 << 20);
+            let a = h.place(va, &desc);
+            h.write(va, &desc, 0x3C);
+            assert_eq!(h.submit(), (1, 0));
+            drop(a);
+            let b = h.place(va, &desc);
+            assert_eq!(h.submit(), (1, 0), "no texture to take the upload over from: uploaded");
+            assert_eq!(h.read(&b, 0), h.want(va, &desc, 0));
+            drop(b);
+        }
+    }
+
+    /// A placement again over the same tiles whose memory the title wrote since the first one's
+    /// upload is uploaded (its written page changed).
+    #[test]
+    fn a_placement_again_over_written_memory_is_uploaded() {
+        let _vram_guard = super::super::vram::VRAM_TEST_LOCK.lock().unwrap_or_else(|e| e.into_inner());
+        let _guard = TEST_LOCK.lock().unwrap_or_else(|e| e.into_inner());
+        unsafe {
+            let Some(h) = Placed::new("a_placement_again_over_written_memory_is_uploaded") else { return };
+            let desc = console_desc(3, 256, 256, 1, 1, 28, 0x109);
+            let va = h.base + (2 << 20);
+            let a = h.place(va, &desc);
+            h.write(va, &desc, 0x4D);
+            assert_eq!(h.submit(), (1, 0));
+            // one byte of the last page, after the first one's upload and before the second placement
+            *((va + 0x3_FFFF) as *mut u8) ^= 0xFF;
+            let b = h.place(va, &desc);
+            assert_eq!(h.submit(), (1, 0), "a written page changed: uploaded");
+            assert_eq!(h.read(&b, 0), h.want(va, &desc, 0), "the second placement has the title's new bytes");
+            drop((a, b));
+        }
+    }
+
+    /// A placement superseded by one over a different range has its tiles unmapped and given back
+    /// to the pool: one placed again at its address and layout does not take its hashes over
+    /// (they describe tiles it no longer has) and is uploaded.
+    #[test]
+    fn a_superseded_placement_never_gives_its_upload_away() {
+        let _vram_guard = super::super::vram::VRAM_TEST_LOCK.lock().unwrap_or_else(|e| e.into_inner());
+        let _guard = TEST_LOCK.lock().unwrap_or_else(|e| e.into_inner());
+        unsafe {
+            let Some(h) = Placed::new("a_superseded_placement_never_gives_its_upload_away") else { return };
+            let desc = console_desc(3, 256, 256, 1, 1, 28, 0x109); // 256 KiB
+            let other = console_desc(3, 512, 512, 1, 1, 28, 0x109); // 1 MiB over it and beyond
+            let va = h.base + (3 << 20);
+            let a = h.place(va, &desc);
+            h.write(va, &desc, 0x5E);
+            assert_eq!(h.submit(), (1, 0));
+            let c = h.place(va, &other);
+            h.write(va, &other, 0x6F);
+            assert_eq!(h.submit(), (1, 0), "the different range is uploaded");
+            h.write(va, &desc, 0x5E);
+            let b = h.place(va, &desc);
+            assert_eq!(h.submit(), (1, 0), "the superseded placement's upload is not taken over");
+            assert_eq!(h.read(&b, 0), h.want(va, &desc, 0));
+            drop((a, b, c));
+        }
+    }
+
+    /// The first placement's tiles went back to the pool (superseded at its address by one that
+    /// shares only its first page) and were taken by a texture elsewhere before the placement again
+    /// at the first one's address; the first one, uncovered, has other tiles where those were: the
+    /// new placement is uploaded, never left out over tiles the earlier upload did not fill.
+    #[test]
+    fn recycled_tiles_are_never_taken_for_an_earlier_upload() {
+        let _vram_guard = super::super::vram::VRAM_TEST_LOCK.lock().unwrap_or_else(|e| e.into_inner());
+        let _guard = TEST_LOCK.lock().unwrap_or_else(|e| e.into_inner());
+        unsafe {
+            let Some(h) = Placed::new("recycled_tiles_are_never_taken_for_an_earlier_upload") else { return };
+            let desc = console_desc(3, 256, 256, 1, 1, 28, 0x109); // 256 KiB: 4 pages
+            let (va, elsewhere) = (h.base + (8 << 20), h.base + (12 << 20));
+            let a = h.place(va, &desc);
+            h.write(va, &desc, 0x71);
+            assert_eq!(h.submit(), (1, 0));
+            let dev_key = h.dev.as_raw() as usize;
+            let before = super::super::vram::mapped_tiles_for(dev_key, a.as_raw() as usize).expect("the first placement is mapped");
+            // superseded by one over [va - 192 KiB, va + 64 KiB): its last three pages go back, cool,
+            // and a texture elsewhere is placed over tiles from the pool
+            let c = h.place(va - 0x3_0000, &desc);
+            std::thread::sleep(std::time::Duration::from_millis(2100));
+            let d = h.place(elsewhere, &desc);
+            // (released, `c` uncovers the first one: it is mapped again, with other tiles)
+            drop(c);
+            let after = super::super::vram::mapped_tiles_for(dev_key, a.as_raw() as usize).expect("mapped again");
+            println!("the first placement's tiles: {before:?} -> {after:?}");
+            let (u, _) = h.submit();
+            println!("uncovered: {u} uploaded; the first placement reads its bytes: {}", h.read(&a, 0) == h.want(va, &desc, 0));
+            let b = h.place(va, &desc);
+            assert_eq!(h.submit().1, 0, "the tiles the first one's upload filled are not all there: not taken over");
+            assert_eq!(h.read(&b, 0), h.want(va, &desc, 0), "the placement again has the title's bytes");
+            drop((a, b, d));
+        }
     }
 }
