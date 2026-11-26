@@ -198,6 +198,11 @@ pub(super) unsafe extern "system" fn reset(this: *mut c_void, alloc: usize, pso:
                     super::alloc_pool::park_list(seg);
                 }
             }
+            // the previous recording a stand-in now replaces is not reset here either: it records
+            // again only after a later Reset, so it does not hold its allocator meanwhile
+            if stand_in.is_some() && park_spares() {
+                super::alloc_pool::park_list(primary as usize);
+            }
         }
         *((this as usize + F_RING_AT) as *mut usize) = 0;
     }
