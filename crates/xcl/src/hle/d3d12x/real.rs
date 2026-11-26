@@ -185,7 +185,21 @@ pub fn abi_root_signature() -> Option<ID3D12RootSignature> {
 /// lifetime.
 static UMA_BUFFER: Mutex<Vec<(usize, u64)>> = Mutex::new(Vec::new());
 /// the committed UMA windows opened as D3D12 heaps (indexed by window `k`; `None` for sparse windows)
-static UMA_HEAPS: Mutex<Vec<Option<usize>>> = Mutex::new(Vec::new());
+/// Window heaps for `CreatePlacedResource` inside coherent UMA windows: for each window `k`,
+/// contiguous `(seg_offset, seg_len, heap_raw)` segments (1 entry for single-heap windows, N for
+/// `XCL_UMA_DRIVER=mixed:...`).
+static UMA_HEAPS: Mutex<Vec<Vec<(usize, usize, usize)>>> = Mutex::new(Vec::new());
+
+fn uma_heap_for(k: usize, offset: usize, len: usize) -> Option<(usize, usize)> {
+    let g = UMA_HEAPS.lock().unwrap();
+    let segs = g.get(k)?;
+    for &(seg_off, seg_len, heap_raw) in segs {
+        if offset >= seg_off && offset.saturating_add(len) <= seg_off.saturating_add(seg_len) {
+            return Some((heap_raw, offset - seg_off));
+        }
+    }
+    None
+}
 /// console buffers placed in unified memory: resource → (address, bytes)
 /// address, bytes, whether XCL allocated the memory (not: the title's own, CreatePlacedResourceX)
 type UmaBuffer = (usize, usize, bool);
@@ -396,7 +410,7 @@ unsafe fn open_uma(device: &ID3D12Device) {
     };
     let n = u.shader_windows();
     let mut bufs: Vec<(usize, u64)> = vec![(0, 0); n];
-    let mut heaps: Vec<Option<usize>> = vec![None; n];
+    let mut heaps: Vec<Vec<(usize, usize, usize)>> = vec![Vec::new(); n];
     let mut shadows: Vec<(usize, ID3D12Resource)> = Vec::new();
     for k in 0..n {
         if !u.is_committed_window(k) {
@@ -406,12 +420,14 @@ unsafe fn open_uma(device: &ID3D12Device) {
         // GPU's loads and atomics on imported pages are an order of magnitude slower (`uma_driver`)
         if shadow_choice() != Some(true) && super::uma_driver::wanted(device) {
             let (base, size) = u.window(k);
-            match super::uma_driver::remake(device, base, size) {
-                Ok((heap, buf)) => {
+            match super::uma_driver::remake_window(device, base, size) {
+                Ok(remade) => {
                     u.set_driver_window(k);
-                    let (buf_raw, va, heap_raw) = super::uma_driver::raw(heap, buf);
-                    bufs[k] = (buf_raw, va);
-                    heaps[k] = Some(heap_raw);
+                    if let Some(segs) = remade.watched_regions {
+                        crate::gpu::uma::set_driver_watch_segments(k, segs);
+                    }
+                    bufs[k] = (remade.buf_raw, remade.gpu_va);
+                    heaps[k] = remade.heaps;
                     continue;
                 }
                 Err(e) => crate::xlog_warn!("D3D12.X: coherent window {k} stays imported: {e}"),
@@ -436,7 +452,7 @@ unsafe fn open_uma(device: &ID3D12Device) {
         match made {
             Ok((buf_raw, va, heap_raw)) => {
                 bufs[k] = (buf_raw, va);
-                heaps[k] = Some(heap_raw);
+                heaps[k] = vec![(0, u.window(k).1, heap_raw)];
             }
             Err(e) => {
                 crate::xlog_warn!("D3D12.X: UMA not available to the GPU: {e}");
@@ -1700,8 +1716,8 @@ unsafe fn place_console_buffer(this: *mut c_void, props: usize, desc: usize, sta
     // the heap from OpenExistingHeapFromAddress is cross-adapter: row-major + sanitized flags & state
     let k = u.window_of(p)?;
     let (d, st) = sanitize_coherent_buffer(&d, state, !u.is_driver_window(k));
-    let heap = (*UMA_HEAPS.lock().unwrap().get(k)?)?;
-    let hr = dev_create_placed_resource(this, heap, p - u.window(k).0, &d as *const _ as usize, st as usize, clear, riid, ppv);
+    let (heap, heap_off) = uma_heap_for(k, p - u.window(k).0, d.Width as usize)?;
+    let hr = dev_create_placed_resource(this, heap, heap_off, &d as *const _ as usize, st as usize, clear, riid, ppv);
     if hr < 0 || (*ppv).is_null() {
         u.free(p);
         static ONCE: AtomicU64 = AtomicU64::new(0);
@@ -1788,14 +1804,14 @@ pub(super) unsafe fn place_at_title_address(this: *mut c_void, va: usize, desc: 
         }
         return Some(hr);
     }
-    let heap = (*UMA_HEAPS.lock().unwrap().get(k)?)?;
+    let (heap, heap_off) = uma_heap_for(k, start - base, delta + bytes)?;
     if !u.shadowed() && !u.is_driver_window(k) {
         d.Flags |= D3D12_RESOURCE_FLAG_ALLOW_CROSS_ADAPTER;
     }
     d.Layout = D3D12_TEXTURE_LAYOUT_ROW_MAJOR;
     d.Alignment = 0;
     d.Width = (delta + bytes) as u64;
-    let hr = dev_create_placed_resource(this, heap, start - base, &d as *const _ as usize, state as usize, clear as usize, riid, ppv);
+    let hr = dev_create_placed_resource(this, heap, heap_off, &d as *const _ as usize, state as usize, clear as usize, riid, ppv);
     if hr < 0 || (*ppv).is_null() {
         return None;
     }

@@ -395,6 +395,11 @@ unsafe fn read<R>(pages: Option<&PageMap>, at: usize, len: usize, f: impl FnOnce
             f(&s[..len])
         });
     }
+    // a GPU_UPLOAD segment of a mixed driver window: by the GPU's copy (CPU reads of that video
+    // memory through the BAR are slow)
+    if let Some(bytes) = super::uma_driver::read_vram_bytes(at, len) {
+        return f(&bytes);
+    }
     if crate::gpu::uma::get().is_some_and(|u| u.in_committed_window(at, len)) {
         return f(std::slice::from_raw_parts(at as *const u8, len));
     }

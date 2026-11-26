@@ -2718,6 +2718,11 @@ unsafe fn title_bytes(at: usize, len: usize) -> std::borrow::Cow<'static, [u8]> 
     // submits make the race likely); the copy goes through the kernel, which gives zeros for it.
     static SAFE: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
     let safe = *SAFE.get_or_init(|| std::env::var("XCL_TEXTURE_SAFE_READ").is_ok_and(|v| v.trim() == "1"));
+    // a GPU_UPLOAD segment of a mixed driver window: by the GPU's copy (CPU reads of that video
+    // memory through the BAR are slow)
+    if let Some(bytes) = super::uma_driver::read_vram_bytes(at, len) {
+        return std::borrow::Cow::Owned(bytes);
+    }
     if !safe && crate::gpu::shader::readable(at, len) {
         std::borrow::Cow::Borrowed(std::slice::from_raw_parts(at as *const u8, len))
     } else {
