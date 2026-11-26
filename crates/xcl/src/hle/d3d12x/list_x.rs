@@ -2733,6 +2733,8 @@ unsafe fn reset_own_alloc(list: *mut c_void) {
 thread_local! {
     /// Tests: making a split's next segment fails (as it can when the device is out of memory).
     static NO_NEW_SEGMENT: std::cell::Cell<bool> = const { std::cell::Cell::new(false) };
+    /// Tests: the Reset that opens a split's next segment fails.
+    static SEGMENT_RESET_FAILS: std::cell::Cell<bool> = const { std::cell::Cell::new(false) };
 }
 
 /// A closed PC list of type `ty` for a split's next segment when `wrapper` has no spare.
@@ -2742,6 +2744,26 @@ unsafe fn next_segment_list(dev: *mut c_void, ty: D3D12_COMMAND_LIST_TYPE) -> Op
         return None;
     }
     real::create_closed_pc_command_list(dev, ty)
+}
+
+/// A PC list of type `ty` recording on `alloc`, for a split's next segment whose Reset failed.
+unsafe fn fallback_segment_list(dev: *mut c_void, ty: D3D12_COMMAND_LIST_TYPE, alloc: usize, init_pso: usize) -> Option<*mut c_void> {
+    #[cfg(test)]
+    if NO_NEW_SEGMENT.with(|f| f.get()) {
+        return None;
+    }
+    real::create_raw_pc_command_list(dev, ty, super::alloc_pool::current(alloc), init_pso)
+}
+
+/// Resets `next` onto `alloc` for a split's next segment.
+unsafe fn reset_segment(next: *mut c_void, alloc: usize, ty: D3D12_COMMAND_LIST_TYPE, init_pso: usize) -> i32 {
+    #[cfg(test)]
+    if SEGMENT_RESET_FAILS.with(|f| f.get()) {
+        return 0x8000_4005u32 as i32;
+    }
+    super::alloc_pool::reset_list(next as usize, alloc, ty.0, |pc_alloc| {
+        pc::<unsafe extern "system" fn(*mut c_void, usize, usize) -> i32>(next, PC_RESET)(next, pc_alloc, init_pso)
+    })
 }
 
 /// Ends `list`'s segment and opens the next; with `dispatch`, a closed segment for it comes between.
@@ -2827,15 +2849,15 @@ unsafe fn split(list: *mut c_void, dispatch: Option<Deferred>) -> Option<*mut c_
 
     // (the allocator backs one recording at a time: `next` opens on it only now `list` is closed)
     let ext_next = *(next as *const usize);
-    let reset_hr = super::alloc_pool::reset_list(next as usize, alloc, ty.0, |pc_alloc| {
-        pc::<unsafe extern "system" fn(*mut c_void, usize, usize) -> i32>(next, PC_RESET)(next, pc_alloc, init_pso)
-    });
+    let reset_hr = reset_segment(next, alloc, ty, init_pso);
     real::preserve_vtable(next, ext_next);
     let next_pc = if reset_hr >= 0 {
         reset_copy_scratch(next);
         next
     } else {
-        match real::create_raw_pc_command_list(dev.as_raw(), ty, super::alloc_pool::current(alloc), init_pso) {
+        // (a list whose Reset failed is not used again: it is released, and the segment made anew)
+        super::title_list::release_segment(next);
+        match fallback_segment_list(dev.as_raw(), ty, alloc, init_pso) {
             Some(p) => p,
             None => {
                 static RESET_ERR: AtomicU64 = AtomicU64::new(0);
@@ -7350,6 +7372,60 @@ mod tests {
                     gr.cells.remove(&va(i));
                 }
             }
+        }
+    }
+
+    /// A split whose next segment fails its Reset releases that list, once, whether the segment
+    /// made in its place is had or not (before, the list was dropped without a Release).
+    #[test]
+    fn a_split_whose_next_segment_fails_its_reset_releases_that_list_once() {
+        let Ok(dev) = crate::gpu::agility::create_device(None, windows::Win32::Graphics::Direct3D::D3D_FEATURE_LEVEL_11_0) else {
+            return crate::gpu::recomp::runner::skip_test("no GPU");
+        };
+        unsafe {
+            let ty = D3D12_COMMAND_LIST_TYPE_COMPUTE;
+            let alloc: ID3D12CommandAllocator = dev.CreateCommandAllocator(ty).unwrap();
+            let a = alloc.as_raw() as usize;
+            let primary = dev.CreateCommandList::<_, _, ID3D12GraphicsCommandList>(0, ty, &alloc, None).unwrap().into_raw();
+            real::adopt(primary, real::Kind::CommandList);
+            on_create(primary, a, 0, ty);
+            super::super::bind::reset(primary, a, 0);
+            let w = super::super::title_list::wrap(primary);
+            let release_w: unsafe extern "system" fn(*mut c_void) -> u32 = std::mem::transmute(*(*(w as *const *const usize)).add(2));
+            let slot = |p: *mut c_void, i: usize| *(*(p as *const *const usize)).add(i);
+            // a spare the split takes as its next segment, with a reference of the test's own
+            let spare = || {
+                let p = real::create_closed_pc_command_list(dev.as_raw(), ty).expect("a closed list");
+                let add_ref: unsafe extern "system" fn(*mut c_void) -> u32 = std::mem::transmute(slot(p, 1));
+                assert_eq!(add_ref(p), 2);
+                super::super::title_list::put_spare(w, p);
+                p
+            };
+            let refs_left = |p: *mut c_void| {
+                let release: unsafe extern "system" fn(*mut c_void) -> u32 = std::mem::transmute(slot(p, 2));
+                release(p)
+            };
+
+            // the segment made in its place is had
+            let s1 = spare();
+            SEGMENT_RESET_FAILS.with(|f| f.set(true));
+            let next = split(primary, None);
+            SEGMENT_RESET_FAILS.with(|f| f.set(false));
+            let next = next.expect("a segment made in place of the one whose Reset failed");
+            assert_ne!(next, s1);
+            assert_eq!(refs_left(s1), 0, "the split released the list whose Reset failed, once");
+
+            // it is not
+            let s2 = spare();
+            SEGMENT_RESET_FAILS.with(|f| f.set(true));
+            NO_NEW_SEGMENT.with(|f| f.set(true));
+            let none = split(next, None);
+            NO_NEW_SEGMENT.with(|f| f.set(false));
+            SEGMENT_RESET_FAILS.with(|f| f.set(false));
+            assert!(none.is_none());
+            assert_eq!(refs_left(s2), 0, "the split released the list whose Reset failed, once");
+
+            assert_eq!(release_w(w), 0);
         }
     }
 
