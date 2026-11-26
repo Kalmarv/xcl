@@ -67,6 +67,22 @@ pub fn host_main(boot_path: &Path) -> i32 {
                     K32GetProcessMemoryInfo(windows_sys::Win32::System::Threading::GetCurrentProcess(), &mut c as *mut _ as *mut _, c.cb);
                     c.PrivateUsage
                 };
+                {
+                    use std::sync::atomic::Ordering::Relaxed;
+                    use crate::hle::d3d12x::real::{Kind, MADE, RES_GONE, RES_HELD};
+                    let r = MADE[Kind::Resource as usize].load(Relaxed);
+                    let (gone, held, let_go) = (RES_GONE.load(Relaxed), RES_HELD.load(Relaxed), crate::hle::d3d12x::real::late_let_go());
+                    crate::xlog_info!(
+                        "objects: resources made {r}, gone {gone}, held {held} (let go {let_go}), live {}; heaps made {}, descriptor heaps {}, query heaps {}, allocators {}, lists {}, PSOs {}",
+                        r.saturating_sub(gone + let_go),
+                        MADE[Kind::Heap as usize].load(Relaxed),
+                        MADE[Kind::DescriptorHeap as usize].load(Relaxed),
+                        MADE[Kind::QueryHeap as usize].load(Relaxed),
+                        MADE[Kind::CommandAllocator as usize].load(Relaxed),
+                        MADE[Kind::CommandList as usize].load(Relaxed),
+                        MADE[Kind::PipelineState as usize].load(Relaxed),
+                    );
+                }
                 let (local, non_local) = crate::hle::d3d12x::real::video_memory().unwrap_or((0, 0));
                 let (arenas, arenas_made) = crate::hle::d3d12x::vram::arena_bytes();
                 let (pools, pools_mapped) = crate::hle::d3d12x::sparse::pool_bytes();

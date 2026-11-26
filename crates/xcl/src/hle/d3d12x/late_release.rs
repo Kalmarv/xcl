@@ -92,6 +92,9 @@ pub fn enabled() -> bool {
     *ON.get_or_init(|| !std::env::var("XCL_LATE_RELEASE").is_ok_and(|v| v.trim() == "0"))
 }
 
+/// held resources let go so far
+pub static LET_GO: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
+
 /// how long a last `Release` itself waits for queues with nothing to do to say so
 const IDLE_WAIT: Duration = Duration::from_micros(300);
 
@@ -142,6 +145,7 @@ pub unsafe fn drain_known(seal_now: bool) {
         None => return,
     };
     // (outside the lock: a release may end other objects, whose releases come back here)
+    LET_GO.fetch_add(gone.len() as u64, std::sync::atomic::Ordering::Relaxed);
     for res in gone {
         let f: unsafe extern "system" fn(*mut c_void) -> u32 = std::mem::transmute(super::real::orig_fn(res as *mut c_void, 2));
         f(res as *mut c_void);

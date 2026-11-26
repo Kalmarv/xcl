@@ -752,6 +752,17 @@ pub unsafe fn adopt(obj: *mut c_void, kind: Kind) {
     }
     let ext = class_for(obj, v, kind);
     *(obj as *mut usize) = ext;
+    MADE[kind as usize].fetch_add(1, Ordering::Relaxed);
+}
+
+/// objects adopted (made through the device), by `Kind` (`XCL_ACTIVITY`'s object line)
+pub static MADE: [AtomicU64; 16] = [const { AtomicU64::new(0) }; 16];
+/// resources whose last Release came: gone at once / held by `late_release`
+pub static RES_GONE: AtomicU64 = AtomicU64::new(0);
+pub static RES_HELD: AtomicU64 = AtomicU64::new(0);
+/// held resources `late_release` has let go
+pub fn late_let_go() -> u64 {
+    super::late_release::LET_GO.load(Ordering::Relaxed)
 }
 
 unsafe fn class_for(obj: *mut c_void, orig: usize, kind: Kind) -> usize {
@@ -1731,7 +1742,10 @@ unsafe extern "system" fn res_release(this: *mut c_void) -> u32 {
         }
     }
     if held {
+        RES_HELD.fetch_add(1, Ordering::Relaxed);
         super::late_release::hold(this as usize);
+    } else if n == 0 {
+        RES_GONE.fetch_add(1, Ordering::Relaxed);
     }
     n
 }
