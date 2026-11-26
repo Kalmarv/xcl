@@ -2600,7 +2600,7 @@ pub(super) unsafe fn reset_stand_in(wrapper: *mut c_void, primary: *mut c_void, 
         Some(p) => p,
         None => {
             let pc_alloc = super::alloc_pool::current(alloc);
-            let made = real::create_raw_pc_command_list(device_of(primary)?.as_raw(), ty, pc_alloc, 0)?;
+            let made = real::create_raw_pc_command_list(device_of(primary)?.as_raw(), ty, pc_alloc, 0)?; real::SPLIT_LISTS.fetch_add(1, Ordering::Relaxed);
             on_create(made, pc_alloc, 0, ty);
             // (closed: it is reset below like a spare)
             let ext = *(made as *const usize);
@@ -2817,7 +2817,10 @@ unsafe fn split(list: *mut c_void, dispatch: Option<Deferred>) -> Option<*mut c_
     let next_pc = match next_pc {
         Some(p) => p,
         None => match real::create_raw_pc_command_list(dev.as_raw(), ty, super::alloc_pool::current(alloc), init_pso) {
-            Some(p) => p,
+            Some(p) => {
+                real::SPLIT_LISTS.fetch_add(1, Ordering::Relaxed);
+                p
+            }
             None => {
                 static CREATE_ERR: AtomicU64 = AtomicU64::new(0);
                 warn(&CREATE_ERR, "mid-list split", format_args!("CreateCommandList failed"));
@@ -2966,7 +2969,7 @@ unsafe fn deferred_segment(wrapper: *mut c_void, list: *mut c_void, ty: D3D12_CO
     };
     let p = match super::title_list::pop_spare(wrapper).filter(emptied) {
         Some(p) => p,
-        None => real::create_raw_pc_command_list(dev.as_raw(), ty, super::alloc_pool::current(own), 0)?,
+        None => { real::SPLIT_LISTS.fetch_add(1, Ordering::Relaxed); real::create_raw_pc_command_list(dev.as_raw(), ty, super::alloc_pool::current(own), 0)? }
     };
     let ext = *(p as *const usize);
     pc::<unsafe extern "system" fn(*mut c_void) -> i32>(p, PC_CLOSE)(p);

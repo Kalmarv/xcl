@@ -760,6 +760,9 @@ pub static MADE: [AtomicU64; 16] = [const { AtomicU64::new(0) }; 16];
 /// resources whose last Release came: gone at once / held by `late_release`
 pub static RES_GONE: AtomicU64 = AtomicU64::new(0);
 pub static RES_HELD: AtomicU64 = AtomicU64::new(0);
+/// command lists whose last Release came / made by XCL for a mid-list split
+pub static LISTS_GONE: AtomicU64 = AtomicU64::new(0);
+pub static SPLIT_LISTS: AtomicU64 = AtomicU64::new(0);
 /// held resources `late_release` has let go
 pub fn late_let_go() -> u64 {
     super::late_release::LET_GO.load(Ordering::Relaxed)
@@ -7065,6 +7068,7 @@ unsafe extern "system" fn cl_release(this: *mut c_void) -> u32 {
     let f: unsafe extern "system" fn(*mut c_void) -> u32 = std::mem::transmute(orig_fn(this, 2));
     let n = f(this);
     if n == 0 {
+        LISTS_GONE.fetch_add(1, Ordering::Relaxed);
         super::list_x::on_release(this as usize);
         super::bind::forget(this);
         super::dred::forget_list(this);

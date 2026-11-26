@@ -69,17 +69,19 @@ pub fn host_main(boot_path: &Path) -> i32 {
                 };
                 {
                     use std::sync::atomic::Ordering::Relaxed;
-                    use crate::hle::d3d12x::real::{Kind, MADE, RES_GONE, RES_HELD};
+                    use crate::hle::d3d12x::real::{Kind, LISTS_GONE, MADE, RES_GONE, RES_HELD, SPLIT_LISTS};
                     let r = MADE[Kind::Resource as usize].load(Relaxed);
                     let (gone, held, let_go) = (RES_GONE.load(Relaxed), RES_HELD.load(Relaxed), crate::hle::d3d12x::real::late_let_go());
                     crate::xlog_info!(
-                        "objects: resources made {r}, gone {gone}, held {held} (let go {let_go}), live {}; heaps made {}, descriptor heaps {}, query heaps {}, allocators {}, lists {}, PSOs {}",
+                        "objects: resources made {r}, gone {gone}, held {held} (let go {let_go}), live {}; heaps made {}, descriptor heaps {}, query heaps {}, allocators {}, lists {} (gone {}, made for splits {}), PSOs {}",
                         r.saturating_sub(gone + let_go),
                         MADE[Kind::Heap as usize].load(Relaxed),
                         MADE[Kind::DescriptorHeap as usize].load(Relaxed),
                         MADE[Kind::QueryHeap as usize].load(Relaxed),
                         MADE[Kind::CommandAllocator as usize].load(Relaxed),
                         MADE[Kind::CommandList as usize].load(Relaxed),
+                        LISTS_GONE.load(Relaxed),
+                        SPLIT_LISTS.load(Relaxed),
                         MADE[Kind::PipelineState as usize].load(Relaxed),
                     );
                 }
