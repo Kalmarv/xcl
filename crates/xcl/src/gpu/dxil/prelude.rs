@@ -78,42 +78,30 @@ impl Lw {
         let k = self.s.m.f32c(0x3F7F_FFFF);
         self.sel(ge, k, r)
     }
-    /// HLSL `frexp` as DXC lowers it: (mantissa, exponent as float).
-    fn frexp_dxc(&mut self, x: Value) -> (Value, Value) {
-        let i = self.bits(x);
-        let e = self.andc(i, 0x7F80_0000);
-        let mant = self.andc(i, 0x007F_FFFF); // DXC drops the sign
-        let e = self.addc(e, (-0x3F00_0000i32) as u32);
-        let e = self.ashrc(e, 23);
-        let mant = self.orc(mant, 0x3F00_0000);
-        let z = self.fc(0.0);
-        let nz = self.fcmp(Pred::FUNe, x, z);
-        let ef = self.sitof(e);
-        let ef = self.sel(nz, ef, z);
-        let mf = self.f(mant);
-        let mf = self.sel(nz, mf, z);
-        (mf, ef)
-    }
-    /// The ISA's mantissa keeps the input's sign (as `frexp_mant_d` does); DXC's `frexp` drops it.
+    /// The ISA's mantissa keeps the input's sign (as `frexp_mant_d` does); 0 / Inf / NaN pass through.
     pub fn frexp_mant(&mut self, x: Value) -> Value {
-        let (m, _) = self.frexp_dxc(x);
-        let mb = self.bits(m);
-        let xb = self.bits(x);
-        let sign = self.andc(xb, 0x8000_0000);
-        let mb = self.or(mb, sign);
-        let m = self.f(mb);
-        let a = self.isinf(x);
-        let b = self.isnan(x);
-        let s = self.lor(a, b);
-        self.sel(s, x, m)
+        let i = self.bits(x);
+        let e_raw = self.andc(i, 0x7F80_0000);
+        let special = self.cmpc(Pred::Eq, e_raw, 0x7F80_0000);
+        let sign = self.andc(i, 0x8000_0000);
+        let norm = self.andc(i, 0x807F_FFFF);
+        let norm = self.orc(norm, 0x3F00_0000);
+        let z = self.fc(0.0);
+        let zero = self.fcmp(Pred::FOEq, x, z);
+        let mb = self.sel(zero, sign, norm);
+        let mb = self.sel(special, i, mb);
+        self.f(mb)
     }
     pub fn frexp_exp(&mut self, x: Value) -> Value {
-        let (_, e) = self.frexp_dxc(x);
-        let a = self.isinf(x);
-        let b = self.isnan(x);
-        let s = self.lor(a, b);
-        let ei = self.ftosi(e);
-        self.selc(s, 0, ei)
+        let i = self.bits(x);
+        let e_raw = self.andc(i, 0x7F80_0000);
+        let e = self.addc(e_raw, (-0x3F00_0000i32) as u32);
+        let e = self.ashrc(e, 23);
+        let z = self.fc(0.0);
+        let zero = self.fcmp(Pred::FOEq, x, z);
+        let special = self.cmpc(Pred::Eq, e_raw, 0x7F80_0000);
+        let zero_or_special = self.lor(zero, special);
+        self.selc(zero_or_special, 0, e)
     }
     pub fn frexp_exp_f32(&mut self, bits: Value, legacy_src: impl FnOnce(&mut Self) -> Value) -> Value {
         use super::lower_round::{F32_DENORM_INPUT_WRITTEN, VAR_F32_MODE};
@@ -302,15 +290,22 @@ impl Lw {
         self.ashrc(s, 8)
     }
     pub fn alignbit(&mut self, s0: Value, s1: Value, s: Value) -> Value {
-        let s = self.andc(s, 31);
-        let a = self.bin(BinOp::LShr, s1, s);
-        let k = self.c(32);
-        let t = self.sub(k, s);
-        let t = self.andc(t, 31);
-        let b = self.bin(BinOp::Shl, s0, t);
-        let r = self.or(a, b);
-        let z = self.cmpc(Pred::Eq, s, 0);
-        self.sel(z, s1, r)
+        if let Some(k) = self.s.m.const_u64(s) {
+            let sh = (k as u32) & 31;
+            if sh == 0 {
+                return s1;
+            }
+            let lo = self.lshrc(s1, sh);
+            let hi = self.shlc(s0, 32 - sh);
+            return self.or(hi, lo);
+        }
+        let sh = self.andc(s, 31);
+        let lo = self.bin(BinOp::LShr, s1, sh);
+        let k31 = self.c(31);
+        let inv = self.xor(sh, k31);
+        let s0_1 = self.shlc(s0, 1);
+        let hi = self.bin(BinOp::Shl, s0_1, inv);
+        self.or(hi, lo)
     }
     pub fn perm_b32(&mut self, s0: Value, s1: Value, sel: Value) -> Value {
         let mut r = self.c(0);
@@ -924,6 +919,93 @@ mod fclass_const_tests {
                 let want = ((mask >> ref_fclass(bits)) & 1) != 0;
                 let got = ((got_mask >> lane) & 1) != 0;
                 assert_eq!(got, want, "mask={mask:#05x} lane={lane} bits={bits:#010x}: got {got}, want {want}");
+            }
+        }
+    }
+
+    #[test]
+    fn gpu_direct_frexp_avoids_special_float_and_int_float_roundtrip() {
+        let ko = KernelOptions { wave64: false, split: false, mem_windows: 1, sampler_base: 0 };
+        let mut code = Vec::new();
+        code.extend(encode("V_FREXP_MANT_F32", "ENC_VOP1", &[("VDST", 1), ("SRC0", 256)], None).unwrap());
+        code.extend(encode("V_FREXP_EXP_I32_F32", "ENC_VOP1", &[("VDST", 2), ("SRC0", 256)], None).unwrap());
+        code.extend(encode("S_ENDPGM", "ENC_SOPP", &[], None).unwrap());
+        let dxil = translate(&code, ko).expect("translate frexp");
+        if crate::gpu::recomp::dxc::create_instance().is_some() {
+            validate::validate(&dxil).expect("validate frexp");
+            let dis = validate::disassemble(&dxil).expect("disassemble frexp");
+            assert!(!dis.contains("@dx.op.isSpecialFloat"), "unexpected isSpecialFloat:\n{dis}");
+            assert!(!dis.contains("sitofp "), "unexpected sitofp:\n{dis}");
+            assert!(!dis.contains("fptosi "), "unexpected fptosi:\n{dis}");
+        }
+        if runner::wave32_supported() != Ok(true) {
+            runner::skip_test("no wave32");
+            return;
+        }
+        // (bits, expected_mant, expected_exp) under D3D12 FTZ; ±subnormal -> (±0.0, 0).
+        const CASES: [(u32, u32, i32); 12] = [
+            (0x0000_0000, 0x0000_0000, 0),    // +0.0
+            (0x8000_0000, 0x8000_0000, 0),    // -0.0
+            (0x0000_0001, 0x0000_0000, 0),    // +subnormal (FTZ)
+            (0x8040_0000, 0x8000_0000, 0),    // -subnormal (FTZ)
+            (0x0080_0000, 0x3F00_0000, -125), // +min normal
+            (0xBF80_0000, 0xBF00_0000, 1),    // -1.0
+            (0x4060_0000, 0x3F60_0000, 2),    // +3.5
+            (0xC122_0000, 0xBF22_0000, 4),    // -10.125
+            (0x7F80_0000, 0x7F80_0000, 0),    // +Inf
+            (0xFF80_0000, 0xFF80_0000, 0),    // -Inf
+            (0x7F80_0001, 0x7F80_0001, 0),    // +sNaN
+            (0xFFC0_1234, 0xFFC0_1234, 0),    // -qNaN
+        ];
+        let mut st = KernelState::default();
+        for (lane, &(bits, _, _)) in CASES.iter().enumerate() {
+            st.vgpr[lane][0] = bits;
+        }
+        let r = runner::run(&dxil, &st, &[]).expect("GPU run frexp");
+        for (lane, &(bits, want_m, want_e)) in CASES.iter().enumerate() {
+            assert_eq!(r.vgpr[lane][1], want_m, "frexp_mant lane {lane} bits={bits:#010x}");
+            assert_eq!(r.vgpr[lane][2] as i32, want_e, "frexp_exp lane {lane} bits={bits:#010x}");
+        }
+    }
+
+    #[test]
+    fn gpu_direct_alignbit_is_select_free_and_matches_isa() {
+        let ko = KernelOptions { wave64: false, split: false, mem_windows: 1, sampler_base: 0 };
+        let mut code = Vec::new();
+        code.extend(encode("V_ALIGNBIT_B32", "ENC_VOP3", &[("VDST", 3), ("SRC0", 256), ("SRC1", 257), ("SRC2", 258)], None).unwrap());
+        for (i, sh) in [0u64, 1, 13, 31, 32].into_iter().enumerate() {
+            code.extend(encode("V_ALIGNBIT_B32", "ENC_VOP3", &[("VDST", 4 + i as u64), ("SRC0", 256), ("SRC1", 257), ("SRC2", 128 + sh)], None).unwrap());
+        }
+        code.extend(encode("V_ALIGNBYTE_B32", "ENC_VOP3", &[("VDST", 9), ("SRC0", 256), ("SRC1", 257), ("SRC2", 258)], None).unwrap());
+        code.extend(encode("S_ENDPGM", "ENC_SOPP", &[], None).unwrap());
+        let dxil = translate(&code, ko).expect("translate alignbit");
+        if crate::gpu::recomp::dxc::create_instance().is_some() {
+            validate::validate(&dxil).expect("validate alignbit");
+            let dis = validate::disassemble(&dxil).expect("disassemble alignbit");
+            assert_eq!(dis.matches(" = select i1 ").count(), 7, "only the 7 EXEC-mask VGPR writes may use select:\n{dis}");
+            assert_eq!(dis.matches("icmp eq i32 ").count(), 1, "only the lane-0 epilogue guard may use icmp eq:\n{dis}");
+            assert!(!dis.contains("sub i32 32,"), "unexpected sub-32 shift workaround:\n{dis}");
+        }
+        if runner::wave32_supported() != Ok(true) {
+            runner::skip_test("no wave32");
+            return;
+        }
+        let ref_ab = |s0: u32, s1: u32, s: u32| ((((s0 as u64) << 32) | (s1 as u64)) >> (s & 31)) as u32;
+        for base in [0u32, 32, 0xFFFF_FFE0] {
+            let mut st = KernelState::default();
+            for lane in 0..32usize {
+                st.vgpr[lane][0] = 0xA5C3_1E79u32.wrapping_add(lane as u32 * 0x0101_0101);
+                st.vgpr[lane][1] = 0x1234_5678u32.wrapping_add(lane as u32 * 0x1020_3040);
+                st.vgpr[lane][2] = base.wrapping_add(lane as u32);
+            }
+            let r = runner::run(&dxil, &st, &[]).expect("GPU run alignbit");
+            for lane in 0..32usize {
+                let (s0, s1, s) = (st.vgpr[lane][0], st.vgpr[lane][1], st.vgpr[lane][2]);
+                assert_eq!(r.vgpr[lane][3], ref_ab(s0, s1, s), "dyn alignbit base={base:#x} lane={lane} s={s:#x}");
+                for (i, sh) in [0u32, 1, 13, 31, 32].into_iter().enumerate() {
+                    assert_eq!(r.vgpr[lane][4 + i], ref_ab(s0, s1, sh), "const alignbit sh={sh} lane={lane}");
+                }
+                assert_eq!(r.vgpr[lane][9], ref_ab(s0, s1, (s & 3) * 8), "alignbyte base={base:#x} lane={lane} s={s:#x}");
             }
         }
     }
