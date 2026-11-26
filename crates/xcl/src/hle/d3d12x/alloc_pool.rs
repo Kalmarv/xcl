@@ -312,16 +312,24 @@ pub unsafe fn forget(alloc: usize) {
 /// recording on it, or this is off). `Some(hr)`: done here – the PC allocator in use was put
 /// aside with its recordings and another one took its place.
 pub unsafe fn title_reset(alloc: *mut c_void) -> Option<HRESULT> {
+    title_reset_with_after_unlock(alloc, || {})
+}
+
+unsafe fn title_reset_with_after_unlock(alloc: *mut c_void, after_unlock: impl FnOnce()) -> Option<HRESULT> {
     if !enabled() {
         return None;
     }
     let mut g = STATE.lock().unwrap();
     let s = g.get_or_insert_with(State::default);
     let hr = title_reset_in(s, alloc, |raw| super::real::reset_pc_allocator(raw));
-    let free = free_aside(s);
+    // Detach while the pool lock still protects the free decision: another title Reset may
+    // reuse this backing as soon as the lock is released and record new commands on it.
+    let free: Vec<_> = free_aside(s).into_iter()
+        .filter_map(super::real::dispatch_chain::detach_recordings).collect();
     drop(g);
-    for b in free {
-        super::real::dispatch_chain::allocator_reset(b);
+    after_unlock();
+    for recordings in free {
+        recordings.release();
     }
     hr
 }
@@ -395,6 +403,49 @@ unsafe fn title_reset_in(s: &mut State, alloc: *mut c_void, mut reset: impl FnMu
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn a_free_spare_reused_after_a_sweep_keeps_its_new_chain_recording() {
+        use super::super::real::dispatch_chain::{holds_recordings_for_test as holds, note_recordings_for_test as note};
+        let mut ids = Box::new([0u8; 5]);
+        let base = ids.as_mut_ptr() as usize;
+        let (title, spare, busy, list, trigger) = (base, base + 1, base + 2, base + 3, base + 4);
+        {
+            let mut g = STATE.lock().unwrap();
+            let s = g.get_or_insert_with(State::default);
+            s.aside.insert(title, vec![spare]);
+            s.cur.insert(title, busy);
+            s.types.insert(title, D3D12_COMMAND_LIST_TYPE_DIRECT.0);
+            s.backings.entry(spare).or_default();
+            s.backings.entry(busy).or_default().users.insert(list);
+        }
+        note(spare);
+        unsafe {
+            title_reset_with_after_unlock(trigger as *mut c_void, || {
+                let mut g = STATE.lock().unwrap();
+                let s = g.as_mut().unwrap();
+                let hr = title_reset_in(s, title as *mut c_void, |raw| {
+                    assert_eq!(raw as usize, spare);
+                    super::super::real::dispatch_chain::allocator_reset(spare);
+                    0
+                });
+                assert_eq!(hr, Some(0));
+                note(spare);
+            });
+        }
+        let kept = holds(spare);
+        {
+            let mut g = STATE.lock().unwrap();
+            let s = g.as_mut().unwrap();
+            s.aside.remove(&title);
+            s.cur.remove(&title);
+            s.types.remove(&title);
+            s.backings.remove(&spare);
+            s.backings.remove(&busy);
+        }
+        super::super::real::dispatch_chain::allocator_reset(spare);
+        assert!(kept, "a sweep removed the chain recording made after the spare was reused");
+    }
 
     #[test]
     fn a_spare_whose_reset_fails_stays_available_for_retry() {
