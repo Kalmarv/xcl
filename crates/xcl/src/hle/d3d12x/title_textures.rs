@@ -1501,6 +1501,11 @@ const TITLE_BYTES_KEPT: usize = 64 << 20;
 /// thread – the title can decommit its other memory from another thread at any moment, and a
 /// read in place then faults.
 unsafe fn with_title_bytes<R>(at: usize, len: usize, f: impl FnOnce(&[u8]) -> R) -> R {
+    // a GPU_UPLOAD segment of a mixed driver window: by the GPU's copy (CPU reads of that video
+    // memory through the BAR are slow)
+    if let Some(bytes) = super::uma_driver::read_vram_bytes(at, len) {
+        return f(&bytes);
+    }
     if crate::gpu::uma::get().is_some_and(|u| u.in_committed_window(at, len)) {
         return f(std::slice::from_raw_parts(at as *const u8, len));
     }

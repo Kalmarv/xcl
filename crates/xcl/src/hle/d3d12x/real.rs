@@ -171,7 +171,21 @@ pub fn abi_root_signature() -> Option<ID3D12RootSignature> {
 /// lifetime.
 static UMA_BUFFER: Mutex<Vec<(usize, u64)>> = Mutex::new(Vec::new());
 /// the committed UMA windows opened as D3D12 heaps (indexed by window `k`; `None` for sparse windows)
-static UMA_HEAPS: Mutex<Vec<Option<usize>>> = Mutex::new(Vec::new());
+/// Window heaps for `CreatePlacedResource` inside coherent UMA windows: for each window `k`,
+/// contiguous `(seg_offset, seg_len, heap_raw)` segments (1 entry for single-heap windows, N for
+/// `XCL_UMA_DRIVER=mixed:...`).
+static UMA_HEAPS: Mutex<Vec<Vec<(usize, usize, usize)>>> = Mutex::new(Vec::new());
+
+fn uma_heap_for(k: usize, offset: usize, len: usize) -> Option<(usize, usize)> {
+    let g = UMA_HEAPS.lock().unwrap();
+    let segs = g.get(k)?;
+    for &(seg_off, seg_len, heap_raw) in segs {
+        if offset >= seg_off && offset.saturating_add(len) <= seg_off.saturating_add(seg_len) {
+            return Some((heap_raw, offset - seg_off));
+        }
+    }
+    None
+}
 /// console buffers placed in unified memory: resource → (address, bytes)
 /// address, bytes, whether XCL allocated the memory (not: the title's own, CreatePlacedResourceX)
 type UmaBuffer = (usize, usize, bool);
@@ -303,13 +317,16 @@ unsafe fn open_uma(device: &ID3D12Device, allow_driver_remap: bool) {
         *UMA_ERROR.lock().unwrap() = "no UMA region".into();
         return;
     };
-    let open = |k: usize| -> Result<(usize, u64, usize), String> {
+    let open = |k: usize| -> Result<(usize, u64, Vec<(usize, usize, usize)>), String> {
         let (base, size) = u.window(k);
         if allow_driver_remap && super::uma_driver::wanted(device) {
-            match super::uma_driver::remake(device, base, size) {
-                Ok((heap, buf)) => {
+            match super::uma_driver::remake_window(device, base, size) {
+                Ok(remade) => {
                     u.set_driver_window(k);
-                    return Ok(super::uma_driver::raw(heap, buf));
+                    if let Some(segs) = remade.watched_regions {
+                        crate::gpu::uma::set_driver_watch_segments(k, segs);
+                    }
+                    return Ok((remade.buf_raw, remade.gpu_va, remade.heaps));
                 }
                 Err(e) => crate::xlog_warn!("D3D12.X: coherent window {k} stays imported: {e}"),
             }
@@ -331,19 +348,19 @@ unsafe fn open_uma(device: &ID3D12Device, allow_driver_remap: bool) {
         device.CreatePlacedResource(&heap, 0, &desc, D3D12_RESOURCE_STATE_COMMON, None, &mut buf).map_err(|e| format!("CreatePlacedResource: {e}"))?;
         let buf = buf.ok_or("CreatePlacedResource")?;
         let va = buf.GetGPUVirtualAddress();
-        Ok((buf.into_raw() as usize, va, heap.into_raw() as usize))
+        Ok((buf.into_raw() as usize, va, vec![(0, size, heap.into_raw() as usize)]))
     };
     let n = u.shader_windows();
     let mut bufs: Vec<(usize, u64)> = vec![(0, 0); n];
-    let mut heaps: Vec<Option<usize>> = vec![None; n];
+    let mut heaps: Vec<Vec<(usize, usize, usize)>> = vec![Vec::new(); n];
     for k in 0..n {
         if !u.is_committed_window(k) {
             continue;
         }
         match open(k) {
-            Ok((buf_raw, va, heap_raw)) => {
+            Ok((buf_raw, va, win_heaps)) => {
                 bufs[k] = (buf_raw, va);
-                heaps[k] = Some(heap_raw);
+                heaps[k] = win_heaps;
             }
             Err(e) => {
                 crate::xlog_warn!("D3D12.X: UMA not available to the GPU: {e}");
@@ -1353,6 +1370,27 @@ const COHERENT_FLOOR: usize = 16 << 20;
 /// committed textures leave (`COHERENT_KEPT`) is kept for these: with the textures at that
 /// limit (Unicorn Overlord's), a second 128 MB of headroom sent every readback buffer to the
 /// sparse windows.
+/// A block of `size` bytes from `u` that one heap holds (`heap_of(p)`). A block across two
+/// segments of a mixed window has none: it is held while the next fit is tried (which then starts
+/// past it), and given back either way.
+fn alloc_in_one_heap<T>(u: &crate::gpu::uma::Uma, size: usize, heap_of: impl Fn(usize) -> Option<T>) -> Option<(usize, T)> {
+    let mut held = Vec::new();
+    let found = loop {
+        let Some(p) = u.alloc(size, 0x1_0000).map(|a| a as usize) else { break None };
+        if let Some(h) = heap_of(p) {
+            break Some((p, h));
+        }
+        held.push(p);
+        if held.len() == 4 {
+            break None;
+        }
+    };
+    for p in held {
+        u.free(p);
+    }
+    found
+}
+
 fn has_coherent_headroom(u: &crate::gpu::uma::Uma, rounded: usize) -> bool {
     u.size().saturating_sub(u.used()) >= COHERENT_FLOOR.min(u.size() / 8).saturating_add(rounded)
 }
@@ -1441,17 +1479,16 @@ unsafe fn place_console_buffer(this: *mut c_void, props: usize, desc: usize, sta
             return Some(hr);
         }
     }
-    let Some(p) = u.alloc(rounded, 0x1_0000).map(|a| a as usize) else {
+    let heap_of = |p: usize| u.window_of(p).and_then(|k| uma_heap_for(k, p - u.window(k).0, rounded).map(|h| (k, h)));
+    let Some((p, (k, (heap, heap_off)))) = alloc_in_one_heap(u, rounded, heap_of) else {
         if prefer_coherent && u.has_sparse() {
             return place_console_buffer_sparse(this, &d, bytes, st, readback_on_null_map, riid, ppv);
         }
         return None;
     };
     // the heap from OpenExistingHeapFromAddress is cross-adapter: row-major + sanitized flags & state
-    let k = u.window_of(p)?;
     let (d, st) = sanitize_coherent_buffer(&d, state, !u.is_driver_window(k));
-    let heap = (*UMA_HEAPS.lock().unwrap().get(k)?)?;
-    let hr = dev_create_placed_resource(this, heap, p - u.window(k).0, &d as *const _ as usize, st as usize, clear, riid, ppv);
+    let hr = dev_create_placed_resource(this, heap, heap_off, &d as *const _ as usize, st as usize, clear, riid, ppv);
     if hr < 0 || (*ppv).is_null() {
         u.free(p);
         static ONCE: AtomicU64 = AtomicU64::new(0);
@@ -1505,14 +1542,14 @@ pub(super) unsafe fn place_at_title_address(this: *mut c_void, va: usize, desc: 
         }
         return Some(hr);
     }
-    let heap = (*UMA_HEAPS.lock().unwrap().get(k)?)?;
+    let (heap, heap_off) = uma_heap_for(k, start - base, delta + bytes)?;
     if !u.is_driver_window(k) {
         d.Flags |= D3D12_RESOURCE_FLAG_ALLOW_CROSS_ADAPTER;
     }
     d.Layout = D3D12_TEXTURE_LAYOUT_ROW_MAJOR;
     d.Alignment = 0;
     d.Width = (delta + bytes) as u64;
-    let hr = dev_create_placed_resource(this, heap, start - base, &d as *const _ as usize, state as usize, clear as usize, riid, ppv);
+    let hr = dev_create_placed_resource(this, heap, heap_off, &d as *const _ as usize, state as usize, clear as usize, riid, ppv);
     if hr < 0 || (*ppv).is_null() {
         return None;
     }
@@ -9159,3 +9196,27 @@ void main() {
     }
 }
 
+
+#[cfg(test)]
+mod uma_heap_tests {
+    use super::*;
+
+    /// A console buffer whose first fit crosses two segments of a mixed window goes to the next
+    /// fit, and the crossing block is given back (it stayed charged to the window).
+    #[test]
+    fn a_block_across_two_segments_is_given_back_and_the_next_fit_used() {
+        let u = crate::gpu::uma::Uma::with_windows(1, 4 << 20).expect("one UMA window");
+        let (w0, _) = u.window(0);
+        let first = u.alloc(960 << 10, 0x1_0000).expect("first block") as usize;
+        assert_eq!(first, w0);
+        let used = u.used();
+        let boundary = w0 + (1 << 20);
+        let heap_of = |p: usize| (p + (128 << 10) <= boundary || p >= boundary).then_some(());
+        let (p, ()) = alloc_in_one_heap(&u, 128 << 10, heap_of).expect("a block in one segment");
+        assert_eq!(p, w0 + (1088 << 10));
+        assert_eq!(u.used(), used + (128 << 10));
+        assert_eq!(u.alloc(64 << 10, 0x1_0000).map(|a| a as usize), Some(w0 + (960 << 10)));
+        assert!(alloc_in_one_heap(&u, 64 << 10, |_| None::<()>).is_none());
+        assert_eq!(u.used(), used + (192 << 10));
+    }
+}

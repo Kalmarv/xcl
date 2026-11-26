@@ -575,7 +575,11 @@ impl Uma {
             match self.kinds[k] {
                 WindowKind::None => k += 1,
                 WindowKind::Committed(s) => {
-                    out.push((self.base + k * WINDOW, s));
+                    if let Some(segs) = driver_watch_segments(k) {
+                        out.extend(segs);
+                    } else {
+                        out.push((self.base + k * WINDOW, s));
+                    }
                     k += 1;
                 }
                 WindowKind::Sparse => {
@@ -861,6 +865,25 @@ impl Uma {
 
 /// The title's graphics memory (created on first use; `XCL_UMA_MB`, default 2048;
 /// `XCL_UMA_WINDOWS=4|8|16`, default 4, with 8/16 requiring `XCL_HEAP_WINDOWS=1`).
+/// Per-window write-watched sub-ranges of mixed driver windows (`XCL_UMA_DRIVER=mixed:...`): only
+/// their CUSTOM segments are write-watched, not the GPU_UPLOAD one.
+static DRIVER_WATCH_SEGMENTS: Mutex<Vec<(usize, Vec<(usize, usize)>)>> = Mutex::new(Vec::new());
+
+/// Window `k` was remade as several driver-heap segments; only `segs` are write-watched.
+pub fn set_driver_watch_segments(k: usize, segs: Vec<(usize, usize)>) {
+    let mut g = DRIVER_WATCH_SEGMENTS.lock().unwrap();
+    if let Some(entry) = g.iter_mut().find(|(wk, _)| *wk == k) {
+        entry.1 = segs;
+    } else {
+        g.push((k, segs));
+    }
+}
+
+fn driver_watch_segments(k: usize) -> Option<Vec<(usize, usize)>> {
+    let g = DRIVER_WATCH_SEGMENTS.lock().unwrap();
+    g.iter().find(|(wk, _)| *wk == k).map(|(_, segs)| segs.clone())
+}
+
 pub fn get() -> Option<&'static Uma> {
     GLOBAL
         .get_or_init(|| {
