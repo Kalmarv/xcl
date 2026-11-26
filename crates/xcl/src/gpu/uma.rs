@@ -562,7 +562,9 @@ impl Uma {
             match self.kinds[k] {
                 WindowKind::None => k += 1,
                 WindowKind::Committed(s) => {
-                    if driver & (1 << k) == 0 {
+                    if let Some(segs) = driver_watch_segments(k) {
+                        out.extend(segs);
+                    } else if driver & (1 << k) == 0 {
                         out.push((self.base + k * WINDOW, s));
                     }
                     k += 1;
@@ -852,10 +854,27 @@ impl Uma {
 /// `XCL_UMA_WINDOWS=4|8|16`, default 4, with 8/16 requiring `XCL_HEAP_WINDOWS=1`).
 /// (scratch) windows remade as driver heaps (`XCL_UMA_DRIVER`) without write watch
 static DRIVER_WINDOWS: std::sync::atomic::AtomicU32 = std::sync::atomic::AtomicU32::new(0);
+/// Per-window watched sub-ranges for mixed driver windows (each sub-range is its own heap mapping).
+static DRIVER_WATCH_SEGMENTS: Mutex<Vec<(usize, Vec<(usize, usize)>)>> = Mutex::new(Vec::new());
 
 /// Window `k` is a driver heap now that is not write-watched.
 pub fn set_driver_window(k: usize) {
     DRIVER_WINDOWS.fetch_or(1 << k, std::sync::atomic::Ordering::Relaxed);
+}
+
+/// Window `k` was remade as multiple contiguous driver-heap segments; only `segs` are write-watched.
+pub fn set_driver_watch_segments(k: usize, segs: Vec<(usize, usize)>) {
+    let mut g = DRIVER_WATCH_SEGMENTS.lock().unwrap();
+    if let Some(entry) = g.iter_mut().find(|(wk, _)| *wk == k) {
+        entry.1 = segs;
+    } else {
+        g.push((k, segs));
+    }
+}
+
+fn driver_watch_segments(k: usize) -> Option<Vec<(usize, usize)>> {
+    let g = DRIVER_WATCH_SEGMENTS.lock().unwrap();
+    g.iter().find(|(wk, _)| *wk == k).map(|(_, segs)| segs.clone())
 }
 
 pub fn get() -> Option<&'static Uma> {

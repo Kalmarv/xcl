@@ -1801,6 +1801,9 @@ unsafe fn subresources_on(picked: &[(usize, &xg::Texture)], threads: usize) -> V
 /// run. Elsewhere the title can decommit a page between a readability check and the detile's
 /// read of it (an access violation in the detile, #751), which `read_committed` survives.
 unsafe fn title_bytes(at: usize, len: usize) -> std::borrow::Cow<'static, [u8]> {
+    if let Some(bytes) = super::uma_driver::read_vram_bytes(at, len) {
+        return std::borrow::Cow::Owned(bytes);
+    }
     if crate::gpu::uma::get().is_some_and(|u| u.in_committed_window(at, len)) {
         std::borrow::Cow::Borrowed(std::slice::from_raw_parts(at as *const u8, len))
     } else {
