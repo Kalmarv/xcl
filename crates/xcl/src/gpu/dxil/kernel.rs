@@ -199,10 +199,19 @@ fn translate_entry(
     // a register's definition and its use): a thread with a large stack for big programs
     let outline = matches!(entry, Entry::Kernel | Entry::Compute(_)) && outline_enabled();
     let code = code.to_vec();
+    // tests: the caller's choice of optimiser passes goes along to the translator thread
+    #[cfg(test)]
+    let no_fold = (super::module::NO_SELECT_FOLD.with(|c| c.get()), super::module::NO_PAIR_FOLD.with(|c| c.get()));
     std::thread::Builder::new()
         .name("xcl-dxil-translate".into())
         .stack_size(256 << 20)
-        .spawn(move || translate_on_this_thread(&code, o, entry, compact, nest, tables, outline))
+        .spawn(move || {
+            #[cfg(test)]
+            super::module::NO_SELECT_FOLD.with(|c| c.set(no_fold.0));
+            #[cfg(test)]
+            super::module::NO_PAIR_FOLD.with(|c| c.set(no_fold.1));
+            translate_on_this_thread(&code, o, entry, compact, nest, tables, outline)
+        })
         .map_err(|e| format!("translator thread: {e}"))?
         .join()
         .map_err(|e| {

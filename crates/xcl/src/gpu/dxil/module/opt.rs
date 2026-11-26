@@ -10,7 +10,7 @@
 
 use std::collections::HashMap;
 
-use super::{BinOp, Block, CastOp, FnAttrs, Module, Op, Pred, Ty, Value};
+use super::{BinOp, Block, CastOp, ConstDef, FnAttrs, Module, Op, Pred, Ty, TypeDef, Value};
 
 impl Op {
     /// Calls `f` on every value operand.
@@ -68,6 +68,14 @@ impl Op {
     }
 }
 
+#[cfg(test)]
+thread_local! {
+    /// Tests: leave out `fold_guarded_selects` on this thread (the form to compare against).
+    pub(crate) static NO_SELECT_FOLD: std::cell::Cell<bool> = const { std::cell::Cell::new(false) };
+    /// Tests: leave out `fold_bitcast_pairs` on this thread.
+    pub(crate) static NO_PAIR_FOLD: std::cell::Cell<bool> = const { std::cell::Cell::new(false) };
+}
+
 /// How an instruction may be merged with an identical one.
 #[derive(PartialEq)]
 enum Cse {
@@ -106,10 +114,108 @@ impl Module {
         }
     }
 
+    fn zext_src(&self, v: Value) -> Option<(Value, u32)> {
+        let Value::Inst(j) = v else { return None };
+        let Op::Cast(CastOp::ZExt, inner, _) = self.insts[j as usize].op else { return None };
+        self.int_width(self.value_ty(inner)).map(|sw| (inner, sw))
+    }
+
+    /// Reinterprets `v` as `to` for free: inverse `BitCast`, dominating `BitCast` in CSE,
+    /// or finite constant bitcast (excluding NaN and Inf in both directions).
+    fn free_bitcast(&mut self, v: Value, to: Ty, table: &HashMap<(Op, Ty), Value>) -> Option<Value> {
+        let from = self.value_ty(v);
+        if self.types[from.0 as usize] == TypeDef::Double || self.types[to.0 as usize] == TypeDef::Double {
+            return None;
+        }
+        if let Value::Inst(j) = v {
+            if let Op::Cast(CastOp::BitCast, inner, _) = self.insts[j as usize].op {
+                if self.value_ty(inner) == to {
+                    return Some(inner);
+                }
+            }
+        }
+        if let Some(&hit) = table.get(&(Op::Cast(CastOp::BitCast, v, to), to)) {
+            return Some(hit);
+        }
+        let fbits = |v| match v {
+            Value::Const(c) => match &self.consts[c as usize] {
+                ConstDef::Float(_, b) => Some(*b),
+                ConstDef::Null(t) if self.is_float(*t) => Some(0),
+                _ => None,
+            },
+            _ => None,
+        };
+        match (&self.types[from.0 as usize], &self.types[to.0 as usize]) {
+            (TypeDef::Int(32), TypeDef::Float) => self.const_u64(v).filter(|&b| (b as u32 & 0x7FFF_FFFF) < 0x7F80_0000).map(|b| self.const_float(to, b & 0xFFFF_FFFF)),
+            (TypeDef::Float, TypeDef::Int(32)) => fbits(v).filter(|&b| (b as u32 & 0x7FFF_FFFF) < 0x7F80_0000).map(|b| self.const_int(to, b & 0xFFFF_FFFF)),
+            (TypeDef::Int(16), TypeDef::Half) => self.const_u64(v).filter(|&b| (b as u16 & 0x7FFF) < 0x7C00).map(|b| self.const_float(to, b & 0xFFFF)),
+            (TypeDef::Half, TypeDef::Int(16)) => fbits(v).filter(|&b| (b as u16 & 0x7FFF) < 0x7C00).map(|b| self.const_int(to, b & 0xFFFF)),
+            _ => None,
+        }
+    }
+
+    /// Pushes `bitcast(select(c, a, b), to)` into `select` in place when `select` has no
+    /// non-bitcast uses (so the original select dies in DCE) and both arms convert for free,
+    /// returning the original `(op, ty)` so CSE can still reuse the bitcast key in dominated blocks.
+    fn simplify_bitcast_select(&mut self, op: &mut Op, repl: &mut [Option<Value>], table: &HashMap<(Op, Ty), Value>, bc_only: &[Option<Option<Ty>>]) -> Option<(Op, Ty)> {
+        let Op::Cast(CastOp::BitCast, Value::Inst(j), to) = *op else { return None };
+        if bc_only[j as usize] != Some(Some(to)) {
+            return None;
+        }
+        let Op::Select(c, t, f) = self.insts[j as usize].op else { return None };
+        let nt = self.free_bitcast(resolve(repl, t), to, table)?;
+        let nf = self.free_bitcast(resolve(repl, f), to, table)?;
+        let orig = (op.clone(), to);
+        *op = Op::Select(resolve(repl, c), resolve(repl, nt), resolve(repl, nf));
+        Some(orig)
+    }
+
+    /// Collapses nested same-condition selects (`select(c, t, select(c, _, f)) -> select(c, t, f)`).
+    fn simplify_select(&self, op: &mut Op, ty: Ty, repl: &mut [Option<Value>]) {
+        let Op::Select(c, t, f) = op else { return };
+        if self.types[ty.0 as usize] == TypeDef::Double {
+            return;
+        }
+        if let Value::Inst(j) = *f {
+            if let Op::Select(c2, _, f2) = self.insts[j as usize].op {
+                if resolve(repl, c2) == *c {
+                    *f = resolve(repl, f2);
+                }
+            }
+        }
+        if let Value::Inst(j) = *t {
+            if let Op::Select(c2, t2, _) = self.insts[j as usize].op {
+                if resolve(repl, c2) == *c {
+                    *t = resolve(repl, t2);
+                }
+            }
+        }
+    }
+
+    /// Canonicalizes operand order on commutative integer ops and integer compares for CSE.
+    fn canonicalize_commutative(&self, op: &mut Op, ty: Ty) {
+        match op {
+            Op::Bin(BinOp::Add | BinOp::Mul | BinOp::And | BinOp::Or | BinOp::Xor, a, b, _)
+                if self.int_width(ty).is_some() && *b < *a => std::mem::swap(a, b),
+            Op::Cmp(p, a, b) if self.int_width(self.value_ty(*a)).is_some() && *b < *a => {
+                *p = match *p {
+                    Pred::Eq => Pred::Eq, Pred::Ne => Pred::Ne,
+                    Pred::UGt => Pred::ULt, Pred::ULt => Pred::UGt,
+                    Pred::UGe => Pred::ULe, Pred::ULe => Pred::UGe,
+                    Pred::SGt => Pred::SLt, Pred::SLt => Pred::SGt,
+                    Pred::SGe => Pred::SLe, Pred::SLe => Pred::SGe,
+                    _ => return,
+                };
+                std::mem::swap(a, b);
+            }
+            _ => {}
+        }
+    }
+
     /// Cheap algebraic & constant simplification on already-resolved operands.
-    fn simplify_op(&mut self, op: &Op, ty: Ty) -> Option<Value> {
-        // Keep 64-bit instructions intact so Int64Ops / Doubles shader flags stay consistent.
-        if matches!(self.types[ty.0 as usize], super::TypeDef::Int(64) | super::TypeDef::Double) {
+    fn simplify_op(&mut self, op: &Op, ty: Ty, table: &HashMap<(Op, Ty), Value>) -> Option<Value> {
+        // Keep f64 instructions intact so Doubles / DoubleExtensions shader flags stay consistent.
+        if matches!(self.types[ty.0 as usize], TypeDef::Double) {
             return None;
         }
         match *op {
@@ -120,18 +226,19 @@ impl Module {
                 match self.const_u64(c) {
                     Some(1) => Some(t),
                     Some(0) => Some(f),
-                    _ => None,
+                    _ => (self.int_width(ty) == Some(1) && self.const_u64(t) == Some(1) && self.const_u64(f) == Some(0))
+                        .then_some(c),
                 }
             }
             Op::Bin(bop, a, b, 0) => {
                 let w = self.int_width(ty)?;
-                // avoid dropping 64-bit ops that keep Int64Ops shader flags consistent
-                if w > 32 {
+                if w > 64 {
                     return None;
                 }
-                let mask = (1u64 << w) - 1;
+                let mask = if w >= 64 { u64::MAX } else { (1u64 << w) - 1 };
                 let (ca, cb) = (self.const_u64(a), self.const_u64(b));
                 if let (Some(x), Some(y)) = (ca, cb) {
+                    let sx = if w >= 64 { x as i64 } else { ((x << (64 - w)) as i64) >> (64 - w) };
                     let r = match bop {
                         BinOp::Add => Some(x.wrapping_add(y)),
                         BinOp::Sub => Some(x.wrapping_sub(y)),
@@ -141,7 +248,7 @@ impl Module {
                         BinOp::Xor => Some(x ^ y),
                         BinOp::Shl if y < w as u64 => Some(x << y),
                         BinOp::LShr if y < w as u64 => Some(x >> y),
-                        BinOp::AShr if y < w as u64 => Some((((x << (64 - w)) as i64) >> (64 - w + y as u32)) as u64),
+                        BinOp::AShr if y < w as u64 => Some((sx >> (y as u32)) as u64),
                         BinOp::UDiv if y != 0 => Some(x / y),
                         BinOp::URem if y != 0 => Some(x % y),
                         _ => None,
@@ -248,6 +355,30 @@ impl Module {
                             }
                         }
                     }
+                    BinOp::LShr => {
+                        if let Some(sh) = cb.filter(|&sh| sh < w as u64) {
+                            if self.zext_src(a).is_some_and(|(_, sw)| sh >= sw as u64) {
+                                return Some(self.const_int(ty, 0));
+                            }
+                            if let Value::Inst(j) = a {
+                                if let Op::Bin(BinOp::Or, x, y, 0) = self.insts[j as usize].op {
+                                    for (lo, hi) in [(x, y), (y, x)] {
+                                        let lo_cleared = self.const_u64(lo) == Some(0)
+                                            || self.zext_src(lo).is_some_and(|(_, sw)| sh >= sw as u64);
+                                        if let (true, Value::Inst(hj)) = (lo_cleared, hi) {
+                                            if let Op::Bin(BinOp::Shl, z, k, 0) = self.insts[hj as usize].op {
+                                                if self.const_u64(k) == Some(sh)
+                                                    && self.zext_src(z).is_some_and(|(_, sw)| (sw as u64) + sh <= w as u64)
+                                                {
+                                                    return Some(z);
+                                                }
+                                            }
+                                        }
+                                    }
+                                }
+                            }
+                        }
+                    }
                     _ => {}
                 }
                 None
@@ -255,11 +386,12 @@ impl Module {
             Op::Cmp(p, a, b) => {
                 let at = self.value_ty(a);
                 let w = self.int_width(at)?;
-                if w > 32 {
+                if w > 64 {
                     return None;
                 }
-                if let (Some(x), Some(y)) = (self.const_u64(a), self.const_u64(b)) {
-                    let sx = |v: u64| ((v << (64 - w)) as i64) >> (64 - w);
+                let (ca, cb) = (self.const_u64(a), self.const_u64(b));
+                if let (Some(x), Some(y)) = (ca, cb) {
+                    let sx = |v: u64| if w >= 64 { v as i64 } else { ((v << (64 - w)) as i64) >> (64 - w) };
                     let r = match p {
                         Pred::Eq => Some(x == y),
                         Pred::Ne => Some(x != y),
@@ -287,29 +419,53 @@ impl Module {
                         return Some(self.const_int(ty, r as u64));
                     }
                 }
-                None
-            }
-            Op::Cast(CastOp::BitCast, Value::Inst(j), to) => {
-                if matches!(self.types[self.insts[j as usize].ty.0 as usize], super::TypeDef::Int(64) | super::TypeDef::Double) {
-                    return None;
+                if w == 1 {
+                    if matches!((p, cb), (Pred::Eq, Some(1)) | (Pred::Ne, Some(0))) {
+                        return Some(a);
+                    }
+                    if matches!((p, ca), (Pred::Eq, Some(1)) | (Pred::Ne, Some(0))) {
+                        return Some(b);
+                    }
                 }
-                if let Op::Cast(CastOp::BitCast, inner, _) = self.insts[j as usize].op {
-                    if self.value_ty(inner) == to {
+                if let Some((inner, 1)) = self.zext_src(a) {
+                    if matches!((p, cb), (Pred::Ne | Pred::UGt, Some(0)) | (Pred::Eq, Some(1))) {
+                        return Some(inner);
+                    }
+                }
+                if let Some((inner, 1)) = self.zext_src(b) {
+                    if matches!((p, ca), (Pred::Ne | Pred::ULt, Some(0)) | (Pred::Eq, Some(1))) {
                         return Some(inner);
                     }
                 }
                 None
             }
+            Op::Cast(CastOp::BitCast, v, to) => self.free_bitcast(v, to, table),
             Op::Cast(cop @ (CastOp::ZExt | CastOp::SExt | CastOp::Trunc), v, to) => {
                 let sw = self.int_width(self.value_ty(v))?;
                 let dw = self.int_width(to)?;
-                if sw > 32 || dw > 32 {
+                if sw > 64 || dw > 64 {
                     return None;
                 }
+                if sw == dw {
+                    return Some(v);
+                }
+                if cop == CastOp::Trunc {
+                    if let Value::Inst(j) = v {
+                        if let Op::Cast(CastOp::ZExt | CastOp::SExt, inner, _) = self.insts[j as usize].op {
+                            if self.value_ty(inner) == to {
+                                return Some(inner);
+                            }
+                        }
+                    }
+                }
                 let x = self.const_u64(v)?;
+                let dm = if dw >= 64 { u64::MAX } else { (1u64 << dw) - 1 };
                 let r = match cop {
-                    CastOp::ZExt | CastOp::Trunc => x & ((1u64 << dw) - 1),
-                    CastOp::SExt => ((((x << (64 - sw)) as i64) >> (64 - sw)) as u64) & ((1u64 << dw) - 1),
+                    CastOp::ZExt | CastOp::Trunc => x & dm,
+                    CastOp::SExt => {
+                        let sx = if sw >= 64 { x as i64 } else { ((x << (64 - sw)) as i64) >> (64 - sw) };
+                        (sx as u64) & dm
+                    }
                     _ => unreachable!(),
                 };
                 Some(self.const_int(to, r))
@@ -318,8 +474,8 @@ impl Module {
         }
     }
 
-    /// Whether an unused instruction can go. 64-bit values stay: helpers already set
-    /// the Int64Ops / Doubles / DoubleExtensions flags for them.
+    /// Whether an unused instruction can go. Double values stay: helpers already set
+    /// the Doubles / DoubleExtensions flags for them (`Int64Ops` is refreshed in `infer_type_features`).
     fn removable(&self, op: &Op, ty: Ty, wide: &[Ty]) -> bool {
         if wide.contains(&ty) {
             return false;
@@ -337,9 +493,15 @@ impl Module {
                 let d = &self.funcs[*f as usize];
                 matches!(d.attrs, FnAttrs::ReadNone | FnAttrs::ReadOnly)
                     && !d.name.ends_with(".f64")
-                    && ["dx.op.unary.", "dx.op.binary.", "dx.op.tertiary.", "dx.op.loadInput.", "dx.op.annotateHandle", "dx.op.createHandleFromBinding", "dx.op.cbufferLoadLegacy."]
-                        .iter()
-                        .any(|p| d.name.starts_with(p))
+                    && [
+                        "dx.op.unary.", "dx.op.unaryBits.", "dx.op.binary.", "dx.op.tertiary.", "dx.op.quaternary.",
+                        "dx.op.dot", "dx.op.legacyF16ToF32", "dx.op.legacyF32ToF16", "dx.op.bitcast",
+                        "dx.op.isSpecialFloat.", "dx.op.threadId", "dx.op.groupId.", "dx.op.flattenedThreadIdInGroup.",
+                        "dx.op.loadInput.", "dx.op.annotateHandle", "dx.op.createHandleFromBinding",
+                        "dx.op.cbufferLoadLegacy.",
+                    ]
+                    .iter()
+                    .any(|p| d.name.starts_with(p))
             }
             _ => false,
         }
@@ -427,7 +589,7 @@ impl Module {
     /// Cleans up the entry function (see the module docs of `opt`). Values
     /// keep their identities; replaced ones simply lose their uses.
     ///
-    /// `XCL_DXIL_NO_OPT=phi,cse,dce,merge` (any subset, or `all`) skips passes, for bisecting.
+    /// `XCL_DXIL_NO_OPT=phi,fold,cse,select,pairs,dce,merge` (any subset, or `all`) skips passes, for bisecting.
     pub fn optimize(&mut self) {
         let off = std::env::var("XCL_DXIL_NO_OPT").unwrap_or_default();
         let skip = |p: &str| off.split(',').any(|x| x.trim() == p || x.trim() == "all");
@@ -508,7 +670,42 @@ impl Module {
             Enter(usize),
             Leave(usize),
         }
-        let mut stack = if skip("cse") { Vec::new() } else { vec![Step::Enter(0)] };
+        let (do_fold, do_cse) = (!skip("fold"), !skip("cse"));
+        // None = unseen, Some(Some(to)) = only used by BitCast(_, to), Some(None) = other use.
+        let mut bc_only: Vec<Option<Option<Ty>>> = vec![None; if do_fold { self.insts.len() } else { 0 }];
+        if do_fold {
+            for &b in &order {
+                for &u in &self.blocks[b as usize] {
+                    if repl[u as usize].is_some() {
+                        continue;
+                    }
+                    match self.insts[u as usize].op {
+                        Op::Cast(CastOp::BitCast, v, to) => if let Value::Inst(j) = resolve(&mut repl, v) {
+                            bc_only[j as usize] = match bc_only[j as usize] {
+                                None => Some(Some(to)),
+                                Some(Some(prev)) if prev == to => Some(Some(to)),
+                                _ => Some(None),
+                            };
+                        },
+                        Op::Select(c, t, f) if self.types[self.insts[u as usize].ty.0 as usize] != TypeDef::Double => {
+                            let rc = resolve(&mut repl, c);
+                            if let Value::Inst(j) = rc { bc_only[j as usize] = Some(None); }
+                            for arm in [t, f] {
+                                if let Value::Inst(j) = resolve(&mut repl, arm) {
+                                    if !matches!(self.insts[j as usize].op, Op::Select(c2, _, _) if resolve(&mut repl, c2) == rc) {
+                                        bc_only[j as usize] = Some(None);
+                                    }
+                                }
+                            }
+                        }
+                        _ => self.insts[u as usize].op.for_each_operand(|v| {
+                            if let Value::Inst(j) = resolve(&mut repl, v) { bc_only[j as usize] = Some(None); }
+                        }),
+                    }
+                }
+            }
+        }
+        let mut stack = if !do_fold && !do_cse { Vec::new() } else { vec![Step::Enter(0)] };
         let mut cse_replaced = false;
         while let Some(step) = stack.pop() {
             let b = match step {
@@ -528,16 +725,26 @@ impl Module {
             let mut local: HashMap<(Op, Ty), Value> = HashMap::new();
             for k in 0..self.blocks[b].len() {
                 let i = self.blocks[b][k] as usize;
+                let ty = self.insts[i].ty;
                 let mut op = std::mem::replace(&mut self.insts[i].op, Op::Ret);
                 op.map_operands(|v| resolve(&mut repl, v));
                 if repl[i].is_none() {
-                    if let Some(s) = self.simplify_op(&op, self.insts[i].ty) {
-                        repl[i] = Some(s);
-                        cse_replaced = true;
+                    let alias_key = if do_fold {
+                        let k = self.simplify_bitcast_select(&mut op, &mut repl, &table, &bc_only);
+                        self.simplify_select(&mut op, ty, &mut repl);
+                        if let Some(s) = self.simplify_op(&op, ty, &table) {
+                            repl[i] = Some(resolve(&mut repl, s));
+                            cse_replaced = true;
+                        }
+                        k
                     } else {
+                        None
+                    };
+                    if repl[i].is_none() && do_cse {
+                        self.canonicalize_commutative(&mut op, ty);
                         let kind = self.cse_kind(&op);
                         if kind != Cse::No {
-                            let key = (op.clone(), self.insts[i].ty);
+                            let key = (op.clone(), ty);
                             let t = if kind == Cse::Dom { &mut table } else { &mut local };
                             if let Some(&v) = t.get(&key) {
                                 repl[i] = Some(v);
@@ -553,6 +760,10 @@ impl Module {
                             // set for subsequent wave/quad intrinsics in the same basic block.
                             local.clear();
                         }
+                    }
+                    if let (true, Some(akey)) = (do_cse, alias_key) {
+                        let old = table.insert(akey.clone(), repl[i].unwrap_or(Value::Inst(i as u32)));
+                        undo.push((akey, old));
                     }
                 }
                 self.insts[i].op = op;
@@ -605,9 +816,20 @@ impl Module {
             }
         }
 
+        #[cfg(test)]
+        let (skip_fold, skip_pairs) = (NO_SELECT_FOLD.with(|c| c.get()), NO_PAIR_FOLD.with(|c| c.get()));
+        #[cfg(not(test))]
+        let (skip_fold, skip_pairs) = (false, false);
+        if !skip("select") && !skip_fold {
+            self.fold_guarded_selects(&order, &repl);
+            if !skip("pairs") && !skip_pairs {
+                self.fold_bitcast_pairs(&order, &repl);
+            }
+        }
+
         // dead instructions: live = side effects, terminators and their operands, transitively
-        let (i64t, f64t) = self.existing_i64_f64();
-        let wide: Vec<Ty> = i64t.into_iter().chain(f64t).collect();
+        let (_, f64t) = self.existing_i64_f64();
+        let wide: Vec<Ty> = f64t.into_iter().collect();
         let mut live = vec![false; self.insts.len()];
         let mut work: Vec<u32> = Vec::new();
         for &b in &order {
@@ -704,6 +926,145 @@ impl Module {
                 }
             }
             debug_assert!(self.uses_well_formed(&order));
+        }
+    }
+
+    /// A lane's result depends only on that lane's operands, and no operand value is undefined
+    /// behaviour (no memory, wave ops, derivatives, integer division).
+    fn lane_local(&self, op: &Op, ty: Ty) -> bool {
+        match op {
+            Op::Bin(BinOp::UDiv | BinOp::URem, ..) => false,
+            Op::Bin(BinOp::SDiv | BinOp::SRem, ..) => self.is_float(ty),
+            Op::Bin(..) | Op::Cast(..) | Op::Cmp(..) | Op::Select(..) | Op::Extract(..) => true,
+            Op::Call(f, args) => {
+                let d = &self.funcs[*f as usize];
+                // unary .. dot4, make / split double, bitcasts and legacy conversions
+                d.attrs == FnAttrs::ReadNone
+                    && d.name.starts_with("dx.op.")
+                    && args.first().and_then(|&a| self.const_u64(a)).is_some_and(|id| matches!(id, 6..=56 | 101 | 102 | 124..=132))
+            }
+            _ => false,
+        }
+    }
+
+    /// Selects whose other arm no lane can observe. The translator writes a VGPR under EXEC as
+    /// `select(exec, new, old)`; a following lane-local instruction under the same EXEC reads
+    /// that select, and its own result is again selected by EXEC. Where a value is only observed
+    /// in lanes where `c` holds, an operand `select(c, x, y)` can be `x`; the false arm of
+    /// `select(c, a, select(c, x, y))` can be `y`, the true arm of `select(c, select(c, x, y), b)`
+    /// `x`. No instruction's value changes in a lane that observes it. Phis, memory, wave ops and
+    /// everything not `lane_local` observe all lanes. The selects left without uses go in DCE.
+    fn fold_guarded_selects(&mut self, order: &[u32], repl: &[Option<Value>]) {
+        #[derive(Clone, Copy, PartialEq)]
+        enum Seen {
+            Unused,
+            Where(Value),
+            All,
+        }
+        fn meet(s: &mut Seen, by: Seen) {
+            *s = match (*s, by) {
+                (x, Seen::Unused) => x,
+                (Seen::Unused, y) => y,
+                (Seen::Where(a), Seen::Where(b)) if a == b => Seen::Where(a),
+                _ => Seen::All,
+            }
+        }
+        let live = |i: u32| repl[i as usize].is_none();
+        let mut seen = vec![Seen::Unused; self.insts.len()];
+        // phis may come before a use's definition (back edges)
+        for &b in order {
+            for &i in &self.blocks[b as usize] {
+                if let (true, Op::Phi(inc)) = (live(i), &self.insts[i as usize].op) {
+                    for &(v, _) in inc {
+                        if let Value::Inst(j) = v {
+                            seen[j as usize] = Seen::All;
+                        }
+                    }
+                }
+            }
+        }
+        // every other use follows its definition: users first
+        for &b in order.iter().rev() {
+            for &i in self.blocks[b as usize].iter().rev() {
+                if !live(i) {
+                    continue;
+                }
+                let (op, ty) = (&self.insts[i as usize].op, self.insts[i as usize].ty);
+                if matches!(op, Op::Phi(_)) {
+                    continue;
+                }
+                let me = if self.lane_local(op, ty) { seen[i as usize] } else { Seen::All };
+                if me == Seen::Unused {
+                    continue;
+                }
+                let mut by = |v: Value, s: Seen| {
+                    if let Value::Inst(j) = v {
+                        meet(&mut seen[j as usize], s);
+                    }
+                };
+                match *op {
+                    Op::Select(c, a, b) => {
+                        by(c, me);
+                        by(a, Seen::Where(c));
+                        by(b, me);
+                    }
+                    _ => op.for_each_operand(|v| by(v, me)),
+                }
+            }
+        }
+        for &b in order {
+            for k in 0..self.blocks[b as usize].len() {
+                let i = self.blocks[b as usize][k];
+                let (op, ty) = (&self.insts[i as usize].op, self.insts[i as usize].ty);
+                if !live(i) || seen[i as usize] == Seen::Unused || !self.lane_local(op, ty) {
+                    continue;
+                }
+                let me = seen[i as usize];
+                let cu = if let Op::Select(c, ..) = *op { Some(c) } else { None };
+                let mut op = op.clone();
+                let mut pos = 0;
+                op.map_operands(|mut v| {
+                    let at = pos;
+                    pos += 1;
+                    while let Value::Inst(j) = v {
+                        let Op::Select(c, x, y) = self.insts[j as usize].op else { break };
+                        v = match (cu, at) {
+                            (Some(cu), 1) if cu == c => x,
+                            (Some(cu), 2) if cu == c => y,
+                            _ if me == Seen::Where(c) => x,
+                            _ => break,
+                        };
+                    }
+                    v
+                });
+                self.insts[i as usize].op = op;
+            }
+        }
+    }
+
+    /// `bitcast(bitcast(x))` back to `x`'s type is `x`. The peephole folds these during CSE;
+    /// `fold_guarded_selects` leaves new ones where it took a select's arm that was a bitcast.
+    fn fold_bitcast_pairs(&mut self, order: &[u32], repl: &[Option<Value>]) {
+        let mut alias: Vec<Option<Value>> = vec![None; self.insts.len()];
+        // definitions come before their uses except in phis: phis take their aliases in pass 2
+        for pass in 0..2 {
+            for &b in order {
+                for k in 0..self.blocks[b as usize].len() {
+                    let i = self.blocks[b as usize][k] as usize;
+                    if repl[i].is_some() {
+                        continue;
+                    }
+                    let mut op = std::mem::replace(&mut self.insts[i].op, Op::Ret);
+                    op.map_operands(|v| match v {
+                        Value::Inst(j) => alias[j as usize].unwrap_or(v),
+                        _ => v,
+                    });
+                    if pass == 0 && matches!(op, Op::Cast(CastOp::BitCast, ..)) {
+                        alias[i] = self.simplify_op(&op, self.insts[i].ty, &HashMap::new());
+                    }
+                    self.insts[i].op = op;
+                }
+            }
         }
     }
 
@@ -1398,6 +1759,88 @@ mod tests {
         assert_eq!(m.const_u64(args[10]), Some(u32::MAX as u64), "or(or(x, 0xFFFF), 0xFFFF0000) -> ~0");
         assert_eq!(args[11], z, "and(zext(i1), 0xFF) -> zext(i1)");
         assert_eq!(m.const_u64(args[12]), Some(0), "and(zext(i1), 0xFFFF0000) -> 0");
+        let order: Vec<u32> = m.block_layout().0.into_iter().map(|b| b as u32).collect();
+        assert!(m.uses_well_formed(&order));
+    }
+
+    #[test]
+    fn guarded_selects_fold_where_no_lane_sees_the_other_arm() {
+        let mut m = Module::new();
+        m.define_entry("main");
+        let entry = m.entry_block();
+        m.set_block(entry);
+
+        let void = m.void();
+        let i32t = m.i32();
+        let src_ty = m.func_ty(i32t, &[]);
+        let src = m.declare("dx.op.waveGetLaneIndex", src_ty, FnAttrs::ReadNone);
+        let sink_ty = m.func_ty(void, &[i32t]);
+        let sink = m.declare("dx.op.storeOutput.i32", sink_ty, FnAttrs::NoUnwind);
+
+        let x = m.call(src, &[]);
+        let (c1, c3, c5, k) = (m.i32c(1), m.i32c(3), m.i32c(5), m.i32c(0xA5A5_5A5A));
+        let exec = m.cmp(Pred::ULt, x, c5);
+        let old = m.bin(BinOp::Xor, x, k);
+        // v = exec ? x + 1 : old; v = exec ? v * 3 : v
+        let a = m.bin(BinOp::Add, x, c1);
+        let s1 = m.select(exec, a, old);
+        let p = m.bin(BinOp::Mul, s1, c3);
+        let s2 = m.select(exec, p, s1);
+        // read where every lane counts: stays
+        let s3 = m.select(exec, a, x);
+        let q = m.bin(BinOp::Sub, s3, c1);
+        m.call(sink, &[s2]);
+        m.call(sink, &[q]);
+        m.ret();
+        m.optimize();
+
+        let Value::Inst(s2i) = s2 else { panic!() };
+        let Value::Inst(pi) = p else { panic!() };
+        assert!(matches!(m.insts[s2i as usize].op, Op::Select(c, t, f) if c == exec && t == p && f == old), "s2 = select(exec, p, old)");
+        assert!(matches!(m.insts[pi as usize].op, Op::Bin(BinOp::Mul, v, w, 0) if (v, w) == (a, c3) || (v, w) == (c3, a)), "p = a * 3");
+        let body = &m.blocks[entry.0 as usize];
+        let has = |v: Value| matches!(v, Value::Inst(i) if body.contains(&i));
+        assert!(!has(s1), "s1 has no uses left");
+        assert!(has(s3), "s3 is read in every lane");
+        let order: Vec<u32> = m.block_layout().0.into_iter().map(|b| b as u32).collect();
+        assert!(m.uses_well_formed(&order));
+    }
+
+    #[test]
+    fn bitcast_pairs_left_by_the_select_fold_fold() {
+        let mut m = Module::new();
+        m.define_entry("main");
+        let entry = m.entry_block();
+        m.set_block(entry);
+
+        let void = m.void();
+        let (i32t, f32t) = (m.i32(), m.f32());
+        let src_ty = m.func_ty(i32t, &[]);
+        let src = m.declare("dx.op.waveGetLaneIndex", src_ty, FnAttrs::ReadNone);
+        let sink_ty = m.func_ty(void, &[i32t]);
+        let sink = m.declare("dx.op.storeOutput.i32", sink_ty, FnAttrs::NoUnwind);
+
+        let x = m.call(src, &[]);
+        let (c5, one) = (m.i32c(5), m.f32c(0x3F80_0000));
+        let exec = m.cmp(Pred::ULt, x, c5);
+        // v = exec ? bits(float(x) + 1) : x; v = exec ? bits(float(v) + 1) : v
+        let xf = m.bitcast(x, f32t);
+        let a = m.bin(BinOp::Add, xf, one);
+        let ai = m.bitcast(a, i32t);
+        let s1 = m.select(exec, ai, x);
+        let s1f = m.bitcast(s1, f32t);
+        let b = m.bin(BinOp::Add, s1f, one);
+        let bi = m.bitcast(b, i32t);
+        let s2 = m.select(exec, bi, s1);
+        m.call(sink, &[s2]);
+        m.ret();
+        m.optimize();
+
+        let Value::Inst(bx) = b else { panic!() };
+        assert!(matches!(m.insts[bx as usize].op, Op::Bin(BinOp::Add, v, w, _) if v == a && w == one), "b = a + 1");
+        let body = &m.blocks[entry.0 as usize];
+        let has = |v: Value| matches!(v, Value::Inst(i) if body.contains(&i));
+        assert!(!has(s1f), "bitcast(bitcast(a)) has no uses left");
         let order: Vec<u32> = m.block_layout().0.into_iter().map(|b| b as u32).collect();
         assert!(m.uses_well_formed(&order));
     }
