@@ -2863,6 +2863,15 @@ impl Em {
                         self.sample_cmp_grad(&t, ty, &vector(&coords[..dx.len()]), &vector(dx), &vector(dy), &tail(format!("{location}, {z}")))
                     }
                     (Some(z), _, _, _) if has_lz || !ps => format!("float4({t}_T.SampleCmpLevelZero({t}_S, {coord}, {z}).xxxx)"),
+                    (Some(z), _, _, Some(b)) => {
+                        // Bias is added to log2(footprint), so scale both screen derivatives by 2^bias.
+                        // A texel offset moves the lookup, not its footprint. Cubes use direction space.
+                        let unmoved = if dim == 3 { &coord } else { &coord0 };
+                        let ty = ["float", "float2", "float3", "float4", "float2", "float3"][dim as usize];
+                        let dx = format!("(ddx({unmoved}) * exp2({b}))");
+                        let dy = format!("(ddy({unmoved}) * exp2({b}))");
+                        self.sample_cmp_grad(&t, ty, &coord, &dx, &dy, &tail(format!("{t}_p, {z}")))
+                    }
                     (Some(z), _, _, _) => format!("float4({t}_T.SampleCmp({t}_S, {}).xxxx)", tail(format!("{coord}, {z}"))),
                     // cube maps: RDNA takes face-space 2D gradients, HLSL wants direction-space 3D
                     // ones (and has no clamp form) – the LOD from the gradients and the face size

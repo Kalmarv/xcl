@@ -2323,6 +2323,44 @@ fn gpu_ps_p0_reads_flat_integer_selectors() {
     }
 }
 
+/// LOD 0 plus one and LOD 1 minus one must select opposite mips. Bias zero is the control.
+#[test]
+fn gpu_ps_compare_mip_bias() {
+    if !gpu_ready() {
+        return;
+    }
+    let mut failures = Vec::new();
+    // At the final slope column zero supplies bias 0.25, its neighbor 0.75.
+    for (op, scale, bias, min_lod, mip, slope) in [
+        ("IMAGE_SAMPLE_C_B", 0.125f32, 0.0f32, 0.0f32, 0, 0.0f32),
+        ("IMAGE_SAMPLE_C_B", 0.125, 1.0, 0.0, 1, 0.0),
+        ("IMAGE_SAMPLE_C_B_CL", 0.25, -1.0, 0.0, 0, 0.0),
+        ("IMAGE_SAMPLE_C_B_O", 0.125, 1.0, 0.0, 1, 0.0),
+        ("IMAGE_SAMPLE_C_B_CL_O", 0.25, -1.0, 1.0, 1, 0.0),
+        ("IMAGE_SAMPLE_C_B", 0.125, 0.0, 0.0, 0, 0.5),
+    ] {
+        let ps = prog(&[
+            // Screen derivatives need coordinates from uncovered neighbors in a partial quad.
+            ("S_WQM_B64", "ENC_SOP1", &[("SDST", 126), ("SSRC0", 126)], None),
+            ("V_MOV_B32", "ENC_VOP1", &[("VDST", 8), ("SRC0", 255)], Some(bias.to_bits())),
+            ("V_MOV_B32", "ENC_VOP1", &[("VDST", 9), ("SRC0", 240)], None), // compare 0.5
+            ("V_MUL_F32", "ENC_VOP2", &[("VDST", 10), ("SRC0", 255), ("VSRC1", 2)], Some(scale.to_bits())),
+            ("V_MUL_F32", "ENC_VOP2", &[("VDST", 11), ("SRC0", 255), ("VSRC1", 3)], Some(scale.to_bits())),
+            ("V_MOV_B32", "ENC_VOP1", &[("VDST", 7), ("SRC0", 128)], None), // zero texel offset for _O
+            ("V_MOV_B32", "ENC_VOP1", &[("VDST", 12), ("SRC0", 255)], Some(min_lod.to_bits())),
+            ("V_MUL_F32", "ENC_VOP2", &[("VDST", 16), ("SRC0", 255), ("VSRC1", 2)], Some(slope.to_bits())),
+            ("V_ADD_F32", "ENC_VOP2", &[("VDST", 8), ("SRC0", V + 16), ("VSRC1", 8)], None),
+            (op, "ENC_MIMG", &[("VDATA", 20), ("VADDR", if op.ends_with("_O") { 7 } else { 8 }), ("SRSRC", 4), ("SSAMP", 6), ("DMASK", 1), ("DIM", 1)], None),
+            ("EXP", "ENC_EXP", &[("TGT", 0), ("EN", 1), ("VSRC0", 20), ("DONE", 1), ("VM", 1)], None),
+        ]);
+        let want = |x| if slope == 0.0 { mip } else { u32::from(x > 0) };
+        if let Err(error) = check_ps_depth_mip(&ps, scale, want) {
+            failures.push(format!("{op}, scale {scale}, slope {slope}: {error}"));
+        }
+    }
+    assert!(failures.is_empty(), "{}", failures.join("\n"));
+}
+
 /// Draw console wave64 VS + PS (`vs` None: position and COLOR passed through; `ps` None:
 /// COLOR interpolated) with triangles given in pixels of a 16 × 16 target, cleared to -1.
 /// Translated for this adapter (`runner::options`: on a GPU with 32-lane waves only, the
