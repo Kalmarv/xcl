@@ -888,10 +888,44 @@ fn outlined_scalar_loads_validate() {
     }
 }
 
+fn outline_fixture_applies(vendor: Option<u32>) -> bool {
+    if vendor.is_none() {
+        crate::gpu::recomp::runner::skip_test("could not identify the GPU for scalar-load outlining");
+        return false;
+    }
+    if !super::kernel::outline_supported(vendor) {
+        use std::io::Write;
+        let thread = std::thread::current();
+        let _ = writeln!(std::io::stderr(), "SKIPPED {}: NVIDIA-only scalar-load fixture", thread.name().unwrap_or("?"));
+        return false;
+    }
+    true
+}
+
+#[test]
+fn outlined_scalar_loads_strict_vendor_exclusion() {
+    // Isolate XCL_REQUIRE_GPU from the other tests running in this process.
+    const CHILD: &str = "XCL_TEST_OUTLINE_VENDOR_CHILD";
+    if std::env::var_os(CHILD).is_some() {
+        assert!(!outline_fixture_applies(Some(0x1002)));
+        assert!(outline_fixture_applies(Some(0x10de)));
+        assert!(std::panic::catch_unwind(|| outline_fixture_applies(None)).is_err());
+        return;
+    }
+    for mode in ["wave64", "mesh"] {
+        let test = std::thread::current();
+        let output = std::process::Command::new(std::env::current_exe().unwrap())
+            .args(["--exact", test.name().unwrap()])
+            .env(CHILD, "1").env("XCL_REQUIRE_GPU", mode)
+            .output().unwrap();
+        assert!(output.status.success(), "{mode}: {}{}", String::from_utf8_lossy(&output.stdout), String::from_utf8_lossy(&output.stderr));
+    }
+}
+
 #[test]
 fn outlined_scalar_loads_match_inline_at_view_end() {
-    if !super::kernel::outline_supported(crate::gpu::adapter::shader_vendor()) {
-        return crate::gpu::recomp::runner::skip_test("scalar-load outlining requires an NVIDIA adapter");
+    if !outline_fixture_applies(crate::gpu::adapter::shader_vendor()) {
+        return;
     }
     use crate::gpu::recomp::runner::{self, KernelState};
     let (wave32, native64) = match (runner::wave32_supported(), runner::wave64_supported()) {
@@ -920,8 +954,8 @@ fn outlined_scalar_loads_match_inline_at_view_end() {
 
 #[test]
 fn outlined_scalar_loads_preserve_distinct_image_descriptors() {
-    if !super::kernel::outline_supported(crate::gpu::adapter::shader_vendor()) {
-        return crate::gpu::recomp::runner::skip_test("scalar-load outlining requires an NVIDIA adapter");
+    if !outline_fixture_applies(crate::gpu::adapter::shader_vendor()) {
+        return;
     }
     use crate::gpu::recomp::runner::{self, KernelState, TestTexture, TexDim};
     use windows::Win32::Graphics::Dxgi::Common::DXGI_FORMAT_R32_UINT;
