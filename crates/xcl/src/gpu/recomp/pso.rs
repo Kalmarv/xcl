@@ -164,7 +164,7 @@ pub fn in_switch_form<R>(f: impl FnOnce() -> R) -> R {
 /// measured there. A pipeline the driver refuses with heap windows (E_OUTOFMEMORY, #156) is built
 /// with root UAVs (`with_switch_fallback`).
 pub fn heap_windows() -> bool {
-    heap_windows_by(heap_windows_env(), ADAPTER_VENDOR.load(std::sync::atomic::Ordering::Relaxed)) && !crate::hle::d3d12x::console_heap::window_views_failed()
+    heap_windows_by(heap_windows_env(), crate::gpu::adapter::shader_vendor().unwrap_or(0)) && !crate::hle::d3d12x::console_heap::window_views_failed()
 }
 
 /// `heap_windows` before the views: `XCL_HEAP_WINDOWS` when set, otherwise on for NVIDIA.
@@ -188,13 +188,6 @@ fn heap_windows_env() -> Option<bool> {
 }
 
 const NVIDIA: u32 = 0x10DE;
-/// PCI vendor id of the adapter the title's device (or `xcl shaders`' bench) runs on; 0 before.
-static ADAPTER_VENDOR: std::sync::atomic::AtomicU32 = std::sync::atomic::AtomicU32::new(0);
-
-/// The adapter's PCI vendor id (`DXGI_ADAPTER_DESC1::VendorId`), for `heap_windows`' default.
-pub fn set_adapter_vendor(vendor: u32) {
-    ADAPTER_VENDOR.store(vendor, std::sync::atomic::Ordering::Relaxed);
-}
 
 /// With heap windows, the direct DXIL translator reads a compute stage's heap windows without
 /// a branch per access (`HEAP_FLAT`); `XCL_HEAP_FLAT=0`: with the guarded branch.
@@ -240,7 +233,7 @@ fn shader_cache() -> &'static Mutex<ShaderCache> {
 /// fills the caches without a title: the same keys as at its run).
 pub fn console_to_dxil_in(blob: &[u8], stage: Stage, sampler_base: u32, split_wave64: bool, windows: u32) -> Result<Compiled, String> {
     let compile_one = || compile_console_shader(blob, stage, sampler_base, windows, split_wave64);
-    if !cache_allowed(stage, |name| std::env::var_os(name).is_some()) {
+    if !cache_allowed(stage, translation_override_active) {
         return compile_one().map(|(c, _)| c);
     }
     let key = ShaderKey {
@@ -990,10 +983,18 @@ fn cached_shader(
     Ok(shader)
 }
 
+fn translation_override_active(name: &str) -> bool {
+    match name {
+        "XCL_DXIL_OUTLINE" => crate::gpu::dxil::kernel::outline_enabled(),
+        _ => std::env::var_os(name).is_some(),
+    }
+}
+
 fn cache_allowed(stage: Stage, present: impl Fn(&str) -> bool) -> bool {
     !["XCL_RECOMP_NO_STRUCTURED", "XCL_RECOMP_WHY", "XCL_X64_ALL_MASKS", "XCL_WAVE64_SPIN", "XCL_DXIL_NO_OPT"]
         .iter()
         .any(|name| present(name))
+        && (stage != Stage::Compute || !present("XCL_DXIL_OUTLINE"))
         && (stage != Stage::Pixel
             || ![
                 "XCL_DEBUG_MAGENTA",
@@ -1231,7 +1232,7 @@ fn console_mesh_with(
     let compile_one = || compile(code, ms, wave64);
     // Cache the mesh compute pass in RAM (`ShaderCache` + in-flight coalescing) and on disk
     // (`translated/v2`, namespaced by backend) across all `(MS, PS)` pipelines that share it.
-    let cs = if cache_allowed(Stage::Mesh, |name| std::env::var_os(name).is_some()) {
+    let cs = if cache_allowed(Stage::Mesh, translation_override_active) {
         let key = ShaderKey {
             hash: crate::gpu::shader::fnv64(blob),
             stage: Stage::Mesh,
@@ -2314,6 +2315,10 @@ mod shader_cache_tests {
             assert!(!cache_allowed(Stage::Compute, |v| v == name));
             assert!(!cache_allowed(Stage::Vertex, |v| v == name));
             assert!(!cache_allowed(Stage::Pixel, |v| v == name));
+        }
+        assert!(!cache_allowed(Stage::Compute, |v| v == "XCL_DXIL_OUTLINE"));
+        for stage in [Stage::Vertex, Stage::Pixel, Stage::Mesh] {
+            assert!(cache_allowed(stage, |v| v == "XCL_DXIL_OUTLINE"));
         }
         for name in [
             "XCL_DEBUG_MAGENTA",

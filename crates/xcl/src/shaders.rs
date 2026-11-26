@@ -914,10 +914,7 @@ pub fn run(path: &Path, args: &[String]) -> i32 {
             return 2;
         }
     };
-    let runtime_windows = || {
-        note_adapter_vendor();
-        runtime_windows(opts.windows)
-    };
+    let runtime_windows = || runtime_windows(opts.windows);
     let top = opts.top;
     let json = opts.json;
     let compile = opts.compile;
@@ -987,13 +984,6 @@ pub fn run(path: &Path, args: &[String]) -> i32 {
     let agg = analyze(&input, recomp_on, compile, iface_on);
     drop(input);
     print(path, &what, agg, top, json, t0, compile)
-}
-
-/// The bench's adapter, whose vendor sets the runtime's default windows (`pso::heap_windows`).
-fn note_adapter_vendor() {
-    if let Some(v) = crate::gpu::adapter::vendor(&crate::gpu::adapter::Selector::from_env_or("auto")) {
-        recomp::pso::set_adapter_vendor(v);
-    }
 }
 
 /// The memory windows of the runtime, as `--precompile`, `--export-hlsl` and `--measure-pso` key
@@ -2138,7 +2128,7 @@ mod tests {
         const RUN: &str = "XCL_TEST_PRECOMPILE_WINDOWS";
         if let Ok(case) = std::env::var(RUN) {
             let n: Vec<u32> = case.split(':').map(|v| v.parse().unwrap()).collect();
-            pso::set_adapter_vendor(n[0]);
+            let _ = crate::gpu::adapter::TITLE_VENDOR.set(n[0]);
             assert_eq!(super::runtime_windows(4), (n[1], n[2]), "(compute, VS / PS / mesh)");
             return;
         }
