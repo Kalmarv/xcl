@@ -916,6 +916,7 @@ fn user_signed_in() {
         return;
     }
     crate::xlog_info!("XUser: the local user reached the title (XUserAddResult); {} device association callback(s)", ASSOCIATION_CALLBACKS.lock().unwrap().len());
+    crate::hle::gameinput::note_user_reached();
     let calls: Vec<_> = ASSOCIATION_CALLBACKS.lock().unwrap().clone();
     for (_, q, ctx, cb) in calls {
         unsafe { notify_association(q, ctx, cb) };

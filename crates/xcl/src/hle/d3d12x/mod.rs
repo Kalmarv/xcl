@@ -19,6 +19,7 @@ mod cpu_writes;
 pub mod dred;
 mod fence_x;
 pub mod frame;
+mod gpu_profile;
 pub mod guard;
 mod late_release;
 pub mod layout;
@@ -32,7 +33,9 @@ pub mod sparse;
 mod standin;
 pub mod title_list;
 pub mod title_textures;
+mod uma_driver;
 pub mod vram;
+pub mod watch_trap;
 
 use std::ffi::c_void;
 use std::sync::OnceLock;

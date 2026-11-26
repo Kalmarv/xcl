@@ -187,6 +187,19 @@ pub fn console_buffers() -> usize {
     UMA_BUFFERS.lock().unwrap().as_ref().map_or(0, |m| m.len())
 }
 static UMA_ERROR: Mutex<String> = Mutex::new(String::new());
+/// (scratch) a coherent window is a driver heap (`uma_driver`): resources placed in it are not
+/// cross-adapter
+static UMA_DRIVER: AtomicBool = AtomicBool::new(false);
+
+/// ALLOW_CROSS_ADAPTER for a buffer placed in a coherent window's heap, unless that heap is the
+/// driver's (`XCL_UMA_DRIVER`)
+fn coherent_flags() -> D3D12_RESOURCE_FLAGS {
+    if UMA_DRIVER.load(Ordering::Relaxed) {
+        D3D12_RESOURCE_FLAG_NONE
+    } else {
+        D3D12_RESOURCE_FLAG_ALLOW_CROSS_ADAPTER
+    }
+}
 
 /// GPU virtual address of the unified memory buffer of window 0 (0: not available).
 pub fn uma_gpu_va() -> u64 {
@@ -305,6 +318,18 @@ unsafe fn open_uma(device: &ID3D12Device) {
     };
     let open = |k: usize| -> Result<(usize, u64, usize), String> {
         let (base, size) = u.window(k);
+        if let Some(upload) = super::uma_driver::mode() {
+            match super::uma_driver::remake(device, base, size, upload) {
+                Ok((heap, buf, watched)) => {
+                    UMA_DRIVER.store(true, Ordering::Relaxed);
+                    if !watched {
+                        crate::gpu::uma::set_driver_window(k);
+                    }
+                    return Ok(super::uma_driver::raw(heap, buf));
+                }
+                Err(e) => crate::xlog_warn!("D3D12.X: XCL_UMA_DRIVER: window {k} stays imported: {e}"),
+            }
+        }
         let dev3: ID3D12Device3 = device.cast().map_err(|e| format!("ID3D12Device3: {e}"))?;
         let heap: ID3D12Heap = dev3.OpenExistingHeapFromAddress(base as *const c_void).map_err(|e| format!("OpenExistingHeapFromAddress (window {k}): {e}"))?;
         let desc = D3D12_RESOURCE_DESC {
@@ -1395,7 +1420,7 @@ unsafe fn place_console_buffer_sparse(this: *mut c_void, d: &D3D12_RESOURCE_DESC
 /// cross-adapter UMA heap (`OpenExistingHeapFromAddress`).
 fn sanitize_coherent_buffer(desc: &D3D12_RESOURCE_DESC, state: usize) -> (D3D12_RESOURCE_DESC, u32) {
     let mut d = *desc;
-    d.Flags = D3D12_RESOURCE_FLAGS(d.Flags.0 & 0xFF) | D3D12_RESOURCE_FLAG_ALLOW_CROSS_ADAPTER;
+    d.Flags = D3D12_RESOURCE_FLAGS(d.Flags.0 & 0xFF) | coherent_flags();
     d.Layout = D3D12_TEXTURE_LAYOUT_ROW_MAJOR;
     d.Alignment = 0;
     (d, state as u32 & PC_RESOURCE_STATES)
@@ -1490,7 +1515,7 @@ pub(super) unsafe fn place_at_title_address(this: *mut c_void, va: usize, desc: 
         return Some(hr);
     }
     let heap = (*UMA_HEAPS.lock().unwrap().get(k)?)?;
-    d.Flags |= D3D12_RESOURCE_FLAG_ALLOW_CROSS_ADAPTER;
+    d.Flags |= coherent_flags();
     d.Layout = D3D12_TEXTURE_LAYOUT_ROW_MAJOR;
     d.Alignment = 0;
     d.Width = (delta + bytes) as u64;
@@ -4356,6 +4381,11 @@ unsafe fn translated_compute_pso_once(this: *mut c_void, f: PsoFn, desc: *const 
                 PSO_USER_SGPRS.lock().unwrap().get_or_insert_with(HashMap::new).insert(*ppv as usize, n);
             }
             note_translated_compute(0, ppv);
+        if super::gpu_profile::on() {
+            let hash = crate::gpu::shader::fnv64(cs);
+            PSO_SHADERS.lock().unwrap().get_or_insert_with(HashMap::new).insert(*ppv as usize, (hash, 0));
+            super::gpu_profile::note_compute(hash, cs, dxil.len(), wave32_only(this));
+        }
             TRANSLATED_PSO.fetch_add(1, Ordering::Relaxed);
             return Some(Ok(0));
         }
@@ -4393,6 +4423,11 @@ unsafe fn translated_compute_pso_once(this: *mut c_void, f: PsoFn, desc: *const 
         PSO_USER_SGPRS.lock().unwrap().get_or_insert_with(HashMap::new).insert(*ppv as usize, n);
     }
     note_translated_compute(hr, ppv);
+    if super::gpu_profile::on() {
+        let hash = crate::gpu::shader::fnv64(cs);
+        PSO_SHADERS.lock().unwrap().get_or_insert_with(HashMap::new).insert(*ppv as usize, (hash, 0));
+        super::gpu_profile::note_compute(hash, cs, dxil.len(), wave32_only(this));
+    }
     crate::xlog_info!(
         "D3D12.X: compute PSO with the translated console CS ({} B DXIL, {} ms{})",
         dxil.len(),
@@ -5300,6 +5335,10 @@ unsafe fn translated_graphics_pso_once(this: *mut c_void, f: PsoFn, desc: *const
     super::dred::label(*ppv as usize, &[("vs", Some(vs)), ("ps", shader_bytes(&d.PS))]);
     TRANSLATED_GRAPHICS.lock().unwrap().get_or_insert_with(HashSet::new).insert(*ppv as usize);
     note_rect_list_gs(*ppv as usize, &copy, rect_gs.is_some());
+    if super::gpu_profile::on() && !super::present::trace_frame() {
+        let ps = shader_bytes(&d.PS).map_or(0, crate::gpu::shader::fnv64);
+        PSO_SHADERS.lock().unwrap().get_or_insert_with(HashMap::new).insert(*ppv as usize, (crate::gpu::shader::fnv64(vs), ps));
+    }
     if super::present::trace_frame() {
         let ps = shader_bytes(&d.PS).map_or(0, crate::gpu::shader::fnv64);
         PSO_SHADERS.lock().unwrap().get_or_insert_with(HashMap::new).insert(*ppv as usize, (crate::gpu::shader::fnv64(vs), ps));
@@ -7277,6 +7316,7 @@ unsafe extern "system" fn q_execute_command_lists(this: *mut c_void, n: u32, lis
         }
     }
     super::list_x::note_queue_for_lists(this as usize, &mapped);
+    super::gpu_profile::note_queue(this);
     super::list_x::execute_with_waits_on(this, &mapped, |chunk| {
         let _ = super::alloc_pool::note_resubmits(this, chunk);
         f(this, chunk.len() as u32, chunk.as_ptr());

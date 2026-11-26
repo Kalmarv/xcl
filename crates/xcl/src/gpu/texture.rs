@@ -221,6 +221,174 @@ unsafe impl Send for Uploader {}
 /// queue (raw pointer) → its uploader, while no batch uses it
 static UPLOADERS: std::sync::Mutex<Option<std::collections::HashMap<usize, Uploader>>> = std::sync::Mutex::new(None);
 
+const ASYNC_SLOTS: usize = 8;
+
+struct AsyncSlot {
+    alloc: ID3D12CommandAllocator,
+    list: ID3D12GraphicsCommandList,
+    staging: Option<(ID3D12Resource, *mut u8, u64)>,
+    fence_val: u64,
+    keep_alive: Vec<ID3D12Resource>,
+}
+
+struct AsyncUploader {
+    slots: Vec<AsyncSlot>,
+    next: usize,
+    fence: ID3D12Fence,
+    value: u64,
+}
+
+unsafe impl Send for AsyncUploader {}
+
+static ASYNC_UPLOADERS: std::sync::Mutex<Option<std::collections::HashMap<usize, AsyncUploader>>> = std::sync::Mutex::new(None);
+
+impl AsyncSlot {
+    unsafe fn new(dev: &ID3D12Device) -> Result<Self, String> {
+        let alloc: ID3D12CommandAllocator = dev.CreateCommandAllocator(D3D12_COMMAND_LIST_TYPE_DIRECT).map_err(err)?;
+        let list: ID3D12GraphicsCommandList = dev.CreateCommandList(0, D3D12_COMMAND_LIST_TYPE_DIRECT, &alloc, None).map_err(err)?;
+        list.Close().map_err(err)?;
+        Ok(AsyncSlot { alloc, list, staging: None, fence_val: 0, keep_alive: Vec::new() })
+    }
+
+    unsafe fn staging(&mut self, dev: &ID3D12Device, bytes: u64) -> Result<(ID3D12Resource, *mut u8), String> {
+        if let Some((b, p, cap)) = &self.staging {
+            if *cap >= bytes {
+                return Ok((b.clone(), *p));
+            }
+        }
+        let cap = staging_capacity(bytes).ok_or("texture upload buffer size overflow")?;
+        drop(self.staging.take());
+        let b = buffer(dev, cap)?;
+        let mut p = std::ptr::null_mut();
+        b.Map(0, None, Some(&mut p)).map_err(err)?;
+        self.staging = Some((b.clone(), p as *mut u8, cap));
+        Ok((b, p as *mut u8))
+    }
+}
+
+impl AsyncUploader {
+    unsafe fn new(dev: &ID3D12Device) -> Result<Self, String> {
+        let mut slots = Vec::with_capacity(ASYNC_SLOTS);
+        for _ in 0..ASYNC_SLOTS {
+            slots.push(AsyncSlot::new(dev)?);
+        }
+        let fence: ID3D12Fence = dev.CreateFence(0, D3D12_FENCE_FLAG_NONE).map_err(err)?;
+        Ok(AsyncUploader { slots, next: 0, fence, value: 0 })
+    }
+}
+
+/// Drop in-flight resource references for any async upload slots whose GPU copy has completed.
+/// Must be called without holding `title_textures::TEXTURES` or `vram` locks, since dropping the
+/// last COM reference to a resource invokes its `ID3D12DestructionNotifier`.
+pub unsafe fn reap_async_uploads() {
+    let mut to_drop: Vec<ID3D12Resource> = Vec::new();
+    {
+        let mut g = ASYNC_UPLOADERS.lock().unwrap();
+        if let Some(map) = g.as_mut() {
+            for up in map.values_mut() {
+                let done = up.fence.GetCompletedValue();
+                for slot in &mut up.slots {
+                    if slot.fence_val > 0 && done >= slot.fence_val && !slot.keep_alive.is_empty() {
+                        to_drop.append(&mut slot.keep_alive);
+                    }
+                }
+            }
+        }
+    }
+    drop(to_drop);
+}
+
+/// Asynchronous batch upload: records onto a ring of upload slots, submits on `queue`, signals a
+/// fence, and returns `(failed, Some((fence, value)))` immediately without stalling the CPU. Callers
+/// synchronize title queues on the GPU with `title_queue.Wait(&fence, value)`.
+pub unsafe fn upload_batch_async(
+    dev: &ID3D12Device,
+    queue: &ID3D12CommandQueue,
+    items: &[(ID3D12Resource, Vec<Subresource>, Vec<D3D12_RESOURCE_STATES>)],
+) -> Result<(Vec<(usize, String)>, Option<(ID3D12Fence, u64)>), String> {
+    if items.is_empty() {
+        return Ok((Vec::new(), None));
+    }
+    let key = windows::core::Interface::as_raw(queue) as usize;
+    let taken = ASYNC_UPLOADERS.lock().unwrap().as_mut().and_then(|m| m.remove(&key));
+    let mut up = match taken {
+        Some(u) => u,
+        None => AsyncUploader::new(dev)?,
+    };
+    let mut failed = Vec::new();
+    let mut planned = Vec::with_capacity(items.len());
+    let mut total = 0u64;
+    for (k, (res, subs, states)) in items.iter().enumerate() {
+        match layout(dev, res, subs, states, states) {
+            Ok(l) => {
+                let base = total.div_ceil(PLACEMENT) * PLACEMENT;
+                total = base + l.total;
+                planned.push((k, l, base));
+            }
+            Err(e) => failed.push((k, e)),
+        }
+    }
+    let put_back = |u: AsyncUploader| {
+        ASYNC_UPLOADERS.lock().unwrap().get_or_insert_with(std::collections::HashMap::new).insert(key, u);
+    };
+    if planned.is_empty() {
+        put_back(up);
+        return Ok((failed, None));
+    }
+    let idx = up.next;
+    up.next = (up.next + 1) % up.slots.len();
+    let copy_error = |e| format!("texture copy: {e}");
+    let need_wait = up.slots[idx].fence_val;
+    if need_wait > 0 && up.fence.GetCompletedValue() < need_wait {
+        if let Err(e) = fence::wait(&up.fence, need_wait, dev, None, 10_000) {
+            std::mem::forget(up);
+            return Err(copy_error(e));
+        }
+    }
+    let slot = &mut up.slots[idx];
+    slot.keep_alive.clear();
+    let (staging, mapped) = match slot.staging(dev, total) {
+        Ok(s) => s,
+        Err(e) => {
+            put_back(up);
+            return Err(e);
+        }
+    };
+    if let Err(e) = slot.alloc.Reset().and_then(|_| slot.list.Reset(&slot.alloc, None)) {
+        put_back(up);
+        return Err(err(e));
+    }
+    for (k, l, base) in &planned {
+        let (res, subs, states) = &items[*k];
+        record_into(&slot.list, res, subs, l, states, states, &staging, mapped, *base);
+        slot.keep_alive.push(res.clone());
+    }
+    if let Err(e) = slot.list.Close() {
+        slot.keep_alive.clear();
+        put_back(up);
+        return Err(err(e));
+    }
+    let cmd: ID3D12CommandList = match windows::core::Interface::cast(&slot.list) {
+        Ok(c) => c,
+        Err(e) => {
+            slot.keep_alive.clear();
+            put_back(up);
+            return Err(err(e));
+        }
+    };
+    queue.ExecuteCommandLists(&[Some(cmd)]);
+    up.value += 1;
+    let val = up.value;
+    if let Err(e) = queue.Signal(&up.fence, val) {
+        std::mem::forget(up);
+        return Err(copy_error(fence::api_error(dev, "Signal", e)));
+    }
+    slot.fence_val = val;
+    let fence_ret = up.fence.clone();
+    put_back(up);
+    Ok((failed, Some((fence_ret, val))))
+}
+
 /// the smallest upload buffer made, and the placement alignment of texture data in it
 const STAGING_MIN: u64 = 4 << 20;
 const PLACEMENT: u64 = D3D12_TEXTURE_DATA_PLACEMENT_ALIGNMENT as u64;
