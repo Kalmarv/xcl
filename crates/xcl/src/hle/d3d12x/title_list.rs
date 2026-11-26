@@ -292,6 +292,14 @@ fn park_spares() -> bool {
     *ON.get_or_init(|| std::env::var("XCL_PARK_SPARES").is_ok_and(|v| v.trim() == "1"))
 }
 
+/// A segment KickoffX took back as a spare, once its submits are marked: under XCL_PARK_SPARES it
+/// no longer holds its allocator until it records again.
+pub(super) fn park_spare(seg: usize) {
+    if park_spares() {
+        super::alloc_pool::park_list(seg);
+    }
+}
+
 /// Pop a previously created closed extra PC command list from `wrapper`'s spare pool for reuse
 /// (the last one whose submits the GPU has finished).
 pub(super) fn pop_spare(wrapper: *mut c_void) -> Option<*mut c_void> {
