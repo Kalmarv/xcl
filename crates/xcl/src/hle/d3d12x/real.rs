@@ -3952,15 +3952,21 @@ fn huge_pso_concurrency() -> usize {
 }
 
 /// Hard cap on concurrent huge (`>= 256 KB`) driver compiles even when wanted by a title bind
-/// (`XCL_HUGE_PSO_WANTED_CONCURRENCY`, default 2, always `>= huge_pso_concurrency()`). Prevents a
-/// burst of lazy compute binds from launching 10+ huge driver compiles simultaneously and spiking
-/// process commit into OOM, while still letting a wanted build overtake 1 background build.
+/// (`XCL_HUGE_PSO_WANTED_CONCURRENCY`, default one more than `huge_pso_concurrency()`, always
+/// `>=` it). Prevents a burst of lazy compute binds from launching 10+ huge driver compiles
+/// simultaneously and spiking process commit into OOM, while still letting a wanted build
+/// overtake 1 background build.
 fn huge_pso_wanted_concurrency() -> usize {
     static V: std::sync::OnceLock<usize> = std::sync::OnceLock::new();
     *V.get_or_init(|| {
         let base = huge_pso_concurrency();
-        env_count(std::env::var("XCL_HUGE_PSO_WANTED_CONCURRENCY").ok().as_deref(), base.max(2), base, 64)
+        env_count(std::env::var("XCL_HUGE_PSO_WANTED_CONCURRENCY").ok().as_deref(), default_huge_pso_wanted_concurrency(base), base, 64)
     })
+}
+
+/// One slot above the background ones: with `base` of them busy, a wanted build still starts.
+fn default_huge_pso_wanted_concurrency(base: usize) -> usize {
+    base + 1
 }
 
 /// A count from the environment: `default` when unset or not a number, clamped to the
@@ -4210,6 +4216,14 @@ mod big_compile_tests {
     fn default_huge_pso_slots_scale_with_available_cpus() {
         for (cpus, slots) in [(1, 1), (4, 1), (7, 1), (8, 2), (15, 3), (16, 4), (32, 4), (64, 4)] {
             assert_eq!(default_huge_pso_concurrency(cpus), slots, "{cpus} available CPUs");
+        }
+    }
+
+    #[test]
+    fn a_wanted_huge_compile_has_a_slot_above_the_background_ones() {
+        for cpus in 1..=64 {
+            let base = default_huge_pso_concurrency(cpus);
+            assert!(default_huge_pso_wanted_concurrency(base) > base, "{cpus} available CPUs: {base} background slots");
         }
     }
 

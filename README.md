@@ -260,7 +260,7 @@ xcl rpf D:\data\shaders.rpf --extract NAME --out folder
   its DXIL above 6 MiB) is free on top of what the huge compiles already running reserved, and it
   reserves that headroom until it finishes. One that a game thread waits for skips the commit
   check (it still reserves), and up to `XCL_HUGE_PSO_WANTED_CONCURRENCY` of the lane's compiles
-  run at once then (default: the concurrency above, at least 2). Smaller pipelines and those
+  run at once then (default: one more than the concurrency above). Smaller pipelines and those
   built on a game thread never wait. `xcl.log` shows each huge one as a numbered
   `driver compile start #K` / `driver compile finish #K: … PSO, N B DXIL, M ms` pair (compute
   ones with `record HASH`, the console record's hash that `--measure-pso` and
