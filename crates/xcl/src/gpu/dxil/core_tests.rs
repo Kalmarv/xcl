@@ -867,6 +867,14 @@ fn scalar_load_threshold_counts_emitted_sites_per_shape() {
 }
 
 #[test]
+fn scalar_load_outlining_requires_nvidia() {
+    assert!(super::kernel::outline_supported(Some(0x10de)));
+    for vendor in [Some(0x1002), Some(0x8086), Some(0x1414), None] {
+        assert!(!super::kernel::outline_supported(vendor));
+    }
+}
+
+#[test]
 fn outlined_scalar_loads_validate() {
     for windows in [1, 4, 0x104] {
         let opts = KernelOptions { wave64: true, split: true, mem_windows: windows, sampler_base: 0 };
@@ -882,6 +890,9 @@ fn outlined_scalar_loads_validate() {
 
 #[test]
 fn outlined_scalar_loads_match_inline_at_view_end() {
+    if !super::kernel::outline_supported(crate::gpu::adapter::shader_vendor()) {
+        return crate::gpu::recomp::runner::skip_test("scalar-load outlining requires an NVIDIA adapter");
+    }
     use crate::gpu::recomp::runner::{self, KernelState};
     let (wave32, native64) = match (runner::wave32_supported(), runner::wave64_supported()) {
         (Ok(a), Ok(b)) => (a, b),
@@ -909,6 +920,9 @@ fn outlined_scalar_loads_match_inline_at_view_end() {
 
 #[test]
 fn outlined_scalar_loads_preserve_distinct_image_descriptors() {
+    if !super::kernel::outline_supported(crate::gpu::adapter::shader_vendor()) {
+        return crate::gpu::recomp::runner::skip_test("scalar-load outlining requires an NVIDIA adapter");
+    }
     use crate::gpu::recomp::runner::{self, KernelState, TestTexture, TexDim};
     use windows::Win32::Graphics::Dxgi::Common::DXGI_FORMAT_R32_UINT;
 

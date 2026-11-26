@@ -148,6 +148,24 @@ pub fn translate_compute_on(code: &[u8], o: KernelOptions, cs: &CsInterface, wav
     translate_entry(code, o, Entry::Compute(cs.clone()), compact_mode(), None, tables)
 }
 
+pub(super) fn outline_supported(vendor: Option<u32>) -> bool {
+    vendor == Some(0x10de) // NVIDIA
+}
+
+pub(crate) fn outline_enabled() -> bool {
+    if !std::env::var("XCL_DXIL_OUTLINE").is_ok_and(|v| v == "1") {
+        return false;
+    }
+    if outline_supported(crate::gpu::adapter::shader_vendor()) {
+        return true;
+    }
+    static WARN: std::sync::Once = std::sync::Once::new();
+    WARN.call_once(|| {
+        crate::xlog_warn!("XCL_DXIL_OUTLINE=1 requires an NVIDIA adapter. Using inline scalar loads.");
+    });
+    false
+}
+
 fn translate_entry(
     code: &[u8],
     o: KernelOptions,
@@ -158,7 +176,7 @@ fn translate_entry(
 ) -> Result<Kernel, String> {
     // SSA construction recurses along the CFG (one level per guarded memory access between
     // a register's definition and its use): a thread with a large stack for big programs
-    let outline = std::env::var("XCL_DXIL_OUTLINE").is_ok_and(|v| v == "1");
+    let outline = matches!(entry, Entry::Kernel | Entry::Compute(_)) && outline_enabled();
     let code = code.to_vec();
     std::thread::Builder::new()
         .name("xcl-dxil-translate".into())
