@@ -75,11 +75,22 @@ static PENDING: std::sync::atomic::AtomicUsize = std::sync::atomic::AtomicUsize:
 // raw COM pointers of the title's objects; uploads hold a reference while they run
 unsafe impl Send for Entry {}
 
+const SRC_CHUNK_SHIFT: u32 = 20; // 1 MiB buckets for O(1) incremental watch-range updates
+const SRC_CHUNK_SIZE: usize = 1usize << SRC_CHUNK_SHIFT;
+
 struct Table {
     /// Active PC textures (newest at each range) → its place in the title's memory
     by_res: BTreeMap<usize, Entry>,
     /// Active `(va, PC texture)` → end address (`va + size`); entries with different `(va, end)` are disjoint
     by_va: BTreeMap<(usize, usize), usize>,
+    /// Active `(src, PC texture)` → src end (`src + size`), for O(dirty runs) dirty lookup
+    by_src: BTreeMap<(usize, usize), usize>,
+    /// Largest byte span currently in `by_src` (bounds range queries)
+    max_src_size: usize,
+    /// Active resources with `pending == true`
+    pending_res: std::collections::BTreeSet<usize>,
+    /// 1 MiB chunk index -> count of active non-`gpu_written` textures overlapping it
+    src_chunks: BTreeMap<usize, u32>,
     /// Older overlapped textures kept dormant until released or uncovered when a newer one is released
     shadowed: BTreeMap<usize, Entry>,
     /// Shadowed `(va, PC texture)` → end address (may overlap)
@@ -94,11 +105,82 @@ impl Table {
         Table {
             by_res: BTreeMap::new(),
             by_va: BTreeMap::new(),
+            by_src: BTreeMap::new(),
+            max_src_size: 0,
+            pending_res: std::collections::BTreeSet::new(),
+            src_chunks: BTreeMap::new(),
             shadowed: BTreeMap::new(),
             shadowed_by_va: BTreeMap::new(),
             max_shadowed_size: 0,
             next_seq: 0,
         }
+    }
+
+    fn add_src_chunks(&mut self, src: usize, size: usize) {
+        if size == 0 {
+            return;
+        }
+        let lo = src >> SRC_CHUNK_SHIFT;
+        let hi = src.saturating_add(size).saturating_sub(1) >> SRC_CHUNK_SHIFT;
+        for c in lo..=hi {
+            *self.src_chunks.entry(c).or_insert(0) += 1;
+        }
+    }
+
+    fn sub_src_chunks(&mut self, src: usize, size: usize) {
+        if size == 0 {
+            return;
+        }
+        let lo = src >> SRC_CHUNK_SHIFT;
+        let hi = src.saturating_add(size).saturating_sub(1) >> SRC_CHUNK_SHIFT;
+        for c in lo..=hi {
+            if let Some(n) = self.src_chunks.get_mut(&c) {
+                if *n <= 1 {
+                    self.src_chunks.remove(&c);
+                } else {
+                    *n -= 1;
+                }
+            }
+        }
+    }
+
+    fn index_active(&mut self, res: usize, e: &Entry) {
+        let size = e.tex.size() as usize;
+        let end = e.src.saturating_add(size);
+        self.by_src.insert((e.src, res), end);
+        self.max_src_size = self.max_src_size.max(size);
+        if e.pending {
+            self.pending_res.insert(res);
+        }
+        if !e.gpu_written {
+            self.add_src_chunks(e.src, size);
+        }
+    }
+
+    fn unindex_active(&mut self, res: usize, e: &Entry) {
+        let size = e.tex.size() as usize;
+        self.by_src.remove(&(e.src, res));
+        self.pending_res.remove(&res);
+        if !e.gpu_written {
+            self.sub_src_chunks(e.src, size);
+        }
+        if self.by_src.is_empty() {
+            self.max_src_size = 0;
+        }
+    }
+
+    /// Coarse 1 MiB-aligned `(start, end)` runs covering all active non-`gpu_written` textures.
+    fn watch_spans(&self) -> Vec<(usize, usize)> {
+        let mut out: Vec<(usize, usize)> = Vec::new();
+        for &c in self.src_chunks.keys() {
+            let lo = c << SRC_CHUNK_SHIFT;
+            let hi = lo.saturating_add(SRC_CHUNK_SIZE);
+            match out.last_mut() {
+                Some(last) if lo <= last.1.saturating_add(WATCH_GAP) => last.1 = last.1.max(hi),
+                _ => out.push((lo, hi)),
+            }
+        }
+        out
     }
 
     fn has_active_overlap(&self, va: usize, end: usize) -> bool {
@@ -146,6 +228,7 @@ impl Table {
         for (ova, ores, _) in self.active_overlaps(va, end) {
             self.by_va.remove(&(ova, ores));
             if let Some(old) = self.by_res.remove(&ores) {
+                self.unindex_active(ores, &old);
                 if old.pending {
                     pending_delta -= 1;
                 }
@@ -182,6 +265,7 @@ impl Table {
         let mut to_unmap = Vec::new();
         if let Some(old) = self.by_res.remove(&res) {
             self.by_va.remove(&(old.va, res));
+            self.unindex_active(res, &old);
             if old.pending {
                 pending_delta -= 1;
             }
@@ -195,6 +279,7 @@ impl Table {
             }
             self.by_va.remove(&(ova, ores));
             if let Some(mut old) = self.by_res.remove(&ores) {
+                self.unindex_active(ores, &old);
                 if old.pending {
                     pending_delta -= 1;
                 }
@@ -225,6 +310,7 @@ impl Table {
             pending_delta += 1;
         }
         self.by_va.insert((va, res), end);
+        self.index_active(res, &entry);
         self.by_res.insert(res, entry);
         (pending_delta, to_unmap)
     }
@@ -241,6 +327,7 @@ impl Table {
         }
         let Some(old) = self.by_res.remove(&res) else { return (false, 0, Vec::new()) };
         self.by_va.remove(&(old.va, res));
+        self.unindex_active(res, &old);
         let mut pending_delta = if old.pending { -1 } else { 0 };
         let va = old.va;
         let end = va.saturating_add(old.tex.size() as usize);
@@ -268,6 +355,7 @@ impl Table {
                     pending_delta += 1;
                 }
                 self.by_va.insert((sva, sres), send);
+                self.index_active(sres, &e);
                 self.by_res.insert(sres, e);
             }
         }
@@ -430,7 +518,28 @@ fn recheck_gpu_view_sources() {
     // (the shadowed textures too: one comes back when the texture over it goes)
     let mut g = TEXTURES.lock().unwrap();
     let t = &mut *g;
-    for e in t.by_res.values_mut().chain(t.shadowed.values_mut()) {
+    let active_keys: Vec<usize> = t.by_res.keys().copied().collect();
+    for res in active_keys {
+        let old = t.by_res.get(&res).map(|e| (e.src, e.tex.size() as usize, e.gpu_written));
+        if let Some(e) = t.by_res.get_mut(&res) {
+            if recheck_source(e) {
+                let (new_src, new_pending) = (e.src, e.pending);
+                if let Some((old_src, size, gpu_w)) = old {
+                    t.by_src.remove(&(old_src, res));
+                    t.by_src.insert((new_src, res), new_src.saturating_add(size));
+                    if new_pending {
+                        t.pending_res.insert(res);
+                    }
+                    if !gpu_w {
+                        t.sub_src_chunks(old_src, size);
+                        t.add_src_chunks(new_src, size);
+                    }
+                }
+                changed = true;
+            }
+        }
+    }
+    for e in t.shadowed.values_mut() {
         changed |= recheck_source(e);
     }
     drop(g);
@@ -474,15 +583,28 @@ pub fn note_gpu_write(res: usize) {
         }
     }
     let mut marked = false;
+    let mut active_marked = false;
     {
         let mut t = TEXTURES.lock().unwrap();
-        if let Some(e) = t.get_mut(res) {
+        if let Some(e) = t.by_res.get_mut(&res) {
+            if !e.gpu_written {
+                e.gpu_written = true;
+                let (src, size) = (e.src, e.tex.size() as usize);
+                t.sub_src_chunks(src, size);
+                GPU_WRITTEN.fetch_add(1, Ordering::Relaxed);
+                marked = true;
+                active_marked = true;
+            }
+        } else if let Some(e) = t.shadowed.get_mut(&res) {
             if !e.gpu_written {
                 e.gpu_written = true;
                 GPU_WRITTEN.fetch_add(1, Ordering::Relaxed);
                 marked = true;
             }
         }
+    }
+    if active_marked {
+        TEXTURES_GEN.fetch_add(1, Ordering::Release);
     }
     if marked {
         STREAM_RECHECK.lock().unwrap().remove(&res);
@@ -659,12 +781,14 @@ thread_local! {
     static DIRTY_BUF: std::cell::RefCell<Vec<usize>> = const { std::cell::RefCell::new(Vec::new()) };
 }
 
+static SPARSE_WATCH_CACHE: Mutex<Option<(u64, Vec<(usize, usize)>)>> = Mutex::new(None);
+static TEX_WATCH_CACHE: Mutex<Option<(u64, Vec<(usize, usize)>)>> = Mutex::new(None);
+
 fn cached_watch_ranges(u: &crate::gpu::uma::Uma) -> Arc<Vec<(usize, usize)>> {
-    let key = (
-        super::sparse::mapped_gen(),
-        TEXTURES_GEN.load(Ordering::Acquire),
-        crate::hle::kernelx::graphics_reservations_gen(),
-    );
+    let sp_gen = super::sparse::mapped_gen();
+    let tex_gen = TEXTURES_GEN.load(Ordering::Acquire);
+    let gr_gen = crate::hle::kernelx::graphics_reservations_gen();
+    let key = (sp_gen, tex_gen, gr_gen);
     {
         let g = WATCH_CACHE.lock().unwrap();
         if let Some((k, ref ranges)) = *g {
@@ -673,15 +797,58 @@ fn cached_watch_ranges(u: &crate::gpu::uma::Uma) -> Arc<Vec<(usize, usize)>> {
             }
         }
     }
-    // Recompute the watched ranges (textures kept in step + mapped sparse tiles clipped to
-    // write-watched regions) only when the set of textures, tiles, or reservations changed.
+    let sp_spans: Vec<(usize, usize)> = {
+        let mut g = SPARSE_WATCH_CACHE.lock().unwrap();
+        if let Some((k, ref v)) = *g {
+            if k == sp_gen {
+                v.clone()
+            } else {
+                let v = merge_spans(super::sparse::mapped_ranges());
+                *g = Some((sp_gen, v.clone()));
+                v
+            }
+        } else {
+            let v = merge_spans(super::sparse::mapped_ranges());
+            *g = Some((sp_gen, v.clone()));
+            v
+        }
+    };
+    let tex_spans: Vec<(usize, usize)> = {
+        let mut g = TEX_WATCH_CACHE.lock().unwrap();
+        if let Some((k, ref v)) = *g {
+            if k == tex_gen {
+                v.clone()
+            } else {
+                let v = TEXTURES.lock().unwrap().watch_spans();
+                *g = Some((tex_gen, v.clone()));
+                v
+            }
+        } else {
+            let v = TEXTURES.lock().unwrap().watch_spans();
+            *g = Some((tex_gen, v.clone()));
+            v
+        }
+    };
     let mut regions = u.watch_regions();
     regions.extend(crate::hle::kernelx::graphics_reservations());
-    let mut wanted: Vec<(usize, usize)> = TEXTURES.lock().unwrap().by_res.values().map(|e| (e.src & !0xFFF, (e.src + e.tex.size() as usize + 0xFFF) & !0xFFF)).collect();
-    wanted.extend(super::sparse::mapped_ranges());
+    let mut wanted = Vec::with_capacity(sp_spans.len() + tex_spans.len());
+    wanted.extend(sp_spans);
+    wanted.extend(tex_spans);
     let computed = Arc::new(watch_ranges(&regions, wanted));
     *WATCH_CACHE.lock().unwrap() = Some((key, Arc::clone(&computed)));
     computed
+}
+
+fn merge_spans(mut spans: Vec<(usize, usize)>) -> Vec<(usize, usize)> {
+    spans.sort_unstable();
+    let mut merged: Vec<(usize, usize)> = Vec::new();
+    for (a, b) in spans {
+        match merged.last_mut() {
+            Some(last) if a <= last.1.saturating_add(WATCH_GAP) => last.1 = last.1.max(b),
+            _ => merged.push((a, b)),
+        }
+    }
+    merged
 }
 
 /// Run `f` as XCL's own GPU work: ExecuteCommandLists inside it does not refresh.
@@ -729,6 +896,7 @@ unsafe fn take_written(base: usize, size: usize, buf: &mut [*mut c_void], dirty:
 }
 
 unsafe fn refresh_once(queue: *mut c_void) {
+    texture::reap_async_uploads();
     let Some(u) = crate::gpu::uma::get() else { return };
     let sparse = u.has_sparse();
     if !sparse && TEXTURES_LEN.load(Ordering::Relaxed) == 0 {
@@ -746,11 +914,18 @@ unsafe fn refresh_once(queue: *mut c_void) {
             if buf.len() < 16384 {
                 buf.resize(16384, std::ptr::null_mut());
             }
-            for &(base, size) in ranges.iter() {
-                take_written(base, size, &mut buf, &mut dirty, &mut page);
+            if super::watch_trap::on() {
+                let mut p = page;
+                super::watch_trap::look(&ranges, &mut dirty, 0x1000, |a, n, d| take_written(a, n, &mut buf, d, &mut p));
+                page = p;
+            } else {
+                for &(base, size) in ranges.iter() {
+                    take_written(base, size, &mut buf, &mut dirty, &mut page);
+                }
             }
         });
         dirty.sort_unstable();
+        dirty.dedup();
         dirty.len()
     });
     super::sparse::note_watch(watch_t0.elapsed(), dirty_len);
@@ -796,38 +971,68 @@ unsafe fn refresh_once(queue: *mut c_void) {
         p.max(b)
     };
     recheck_streamed_unwatched(&ranges, recheck_frame);
-    if dirty_len == 0 && PENDING.load(Ordering::Relaxed) == 0 {
-        return;
+    if dirty_len != 0 || PENDING.load(Ordering::Relaxed) != 0 {
+        // textures made since the last submit and those with a written page; a reference each
+        // while they are uploaded
+        let todo: Vec<(ID3D12Resource, Upload)> = DIRTY_BUF.with(|dcell| {
+            let dirty = dcell.borrow();
+            let mut t = TEXTURES.lock().unwrap();
+            let mut picked_ids: Vec<(usize, bool)> = Vec::new();
+            let mut seen = std::collections::HashSet::new();
+            if !t.pending_res.is_empty() {
+                let pend = std::mem::take(&mut t.pending_res);
+                for res in pend {
+                    if let Some(e) = t.by_res.get_mut(&res) {
+                        let was_pending = e.pending;
+                        if e.pending {
+                            e.pending = false;
+                            PENDING.fetch_sub(1, Ordering::Relaxed);
+                        }
+                        if was_pending && seen.insert(res) {
+                            picked_ids.push((res, true));
+                        }
+                    }
+                }
+            }
+            if !dirty.is_empty() && !t.by_src.is_empty() {
+                let max_sz = t.max_src_size;
+                let pg = page as usize;
+                let mut i = 0;
+                while i < dirty.len() {
+                    let lo = dirty[i];
+                    let mut hi = lo.saturating_add(pg);
+                    i += 1;
+                    while i < dirty.len() && dirty[i] == hi {
+                        hi = hi.saturating_add(pg);
+                        i += 1;
+                    }
+                    let start_key = (lo.saturating_sub(max_sz), 0);
+                    let end_key = (hi, 0);
+                    for (&(_, res), &src_end) in t.by_src.range(start_key..end_key) {
+                        if src_end > lo && seen.insert(res) {
+                            picked_ids.push((res, false));
+                        }
+                    }
+                }
+            }
+            picked_ids
+                .into_iter()
+                .filter_map(|(res, was_pending)| {
+                    let e = t.by_res.get(&res)?;
+                    if e.gpu_written && !was_pending {
+                        return None;
+                    }
+                    let p = res as *mut c_void;
+                    ID3D12Resource::from_raw_borrowed(&p).map(|r| (r.clone(), (e.device, e.src, Arc::clone(&e.tex), e.states.clone())))
+                })
+                .collect()
+        });
+        seed_stream_recheck(&todo, &ranges, recheck_frame);
+        upload_all(todo, queue.is_null());
     }
-    // textures made since the last submit and those with a written page; a reference each
-    // while they are uploaded
-    let todo: Vec<(ID3D12Resource, Upload)> = DIRTY_BUF.with(|dcell| {
-        let dirty = dcell.borrow();
-        let mut t = TEXTURES.lock().unwrap();
-        t.by_res
-            .iter_mut()
-            .filter(|(_, e)| {
-                if e.pending {
-                    return true;
-                }
-                if e.gpu_written {
-                    return false;
-                }
-                let i = dirty.partition_point(|&p| p + page as usize <= e.src);
-                dirty.get(i).is_some_and(|&p| p < e.src + e.tex.size() as usize)
-            })
-            .filter_map(|(&res, e)| {
-                if e.pending {
-                    e.pending = false;
-                    PENDING.fetch_sub(1, Ordering::Relaxed);
-                }
-                let p = res as *mut c_void;
-                ID3D12Resource::from_raw_borrowed(&p).map(|r| (r.clone(), (e.device, e.src, Arc::clone(&e.tex), e.states.clone())))
-            })
-            .collect()
-    });
-    seed_stream_recheck(&todo, &ranges, recheck_frame);
-    upload_all(todo);
+    if let Some(q) = ID3D12CommandQueue::from_raw_borrowed(&queue) {
+        wait_for_uploads(q);
+    }
 }
 
 /// texture → `content_hash` of its memory at its last upload
@@ -842,6 +1047,7 @@ fn unchanged_skip() -> bool {
 
 /// Whether texture `res` was last uploaded from memory with hash `h`; `h` is remembered as its
 /// content from here on (the caller uploads it when this is false).
+#[cfg(test)]
 fn same_as_last_upload(res: usize, h: u64) -> bool {
     LAST_CONTENT.lock().unwrap().insert(res, h) == Some(h)
 }
@@ -1052,12 +1258,17 @@ unsafe fn recheck_streamed_unwatched_at(watched: &[(usize, usize)], frame: u64) 
         {
             let mut t = TEXTURES.lock().unwrap();
             for res in changed {
+                let mut mark = false;
                 if let Some(e) = t.by_res.get_mut(&res) {
                     if !e.gpu_written && !e.pending {
                         e.pending = true;
                         PENDING.fetch_add(1, Ordering::Relaxed);
                         queued += 1;
+                        mark = true;
                     }
+                }
+                if mark {
+                    t.pending_res.insert(res);
                 }
             }
         }
@@ -1087,56 +1298,161 @@ fn batch_fits(picked_count: usize, picked_bytes: usize, batch_dev: usize, next_d
             && picked_bytes.saturating_add(next_bytes) <= BATCH_BYTES)
 }
 
-/// The uploads `todo`, in batches of up to `BATCH_BYTES` and `BATCH_ITEMS` (one list and one wait each).
-unsafe fn upload_all(todo: Vec<(ID3D12Resource, Upload)>) {
+struct SendFence(ID3D12Fence);
+unsafe impl Send for SendFence {}
+
+/// Latest async texture upload fence value per device, and last waited value per title queue.
+static UPLOAD_SYNC: Mutex<BTreeMap<usize, (SendFence, u64, BTreeMap<usize, u64>)>> = Mutex::new(BTreeMap::new());
+
+unsafe fn note_upload_fence(device: usize, fence: ID3D12Fence, value: u64) {
+    let mut g = UPLOAD_SYNC.lock().unwrap();
+    match g.get_mut(&device) {
+        Some(entry) => {
+            let same_fence = entry.0 .0.as_raw() == fence.as_raw();
+            if !same_fence {
+                entry.0 = SendFence(fence);
+                entry.1 = value;
+                entry.2.clear();
+            } else if value > entry.1 {
+                entry.1 = value;
+            }
+        }
+        None => {
+            g.insert(device, (SendFence(fence), value, BTreeMap::new()));
+        }
+    }
+}
+
+pub(super) unsafe fn wait_for_uploads(queue: &ID3D12CommandQueue) {
+    let mut dev: Option<ID3D12Device> = None;
+    if queue.GetDevice(&mut dev).is_err() {
+        return;
+    }
+    let Some(dev) = dev else { return };
+    let dev_key = dev.as_raw() as usize;
+    let q = queue.as_raw() as usize;
+    let mut g = UPLOAD_SYNC.lock().unwrap();
+    if let Some((fence, val, waited)) = g.get_mut(&dev_key) {
+        if *val > 0 && waited.get(&q).copied().unwrap_or(0) < *val {
+            if queue.Wait(&fence.0, *val).is_ok() {
+                super::list_x::note_internal_wait(q, "title texture uploads", &fence.0, *val);
+                waited.insert(q, *val);
+            }
+        }
+    }
+}
+
+/// The uploads `todo`, in batches of up to `BATCH_BYTES` and `BATCH_ITEMS` (async GPU copies when
+/// `sync == false`, synchronous when a caller passes no title queue to wait on).
+unsafe fn upload_all(todo: Vec<(ID3D12Resource, Upload)>, sync: bool) {
     static N: AtomicU64 = AtomicU64::new(0);
     let warn = |e: &str| {
         if N.fetch_add(1, Ordering::Relaxed) < 4 {
             crate::xlog_warn!("title texture: upload failed: {e}");
         }
     };
+    let do_skip = unchanged_skip();
     let mut todo = todo.into_iter().peekable();
     while todo.peek().is_some() {
-        let mut picked = Vec::new();
+        let mut raw_batch: Vec<(ID3D12Resource, usize, Arc<xg::Texture>, Vec<D3D12_RESOURCE_STATES>)> = Vec::new();
         let mut bytes = 0usize;
         let mut device = 0usize;
         while let Some((_, (dev, _, tex, _))) = todo.peek() {
-            if !batch_fits(picked.len(), bytes, device, *dev, tex.size() as usize) {
+            if !batch_fits(raw_batch.len(), bytes, device, *dev, tex.size() as usize) {
                 break;
             }
             let (r, (dev, va, tex, states)) = todo.next().unwrap();
-            // The same bytes as at this texture's last upload: nothing to do. The write watch is
-            // per page and a title writes next to its textures (and rewrites what it wrote): a
-            // retail title's video planes and UI targets went up again for every submit, ~25 MB
-            // a presented frame where ~3 MB had changed, and the submits waited here.
-            if unchanged_skip() {
-                let h = content_hash(&title_bytes(va, tex.size() as usize));
-                if same_as_last_upload(r.as_raw() as usize, h) {
-                    let n = UNCHANGED.fetch_add(1, Ordering::Relaxed) + 1;
-                    if n == 1 || (n.is_power_of_two() && n >= 1024) {
-                        crate::xlog_info!("title textures: {n} uploads left out so far – the texture's memory held what it held at its last upload");
-                    }
-                    continue;
-                }
-            }
             device = dev;
             bytes += tex.size() as usize;
-            picked.push((r, va, tex, states));
+            raw_batch.push((r, va, tex, states));
         }
-        if picked.is_empty() {
+        if raw_batch.is_empty() {
             continue;
         }
-        let subs = subresources_of_all(&picked, bytes);
-        let mut batch = Vec::with_capacity(picked.len());
-        for ((r, va, _, states), subs) in picked.into_iter().zip(subs) {
+        // Snapshot previous content hashes in one lock so read + hash + detile run lock-free in parallel.
+        let prev_hashes: Vec<Option<u64>> = if do_skip {
+            let g = LAST_CONTENT.lock().unwrap();
+            raw_batch.iter().map(|(r, _, _, _)| g.get(&(r.as_raw() as usize)).copied()).collect()
+        } else {
+            vec![None; raw_batch.len()]
+        };
+        let work_items: Vec<(usize, &xg::Texture, Option<u64>)> = raw_batch
+            .iter()
+            .zip(&prev_hashes)
+            .map(|((_, va, tex, _), &ph)| (*va, &**tex, ph))
+            .collect();
+        let threads = if bytes < (256 << 10) && work_items.len() < 4 {
+            1
+        } else {
+            std::thread::available_parallelism().map_or(1, |n| n.get() / 2).clamp(1, 8).min(work_items.len())
+        };
+        let prep_one = |va: usize, tex: &xg::Texture, prev: Option<u64>| -> Option<(Option<u64>, Vec<Subresource>)> {
+            if do_skip {
+                let b = title_bytes(va, tex.size() as usize);
+                let h = content_hash(&b);
+                if prev == Some(h) {
+                    return None;
+                }
+                Some((Some(h), subresources_from_bytes(&b, tex)))
+            } else {
+                Some((None, subresources(va, tex)))
+            }
+        };
+        let mut results: Vec<Option<(Option<u64>, Vec<Subresource>)>> = if threads <= 1 {
+            work_items.iter().map(|&(va, tex, ph)| prep_one(va, tex, ph)).collect()
+        } else {
+            let next = std::sync::atomic::AtomicUsize::new(0);
+            let mut out: Vec<Option<(Option<u64>, Vec<Subresource>)>> = (0..work_items.len()).map(|_| None).collect();
+            let done: Vec<Vec<(usize, Option<(Option<u64>, Vec<Subresource>)>)>> = std::thread::scope(|s| {
+                let workers: Vec<_> = (0..threads)
+                    .map(|_| {
+                        s.spawn(|| {
+                            let mut mine = Vec::new();
+                            loop {
+                                let k = next.fetch_add(1, Ordering::Relaxed);
+                                let Some(&(va, tex, ph)) = work_items.get(k) else { break };
+                                mine.push((k, prep_one(va, tex, ph)));
+                            }
+                            mine
+                        })
+                    })
+                    .collect();
+                workers.into_iter().map(|w| w.join().unwrap_or_default()).collect()
+            });
+            for (k, r) in done.into_iter().flatten() {
+                out[k] = r;
+            }
+            out
+        };
+        let mut new_hashes: Vec<(usize, u64)> = Vec::new();
+        let mut batch = Vec::with_capacity(raw_batch.len());
+        for ((r, va, _, states), res) in raw_batch.into_iter().zip(results.drain(..)) {
+            let Some((hash_opt, subs)) = res else {
+                let n = UNCHANGED.fetch_add(1, Ordering::Relaxed) + 1;
+                if n == 1 || (n.is_power_of_two() && n >= 1024) {
+                    crate::xlog_info!("title textures: {n} uploads left out so far – the texture's memory held what it held at its last upload");
+                }
+                continue;
+            };
+            if let Some(h) = hash_opt {
+                new_hashes.push((r.as_raw() as usize, h));
+            }
             if super::present::trace_frame() {
                 note_content(va, &r, &subs);
             }
             if super::vram::level_pages() {
-                // (the queue waits for these mappings before the copies: `vram::before_execute` below)
                 map_levels_with_texels(&r, &subs);
             }
             batch.push((r, subs, states));
+        }
+        if !new_hashes.is_empty() {
+            let mut g = LAST_CONTENT.lock().unwrap();
+            for (k, h) in new_hashes {
+                g.insert(k, h);
+            }
+        }
+        if batch.is_empty() {
+            continue;
         }
         let d = device as *mut c_void;
         let Some(dev) = ID3D12Device::from_raw_borrowed(&d) else { continue };
@@ -1147,17 +1463,35 @@ unsafe fn upload_all(todo: Vec<(ID3D12Resource, Upload)>) {
                 continue;
             }
         };
-        match own_work(|| {
-            super::vram::before_execute(&queue);
-            texture::upload_batch(dev, &queue, &batch)
-        }) {
-            Ok(failed) => {
-                for (_, e) in failed {
-                    warn(&e);
+        if sync {
+            match own_work(|| {
+                super::vram::before_execute(&queue);
+                texture::upload_batch(dev, &queue, &batch)
+            }) {
+                Ok(failed) => {
+                    for (_, e) in failed {
+                        warn(&e);
+                    }
+                    UPLOADS.fetch_add(batch.len() as u64, Ordering::Relaxed);
                 }
-                UPLOADS.fetch_add(batch.len() as u64, Ordering::Relaxed);
+                Err(e) => warn(&e),
             }
-            Err(e) => warn(&e),
+        } else {
+            match own_work(|| {
+                super::vram::before_execute(&queue);
+                texture::upload_batch_async(dev, &queue, &batch)
+            }) {
+                Ok((failed, fence)) => {
+                    for (_, e) in failed {
+                        warn(&e);
+                    }
+                    if let Some((f, v)) = fence {
+                        note_upload_fence(device, f, v);
+                    }
+                    UPLOADS.fetch_add(batch.len() as u64, Ordering::Relaxed);
+                }
+                Err(e) => warn(&e),
+            }
         }
     }
 }
@@ -1313,7 +1647,7 @@ unsafe fn upload_queue(dev: &ID3D12Device, device: usize) -> Result<ID3D12Comman
 /// retail game's intro video had its submitting thread at 42 % in GetWriteWatch with a 1 MiB gap
 /// (thousands of calls before each submit over its mapped sparse tiles). The pages of a gap are
 /// reported as written too; the uploads keep to what they track.
-const WATCH_GAP: usize = 64 << 20;
+const WATCH_GAP: usize = 4 << 20;
 
 /// The parts of `wanted` (start, end) inside `regions` (base, size), merged (gaps under
 /// `WATCH_GAP` too) and sorted, as (base, size) – each within one region (a write-watch call
@@ -1410,19 +1744,27 @@ unsafe fn read_committed(at: usize, len: usize) -> Vec<u8> {
     out
 }
 
-/// Batches of at least this many bytes are detiled on several threads (`subresources_of_all`)
-const PARALLEL_BYTES: usize = 1 << 20;
-
-/// `subresources` of every texture of a batch (`bytes` of them), in order: on several threads
-/// when the batch is big. They were read and detiled one after another in the title's own
-/// submit – most of a retail game's render thread while it streamed textures the CPU writes.
-unsafe fn subresources_of_all(picked: &[(ID3D12Resource, usize, Arc<xg::Texture>, Vec<D3D12_RESOURCE_STATES>)], bytes: usize) -> Vec<Vec<Subresource>> {
-    let picked: Vec<(usize, &xg::Texture)> = picked.iter().map(|(_, va, tex, _)| (*va, &**tex)).collect();
-    let threads = if bytes < PARALLEL_BYTES { 1 } else { std::thread::available_parallelism().map_or(1, |n| n.get() / 2).clamp(1, 8) };
-    subresources_on(&picked, threads)
+fn subresources_from_bytes(mem: &[u8], tex: &xg::Texture) -> Vec<Subresource> {
+    let Some(tex) = tex.texels() else { return Vec::new() };
+    let c = &tex.chain;
+    let bpe = tex.bpe as usize;
+    if tex.depth > 0 {
+        return c.levels.iter().enumerate().map(|(i, l)| Subresource { depth: l.depth, rows: l.height, row_bytes: l.width * bpe, data: c.detile_volume(mem, i) }).collect();
+    }
+    let mut out = Vec::with_capacity(tex.array as usize * c.levels.len());
+    for s in 0..tex.array as usize {
+        let start = s * c.slice_bytes;
+        let end = start + c.slice_bytes;
+        let slice = if end <= mem.len() { &mem[start..end] } else { mem };
+        for (i, l) in c.levels.iter().enumerate() {
+            out.push(Subresource { depth: 1, rows: l.height, row_bytes: l.width * bpe, data: c.detile_level(slice, i, s) });
+        }
+    }
+    out
 }
 
 /// `subresources` of each (address, texture), in order, on up to `threads` threads.
+#[cfg(test)]
 unsafe fn subresources_on(picked: &[(usize, &xg::Texture)], threads: usize) -> Vec<Vec<Subresource>> {
     let threads = threads.min(picked.len());
     if threads <= 1 {
@@ -1454,10 +1796,12 @@ unsafe fn subresources_on(picked: &[(usize, &xg::Texture)], threads: usize) -> V
     out
 }
 
-/// The title's bytes at `at`: where they are when all of them are readable (a copy first cost
-/// as much as the detile of a video frame), else read page run by page run.
+/// The title's bytes at `at`: where they are in a coherent window, which stays committed as a
+/// whole (a copy first cost as much as the detile of a video frame), else read page run by page
+/// run. Elsewhere the title can decommit a page between a readability check and the detile's
+/// read of it (an access violation in the detile, #751), which `read_committed` survives.
 unsafe fn title_bytes(at: usize, len: usize) -> std::borrow::Cow<'static, [u8]> {
-    if crate::gpu::shader::readable(at, len) {
+    if crate::gpu::uma::get().is_some_and(|u| u.in_committed_window(at, len)) {
         std::borrow::Cow::Borrowed(std::slice::from_raw_parts(at as *const u8, len))
     } else {
         std::borrow::Cow::Owned(read_committed(at, len))
@@ -1813,10 +2157,11 @@ mod tests {
         assert!(LIST_NOTES.lock().unwrap().get(&l1).is_none());
     }
 
-    /// The title's bytes are used where they are when all of them are readable, and read with the
-    /// pages that are not committed as zeros otherwise – the same bytes either way.
+    /// Outside a coherent window the title's bytes are read (so a page the title decommits meanwhile
+    /// reads as zeros instead of faulting the detile, #751), with the pages that are not committed
+    /// as zeros – the bytes where they are, either way.
     #[test]
-    fn title_bytes_are_used_in_place_when_all_are_readable() {
+    fn title_bytes_outside_the_windows_are_read_not_borrowed() {
         use windows_sys::Win32::System::Memory::{VirtualAlloc, VirtualFree, MEM_COMMIT, MEM_RELEASE, MEM_RESERVE, PAGE_READWRITE};
         unsafe {
             let base = VirtualAlloc(std::ptr::null(), 3 << 12, MEM_RESERVE, PAGE_READWRITE) as usize;
@@ -1826,8 +2171,7 @@ mod tests {
                 std::ptr::write_bytes((base + (page << 12)) as *mut u8, 0xA0 + page as u8, 1 << 12);
             }
             let whole = title_bytes(base, 1 << 12);
-            assert!(matches!(whole, std::borrow::Cow::Borrowed(_)), "a committed page is not copied");
-            assert_eq!(whole.as_ptr() as usize, base);
+            assert!(matches!(whole, std::borrow::Cow::Owned(_)), "memory outside the windows is read, not borrowed");
             assert!(whole.iter().all(|&b| b == 0xA0));
             let holed = title_bytes(base, 3 << 12);
             assert!(matches!(holed, std::borrow::Cow::Owned(_)), "a range with a reserved page is read");
@@ -1844,8 +2188,16 @@ mod tests {
         let wanted = vec![(0x12000, 0x13000), (0x11000, 0x12800), (0x1F000, 0x41000), (0x60000, 0x61000)];
         assert_eq!(watch_ranges(&regions, wanted), vec![(0x11000, 0xF000), (0x40000, 0x10000)]);
         // ranges a gap of under WATCH_GAP apart: one scan; further apart: two
-        let wanted = vec![(0x1000_0000, 0x1000_1000), (0x1008_0000, 0x1008_1000), (0x1100_0000, 0x1100_1000), (0x1800_0000, 0x1800_1000)];
-        assert_eq!(watch_ranges(&regions, wanted), vec![(0x1000_0000, 0x100_1000), (0x1800_0000, 0x1000)]);
+        let wanted = vec![
+            (0x1000_0000, 0x1000_1000),
+            (0x1000_0000 + WATCH_GAP / 2, 0x1000_1000 + WATCH_GAP / 2),
+            (0x1000_0000 + WATCH_GAP, 0x1000_1000 + WATCH_GAP),
+            (0x1000_0000 + WATCH_GAP * 3, 0x1000_1000 + WATCH_GAP * 3),
+        ];
+        assert_eq!(
+            watch_ranges(&regions, wanted),
+            vec![(0x1000_0000, WATCH_GAP + 0x1000), (0x1000_0000 + WATCH_GAP * 3, 0x1000)]
+        );
         // a merged range over two regions: a piece in each, whatever order the regions come in
         let regions = [(0x40000, 0x10000), (0x10000, 0x10000)];
         assert_eq!(watch_ranges(&regions, vec![(0x18000, 0x48000)]), vec![(0x18000, 0x8000), (0x40000, 0x8000)]);

@@ -118,6 +118,12 @@ pub fn heap_windows() -> bool {
     *ENV.get_or_init(|| std::env::var("XCL_HEAP_WINDOWS").is_ok_and(|v| v.trim() == "1")) && !crate::hle::d3d12x::console_heap::window_views_failed()
 }
 
+/// Scope an experimental byte-store comparison to a single console compute shader.
+pub(crate) fn byte_store_program() -> Option<u64> {
+    static PROGRAM: OnceLock<Option<u64>> = OnceLock::new();
+    *PROGRAM.get_or_init(|| u64::from_str_radix(std::env::var("XCL_BYTE_STORE_CS").ok()?.trim(), 16).ok())
+}
+
 /// A static sampler of a translated program: (S#, comparison) – see `Translation`.
 pub type StaticSampler = ([u32; 4], bool);
 
@@ -153,12 +159,19 @@ fn shader_cache() -> &'static Mutex<ShaderCache> {
 /// `console_to_dxil_for` with the title's memory windows given (`xcl shaders --precompile`
 /// fills the caches without a title: the same keys as at its run).
 pub fn console_to_dxil_in(blob: &[u8], stage: Stage, sampler_base: u32, split_wave64: bool, windows: u32) -> Result<Compiled, String> {
+    let hash = crate::gpu::shader::fnv64(blob);
+    let windows = if stage == Stage::Compute && windows == (super::HEAP_WINDOWS | 4) && byte_store_program() == Some(hash)
+        && crate::gpu::dxil::kernel::enabled() && !super::lower_dxil::enabled()
+        && !crate::hle::d3d12x::console_heap::byte_views_unavailable()
+    {
+        windows | super::BYTE_WINDOWS
+    } else { windows };
     let compile_one = || compile_console_shader(blob, stage, sampler_base, windows, split_wave64);
     if !cache_allowed(stage, |name| std::env::var_os(name).is_some()) {
         return compile_one().map(|(c, _)| c);
     }
     let key = ShaderKey {
-        hash: crate::gpu::shader::fnv64(blob),
+        hash,
         stage,
         sampler_base,
         windows,
@@ -257,6 +270,9 @@ mod translated {
                 Backend::current(),
                 direct_version(crate::gpu::dxil::kernel::TRANSLATOR_VERSION, env!("XCL_DIRECT_DXIL_SOURCE_ID")),
             );
+            let id = if Backend::current() != Backend::Hlsl && crate::gpu::dxil::kernel::declared_lds_enabled() {
+                identity_for(&id.to_string(), "declared-lds")
+            } else { id };
             // `XCL_DIRECT_COMPACT=0` or `1`: the compact form forced off or on is another output
             let id = match crate::gpu::dxil::kernel::compact_mode() {
                 Some(on) if Backend::current() != Backend::Hlsl => identity_for(&id.to_string(), if on { "xcl-direct-compact-1" } else { "xcl-direct-compact-0" }),
@@ -507,6 +523,9 @@ mod translated {
             Some(on) => identity_for(&id.to_string(), if on { "xcl-direct-compact-1" } else { "xcl-direct-compact-0" }),
             None => id,
         };
+        let id = if crate::gpu::dxil::kernel::declared_lds_enabled() {
+            identity_for(&id.to_string(), "declared-lds")
+        } else { id };
         let id = match nest_tag {
             Some(tag) => identity_for(&id.to_string(), tag),
             None => id,
@@ -597,6 +616,7 @@ fn compile_console_shader(blob: &[u8], stage: Stage, sampler_base: u32, windows:
             Err(e) => direct_fallback("CS", &e),
         }
     }
+    let windows = windows & !super::BYTE_WINDOWS;
     // `XCL_DIRECT_DXIL=all`: vertex / pixel shaders too (not with the PS debug hooks below)
     let ps_debug = stage == Stage::Pixel
         && (debug_color(blob).is_some() || ["XCL_DEBUG_LOD0", "XCL_DEBUG_PS_SUB", "XCL_DEBUG_PS_EXPR"].iter().any(|v| std::env::var_os(v).is_some()));
@@ -932,6 +952,21 @@ pub fn compute_user_sgprs(blob: &[u8]) -> Option<u32> {
         Mode::Compute(cs) => Some(cs.user_sgprs),
         _ => None,
     }
+}
+
+/// A console compute shader's thread group size, whether its program is wave64 and the bytes
+/// of its RDNA2 code (`XCL_GPU_PROFILE` names a program by them). None: not a console compute
+/// shader.
+pub fn compute_shape(blob: &[u8]) -> Option<([u32; 3], bool, usize)> {
+    if let Some(f) = fspx(blob) {
+        return Some((f.threads, super::detect_wave64(f.code), f.code.len()));
+    }
+    let sh = xbox::parse(blob)?;
+    let f = sh.fssm.iter().find(|f| f.stages.first().is_some_and(|s| s.hw == 6))?;
+    let Mode::Compute(cs) = interface(blob, &sh, f)? else { return None };
+    let p = f.programs.first()?;
+    let code = f.data.get(p.offset..p.offset + p.len)?;
+    Some((cs.threads, super::detect_wave64(code), code.len()))
 }
 
 /// The HLSL and profile a console program compiles from at pipeline creation (for
@@ -1650,6 +1685,36 @@ mod shader_cache_tests {
             assert!(out.status.success(), "nest={nest}, split={split}: {}\n{}", String::from_utf8_lossy(&out.stdout), String::from_utf8_lossy(&out.stderr));
         }
         std::fs::remove_dir_all(&dir).unwrap();
+    }
+
+    #[test]
+    fn declared_lds_disk_cache_separates_both_direct_routes() {
+        const CASE: &str = "XCL_TEST_DECLARED_LDS_CACHE";
+        if let Ok(case) = std::env::var(CASE) {
+            let (marker, expected) = case.split_once(':').unwrap();
+            let marker = marker.parse().unwrap();
+            let rerouted = !crate::gpu::dxil::kernel::enabled();
+            let shader = translated::cached(&dxc::cache_dir(), b"console-lds", Stage::Compute, 0, 1, true,
+                || Ok((compiled(marker), rerouted))).unwrap();
+            assert_eq!(shader.dxil[67], expected.parse::<u8>().unwrap());
+            return;
+        }
+        for direct in ["0", "1"] {
+            let dir = std::env::temp_dir().join(format!("xcl-declared-lds-{}-{direct}", std::process::id()));
+            let _ = std::fs::remove_dir_all(&dir);
+            for (lds, case) in [("0", "1:1"), ("1", "2:2"), ("0", "9:1"), ("1", "9:2")] {
+                let status = std::process::Command::new(std::env::current_exe().unwrap())
+                    .args(["--exact", "gpu::recomp::pso::shader_cache_tests::declared_lds_disk_cache_separates_both_direct_routes"])
+                    .env(CASE, case)
+                    .env("XCL_DXIL_CACHE", &dir)
+                    .env("XCL_TRANSLATED_CACHE", "1")
+                    .env("XCL_DIRECT_DXIL", direct)
+                    .env("XCL_DECLARED_LDS", lds)
+                    .status().unwrap();
+                assert!(status.success(), "direct={direct}, declared={lds}, case={case}");
+            }
+            std::fs::remove_dir_all(dir).unwrap();
+        }
     }
 
     fn key(hash: u64) -> ShaderKey {

@@ -176,7 +176,6 @@ A **gamepad is recommended**: console games are made for one, and their menus an
 
 - **Gamepad:** any controller Windows sees through XInput (Xbox controllers, wired or wireless) is the
   game's gamepad – buttons, sticks, triggers and rumble. It can be plugged in or out while the game runs.
-  GameInput keeps half a second of recent state changes so titles can read inputs between frames.
 - **PlayStation controllers** (DualShock 4 wired or over Bluetooth, DualSense wired) are the gamepad
   when no XInput controller is connected – buttons, sticks and triggers, no rumble or light bar.
   `XCL_PLAYSTATION_PAD=0` turns this off.
@@ -228,6 +227,14 @@ xcl shaders D:\data\shaders.rpf --precompile --only cs --pipelines --used-only  
 xcl shaders D:\data\shaders.rpf --export-hlsl out --record-hash HEX  # exact compute HLSL for investigation
 xcl shaders D:\data\shaders.rpf --measure-pso HEX --repeat 3         # cold driver PSO timing (cache disabled)
 xcl rpf D:\data\shaders.rpf --extract NAME --out folder
+```
+
+Fill the reusable DXIL cache ahead of a run with the read-only package wrapper. Add
+`-Pipelines` to warm the GPU driver's compute-pipeline cache too (slower and GPU/driver-specific):
+
+```powershell
+.\scripts\precompile-shaders.ps1 -Package 'D:\data\shaders.rpf'
+.\scripts\precompile-shaders.ps1 -Package 'D:\data\shaders.rpf' -Pipelines
 ```
 
 <details>

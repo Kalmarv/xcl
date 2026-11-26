@@ -424,9 +424,17 @@ impl Chain {
     /// level `i` of array slice `slice` (`src` = the slice's bytes) → linear rows of elements;
     /// bytes past the end of `src` read as 0
     pub fn detile_level(&self, src: &[u8], i: usize, slice: usize) -> Vec<u8> {
+        match self.layout.elem_log2 {
+            3 => self.detile_level_sized::<8>(src, i, slice),
+            4 => self.detile_level_sized::<16>(src, i, slice),
+            _ => self.detile_level_sized::<0>(src, i, slice),
+        }
+    }
+
+    fn detile_level_sized<const E: usize>(&self, src: &[u8], i: usize, slice: usize) -> Vec<u8> {
         let l = self.levels[i];
         let t = &self.layout;
-        let e = 1usize << t.elem_log2;
+        let e = if E == 0 { 1usize << t.elem_log2 } else { E };
         let mut out = vec![0u8; l.width * l.height * e];
         if t.mode == 0 && t.base_xor == 0 && l.origin == (0, 0) {
             // linear: a row's elements are contiguous, so it is copied whole (the elements that

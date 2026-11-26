@@ -325,7 +325,10 @@ pub(super) unsafe extern "system" fn execute_indirect(this: *mut c_void, sig: us
         if let (Some(list), Some(r)) = (ID3D12GraphicsCommandList::from_raw_borrowed(&this), ID3D12RootSignature::from_raw_borrowed(&rs)) {
             list.SetGraphicsRootSignature(r);
         }
-        return fresh_indirect_arguments(this, || pc(this, sig, max, args, args_off, count_buf, count_off));
+        let t = super::gpu_profile::begin(this, pso, super::gpu_profile::Kind::PcIndirect, [max, 0, 0]);
+        fresh_indirect_arguments(this, || pc(this, sig, max, args, args_off, count_buf, count_off));
+        super::gpu_profile::end(this, t);
+        return;
     }
     if ROOT_SIGNATURES.lock().unwrap().as_ref().is_some_and(|s| s.contains(&sig)) {
         static N: std::sync::atomic::AtomicU32 = std::sync::atomic::AtomicU32::new(0);
@@ -349,7 +352,9 @@ pub(super) unsafe extern "system" fn execute_indirect(this: *mut c_void, sig: us
                 }
             }
             count(if gfx { DRAWS } else { DISPATCHES });
-            fresh_indirect_arguments(this, || pc(this, sig, max, args, args_off, count_buf, count_off))
+            let t = super::gpu_profile::begin(this, pso, if gfx { super::gpu_profile::Kind::IndirectDraw } else { super::gpu_profile::Kind::IndirectDispatch }, [max, 0, 0]);
+            fresh_indirect_arguments(this, || pc(this, sig, max, args, args_off, count_buf, count_off));
+            super::gpu_profile::end(this, t);
         }
         Err(e) => {
             count(if gfx { DRAWS_SKIPPED } else { DISPATCHES_SKIPPED });
@@ -493,11 +498,12 @@ fn cpu_rect_expansion(pso: usize) -> bool {
 pub(super) unsafe extern "system" fn draw_instanced(this: *mut c_void, vertices: u32, instances: u32, first_vertex: u32, first_instance: u32) {
     DRAW_ARGS.with(|d| d.set((false, vertices, instances, first_vertex, 0)));
     if let Some(list) = graphics_bound(this) {
-        if draw_rects(this, &list, vertices, instances, first_vertex, first_instance) {
-            return;
+        let t = super::gpu_profile::begin(this, with(this, |s| s.pso), super::gpu_profile::Kind::Draw, [vertices, instances, 0]);
+        if !draw_rects(this, &list, vertices, instances, first_vertex, first_instance) {
+            super::list_x::sync_title_buffers(this, None, first_vertex, vertices, if first_instance != 0 { instances.max(2) } else { instances });
+            list.DrawInstanced(vertices, instances, first_vertex, first_instance);
         }
-        super::list_x::sync_title_buffers(this, None, first_vertex, vertices, if first_instance != 0 { instances.max(2) } else { instances });
-        list.DrawInstanced(vertices, instances, first_vertex, first_instance);
+        super::gpu_profile::end(this, t);
     }
 }
 
@@ -535,7 +541,10 @@ pub(super) unsafe fn emit_prepared_indexed_draw(
     base_vertex: i32,
     first_instance: u32,
 ) {
+    let this = list.as_raw();
+    let t = super::gpu_profile::begin(this, with(this, |s| s.pso), super::gpu_profile::Kind::Draw, [indices, instances, 0]);
     list.DrawIndexedInstanced(indices, instances, first_index, base_vertex, first_instance);
+    super::gpu_profile::end(this, t);
 }
 
 /// Before a draw: with a translated pipeline its ABI root signature and the kept graphics
@@ -1008,7 +1017,10 @@ unsafe fn translated_dispatch(this: *mut c_void, list: &ID3D12GraphicsCommandLis
         trace_fullscreen(this, pso, [x, y, z]);
     }
     bind_abi(this, list, pso, false)?;
-    super::real::dispatch_chain::dispatch(list, pso, with(this, |s| s.allocator), [x, y, z])
+    let t = super::gpu_profile::begin(this, pso, super::gpu_profile::Kind::Dispatch, [x, y, z]);
+    let r = super::real::dispatch_chain::dispatch(list, pso, with(this, |s| s.allocator), [x, y, z]);
+    super::gpu_profile::end(this, t);
+    r
 }
 
 /// XCL's ABI for a translated pipeline: its root signature, the user SGPRs (`io`, the kept

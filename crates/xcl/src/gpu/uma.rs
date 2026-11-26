@@ -555,13 +555,16 @@ impl Uma {
     /// contiguous sparse windows belong to a single reservation, while each committed window
     /// is its own allocation.
     pub fn watch_regions(&self) -> Vec<(usize, usize)> {
+        let driver = DRIVER_WINDOWS.load(std::sync::atomic::Ordering::Relaxed);
         let mut out: Vec<(usize, usize)> = Vec::with_capacity(self.kinds.len());
         let mut k = 0;
         while k < self.kinds.len() {
             match self.kinds[k] {
                 WindowKind::None => k += 1,
                 WindowKind::Committed(s) => {
-                    out.push((self.base + k * WINDOW, s));
+                    if driver & (1 << k) == 0 {
+                        out.push((self.base + k * WINDOW, s));
+                    }
                     k += 1;
                 }
                 WindowKind::Sparse => {
@@ -847,6 +850,14 @@ impl Uma {
 
 /// The title's graphics memory (created on first use; `XCL_UMA_MB`, default 2048;
 /// `XCL_UMA_WINDOWS=4|8|16`, default 4, with 8/16 requiring `XCL_HEAP_WINDOWS=1`).
+/// (scratch) windows remade as driver heaps (`XCL_UMA_DRIVER`) without write watch
+static DRIVER_WINDOWS: std::sync::atomic::AtomicU32 = std::sync::atomic::AtomicU32::new(0);
+
+/// Window `k` is a driver heap now that is not write-watched.
+pub fn set_driver_window(k: usize) {
+    DRIVER_WINDOWS.fetch_or(1 << k, std::sync::atomic::Ordering::Relaxed);
+}
+
 pub fn get() -> Option<&'static Uma> {
     GLOBAL
         .get_or_init(|| {
