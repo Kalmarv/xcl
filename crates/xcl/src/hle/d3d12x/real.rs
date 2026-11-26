@@ -7369,6 +7369,14 @@ mod dred_tests {
     use super::*;
 
     #[test]
+    fn the_done_ops_are_counted_by_kind_with_the_longest_barrier_execute_indirect_run() {
+        // marker, a dispatch, two chain rounds, a dispatch, three more: done stops before the last op
+        let h = [0, 15, 6, 15, 5, 15, 5, 6, 15, 5, 15, 5, 15, 5, 0];
+        assert_eq!(dred_done_ops(&h, 14), "done ops by kind: 0x1 5x5 6x2 15x6; first ExecuteIndirect at 4; longest barrier/ExecuteIndirect run: 3 from op 8");
+        assert_eq!(dred_done_ops(&h, 3), "done ops by kind: 0x1 6x1 15x1; first ExecuteIndirect at none; longest barrier/ExecuteIndirect run: 0 from op 0");
+    }
+
+    #[test]
     fn a_late_partially_executed_list_is_reported_before_unstarted_lists() {
         let progress = [0u32, 1, 2];
         let mut nodes = vec![D3D12_AUTO_BREADCRUMB_NODE::default(); 606];
@@ -7432,9 +7440,45 @@ pub fn log_device_removed() {
                     bound += &format!("; bound after it: {}", after.iter().take(4).cloned().collect::<Vec<_>>().join(", "));
                 }
                 crate::xlog_error!("DRED: list {:p} on queue {:p}: {done} of {count} operations done, around: {}{bound}", list, node.pCommandQueue.as_ref().map_or(std::ptr::null_mut(), |q| q.as_raw()), ops.join(" "));
+                if done > 0 {
+                    crate::xlog_error!("DRED: list {:p}: {}", list, dred_done_ops(&history, done));
+                }
             });
         }
     }
+}
+
+/// Local diagnostic: the ops a list finished, by kind, and its longest run of barrier /
+/// ExecuteIndirect pairs (a chained ExecuteIndirect's rounds record that pattern).
+fn dred_done_ops(history: &[i32], done: usize) -> String {
+    let ops = &history[..done.min(history.len())];
+    let mut kinds = std::collections::BTreeMap::new();
+    for &o in ops {
+        *kinds.entry(o).or_insert(0usize) += 1;
+    }
+    let (mut best, mut best_at, mut run, mut run_at) = (0usize, 0usize, 0usize, 0usize);
+    let mut i = 0;
+    while i < ops.len() {
+        if ops[i] == 15 && ops.get(i + 1) == Some(&5) {
+            if run == 0 {
+                run_at = i;
+            }
+            run += 1;
+            i += 2;
+        } else {
+            if run > best {
+                (best, best_at) = (run, run_at);
+            }
+            run = 0;
+            i += 1;
+        }
+    }
+    if run > best {
+        (best, best_at) = (run, run_at);
+    }
+    let kinds = kinds.iter().map(|(k, n)| format!("{k}x{n}")).collect::<Vec<_>>().join(" ");
+    let first = ops.iter().position(|&o| o == 5).map_or("none".to_string(), |p| p.to_string());
+    format!("done ops by kind: {kinds}; first ExecuteIndirect at {first}; longest barrier/ExecuteIndirect run: {best} from op {best_at}")
 }
 
 /// The GPU hung or the device was removed: the title is stopped at once (a title that goes on
