@@ -61,7 +61,7 @@ struct Chain {
     tail: Vec<ID3D12PipelineState>,
     words: u32,
     whole_code: Vec<u8>,
-    whole: OnceLock<ID3D12PipelineState>,
+    whole: OnceLock<Option<ID3D12PipelineState>>,
     build_whole: Mutex<()>,
     /// threads other than `want_whole`'s waiting for the whole form
     waiting: std::sync::atomic::AtomicUsize,
@@ -77,7 +77,7 @@ struct Chain {
 
 impl Chain {
     unsafe fn whole(&self) -> Result<ID3D12PipelineState, String> {
-        if let Some(p) = self.whole.get() { return Ok(p.clone()); }
+        if let Some(p) = self.whole.get() { return p.clone().ok_or_else(|| "whole compute pipeline".into()); }
         // `want_whole`'s build may hold `build_whole` while it waits for its turn
         // (`big_compile_turn`): while this thread waits, that build is one the title waits for
         self.waiting.fetch_add(1, Ordering::AcqRel);
@@ -88,10 +88,8 @@ impl Chain {
 
     unsafe fn build_whole_form(&self) -> Result<ID3D12PipelineState, String> {
         let _guard = self.build_whole.lock().unwrap();
-        if let Some(p) = self.whole.get() { return Ok(p.clone()); }
-        let p = self.builder.pipeline(&self.whole_code, &pc_iid(Kind::PipelineState)).ok_or("whole compute pipeline")?;
-        let _ = self.whole.set(p.clone());
-        Ok(p)
+        // a failed build is kept: not tried again
+        self.whole.get_or_init(|| self.builder.pipeline(&self.whole_code, &pc_iid(Kind::PipelineState))).clone().ok_or_else(|| "whole compute pipeline".into())
     }
 
     /// The whole form built on another thread, for a later ExecuteIndirect with more slabs than rounds
@@ -452,7 +450,7 @@ pub(in crate::hle::d3d12x) unsafe fn execute_indirect(list: &ID3D12GraphicsComma
     let Some((scratch, _)) = scratch_for(dev, list.as_raw() as usize, allocator, scratch_budget(), group) else { return Ok(false) };
     let most = (scratch.bytes / group).max(1);
     let sig = pso::dispatch_command_signature(dev)?;
-    let full = chain.whole.get().cloned();
+    let full = chain.whole.get().cloned().flatten();
     let before = slabs_before(chain.measured.load(Ordering::Relaxed), full.is_some(), chain.slabs.load(Ordering::Relaxed), chain.last.load(Ordering::Relaxed));
     let rounds = indirect_rounds(seen, most, before, most_rounds());
     let buffer = pso::chain_commands_buffer(dev, rounds, commands).ok_or("no buffer for the commands of a chained ExecuteIndirect")?;
@@ -486,7 +484,7 @@ pub(in crate::hle::d3d12x) unsafe fn execute_indirect(list: &ID3D12GraphicsComma
 
 #[cfg(test)]
 mod tests {
-    use super::{scratch_bytes, LEAST};
+    use super::*;
 
     const MB: u64 = 1 << 20;
 
@@ -705,6 +703,27 @@ mod tests {
             let waited = waited.recv_timeout(Duration::from_secs(5));
             drop(held);
             assert!(waited.is_ok(), "the title thread waited for the background build's turn");
+        }
+    }
+
+    #[test]
+    fn a_whole_form_that_fails_to_build_is_not_built_again() {
+        static CALLS: AtomicU64 = AtomicU64::new(0);
+        unsafe extern "system" fn refused(_: *mut c_void, _: *const c_void, _: *const GUID, _: *mut *mut c_void) -> HRESULT {
+            CALLS.fetch_add(1, Ordering::Relaxed);
+            crate::util::E_FAIL
+        }
+        unsafe {
+            let Ok(dev) = crate::gpu::agility::create_device(None, D3D_FEATURE_LEVEL_11_0) else {
+                return crate::gpu::recomp::runner::skip_test("no GPU");
+            };
+            let signature = pso::dispatch_chain_root_signature(&dev, &[]).unwrap();
+            let builder = Arc::new(PipelineBuilder { device: dev, create: refused, signature, flags: D3D12_PIPELINE_STATE_FLAG_NONE, node: 0, record: 0 });
+            let chain = Chain { builder, tail: Vec::new(), words: 4, whole_code: vec![0; 16], whole: OnceLock::new(),
+                build_whole: Mutex::new(()), waiting: Default::default(), slabs: Default::default(), last: Default::default(), measured: Default::default(), wanted: Default::default(), warned: Default::default() };
+            assert!(chain.whole().is_err());
+            assert!(chain.whole().is_err());
+            assert_eq!(CALLS.load(Ordering::Relaxed), 1);
         }
     }
 }
