@@ -1243,17 +1243,16 @@ impl Lw {
 
         let name = format!("xcl_{}_load_{count}", if buffer { "buffer" } else { "scalar" });
         let uma = if self.windowed() { self.uma_base() } else { self.c(0) };
-        let mut args = vec![inputs[0], inputs[1], inputs[2], inputs[3], inputs[4], uma];
-        let slot = (count > 1).then(|| self.s.m.return_slot());
-        args.extend(slot);
+        let slot = self.s.m.return_slot();
+        let args = [inputs[0], inputs[1], inputs[2], inputs[3], inputs[4], uma, slot];
         let f = if let Some(f) = self.s.m.function(&name) {
             f
         } else {
             let word = self.s.m.i32();
             let params: Vec<_> = args.iter().map(|&a| self.s.m.type_of(a)).collect();
-            let signature = self.s.m.func_ty(word, &params);
-            let attrs = if slot.is_some() { FnAttrs::NoInlineScalarLoadOut } else { FnAttrs::NoInline };
-            let f = self.s.m.declare(&name, signature, attrs);
+            let void = self.s.m.void();
+            let signature = self.s.m.func_ty(void, &params);
+            let f = self.s.m.declare(&name, signature, FnAttrs::NoInlineScalarLoadOut);
             let body = self.s.m.declarations();
             let caller = std::mem::replace(&mut self.s.m, body);
             let ssa = std::mem::replace(&mut self.ssa, Ssa::new(word));
@@ -1269,16 +1268,16 @@ impl Lw {
             }
             self.ssa.expect_preds(&mut self.s, Block(0), 0, &mut |s, v| self.init.load(s, v));
             let results = self.scalar_load(count, buffer, std::array::from_fn(|i| Value::Param(word, i as u32)));
-            if slot.is_some() {
-                let out = Value::Param(params[6], 6);
-                let z = self.c(0);
-                for (i, &v) in results.iter().enumerate().skip(1) {
-                    let k = self.c(i as u32);
-                    let at = self.s.m.gep(out, &[z, k]);
-                    self.s.m.store(at, v, 4);
-                }
+            // Consecutive calls may feed distinct live descriptor indices. Passing every word
+            // through caller storage avoids a native driver reusing the later call's scalar return.
+            let out = Value::Param(params[6], 6);
+            let z = self.c(0);
+            for (i, v) in results.into_iter().enumerate() {
+                let k = self.c(i as u32);
+                let at = self.s.m.gep(out, &[z, k]);
+                self.s.m.store(at, v, 4);
             }
-            self.s.m.return_word(results[0]);
+            self.s.m.ret();
             self.s.m.optimize();
             self.mems = old_mems;
             self.uma_base_val = old_base;
@@ -1287,17 +1286,13 @@ impl Lw {
             self.s.m.finish_helper(f, body);
             f
         };
-        let r = self.s.m.call(f, &args);
-        let mut results = vec![r];
-        if let Some(slot) = slot {
-            let z = self.c(0);
-            for i in 1..count {
-                let k = self.c(i);
-                let at = self.s.m.gep(slot, &[z, k]);
-                results.push(self.s.m.load(at, 4));
-            }
-        }
-        results
+        self.s.m.call(f, &args);
+        let z = self.c(0);
+        (0..count).map(|i| {
+            let k = self.c(i);
+            let at = self.s.m.gep(slot, &[z, k]);
+            self.s.m.load(at, 4)
+        }).collect()
     }
 
     // ------------------------------------------------------------ MUBUF / MTBUF

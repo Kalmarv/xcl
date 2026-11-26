@@ -874,7 +874,7 @@ fn outlined_scalar_loads_validate() {
         super::validate::validate(&blob).unwrap();
         let ir = super::validate::disassemble(&blob).unwrap();
         for name in ["@xcl_buffer_load_4(", "@xcl_scalar_load_2("] {
-            let definition = ir.lines().find(|l| l.starts_with("define internal") && l.contains(name)).expect("wide load helper");
+            let definition = ir.lines().find(|l| l.starts_with("define internal void") && l.contains(name)).expect("wide load helper");
             assert!(definition.contains("[16 x i32]* noalias"), "{definition}");
         }
     }
@@ -903,6 +903,50 @@ fn outlined_scalar_loads_match_inline_at_view_end() {
             assert_eq!(a.raw, b.raw);
             assert_eq!(&b.sgpr[24..28], &[memory[4], memory[5], memory[6], 0]);
             assert_eq!(&b.sgpr[32..36], &[memory[5], memory[6], 0, 0]);
+        }
+    }
+}
+
+#[test]
+fn outlined_scalar_loads_preserve_distinct_image_descriptors() {
+    use crate::gpu::recomp::runner::{self, KernelState, TestTexture, TexDim};
+    use windows::Win32::Graphics::Dxgi::Common::DXGI_FORMAT_R32_UINT;
+
+    if !runner::wave32_supported().unwrap_or(false) {
+        return runner::skip_test("no wave32 GPU");
+    }
+
+    // Keep four different descriptor indices live across calls to the same eight-word helper.
+    let mut code = Vec::new();
+    let mut memory = Vec::new();
+    for i in 0..4 {
+        code.extend(encode("S_LOAD_DWORDX8", "ENC_SMEM", &[("SDATA", 16 + 8 * i), ("SBASE", 4), ("OFFSET", 32 * i), ("SOFFSET", 125)], None).unwrap());
+        memory.extend_from_slice(&[2 * i as u32, 20 << 20, 0, 9 << 28, 0, 0, 0, 0]);
+    }
+    for i in 0..4 {
+        code.extend(encode("IMAGE_STORE", "ENC_MIMG", &[("VDATA", 4 + i), ("VADDR", 0), ("SRSRC", 4 + 2 * i), ("DMASK", 1), ("DIM", 1), ("UNORM", 1)], None).unwrap());
+    }
+    code.extend(encode("S_ENDPGM", "ENC_SOPP", &[], None).unwrap());
+    let textures: Vec<_> = (0..4).map(|_| TestTexture {
+        dim: TexDim::D2, format: DXGI_FORMAT_R32_UINT, width: 32, height: 1, depth: 1,
+        texel_bytes: 4, data: vec![0; 128], uav: true,
+    }).collect();
+    let mut state = KernelState::default();
+    for (lane, vgprs) in state.vgpr.iter_mut().enumerate() {
+        vgprs[0] = lane as u32;
+        for i in 0..4 { vgprs[4 + i] = 0x12340000 + (i as u32) * 32 + lane as u32; }
+    }
+    let opts = KernelOptions { wave64: false, split: false, mem_windows: 1, sampler_base: 0 };
+    for outline in [false, true] {
+        let dxil = super::kernel::translate_outline_fixture(&code, opts, outline).unwrap();
+        let result = runner::run_with(&dxil, &state, &memory, &textures, &[]).unwrap();
+        assert_eq!(result.textures.len(), textures.len());
+        for (i, bytes) in result.textures.iter().enumerate() {
+            assert_eq!(bytes.len(), 32 * 4);
+            for (lane, texel) in bytes.chunks_exact(4).enumerate() {
+                let expected = 0x12340000 + i as u32 * 32 + lane as u32;
+                assert_eq!(u32::from_le_bytes(texel.try_into().unwrap()), expected, "outline={outline} texture={i} lane={lane}");
+            }
         }
     }
 }

@@ -81,8 +81,7 @@ pub enum FnAttrs {
     NoUnwind,
     /// `noduplicate nounwind` (barriers)
     NoDuplicate,
-    NoInline,
-    /// A wide scalar load takes six words and a private, non-aliasing output pointer.
+    /// A scalar load takes six words and a private, non-aliasing output pointer.
     NoInlineScalarLoadOut,
 }
 
@@ -90,8 +89,7 @@ impl FnAttrs {
     /// Index into the PARAMATTR table (+1; 0 = none).
     fn index(self) -> u64 {
         match self {
-            FnAttrs::NoInline => 5,
-            FnAttrs::NoInlineScalarLoadOut => 6,
+            FnAttrs::NoInlineScalarLoadOut => 5,
             FnAttrs::None => 0,
             FnAttrs::ReadNone => 1,
             FnAttrs::ReadOnly => 2,
@@ -203,7 +201,6 @@ enum Op {
     Cmp(Pred, Value, Value),
     Select(Value, Value, Value),
     Extract(Value, u32),
-    Return(Value),
     Call(u32, Vec<Value>),
     Phi(Vec<(Value, Block)>),
     Load(Value, u32),
@@ -561,7 +558,7 @@ impl Module {
     /// Whether the current block already ends in a terminator.
     pub fn terminated(&self) -> bool {
         self.blocks[self.cur.0 as usize].last().is_some_and(|&i| {
-            matches!(self.insts[i as usize].op, Op::Br(_) | Op::CondBr(..) | Op::Switch(..) | Op::Ret | Op::Return(_) | Op::Unreachable)
+            matches!(self.insts[i as usize].op, Op::Br(_) | Op::CondBr(..) | Op::Switch(..) | Op::Ret | Op::Unreachable)
         })
     }
 
@@ -635,13 +632,9 @@ impl Module {
         let t = self.struct_elem(at, idx);
         self.push(Op::Extract(agg, idx), t)
     }
-    pub fn return_word(&mut self, v: Value) {
-        let void = self.void();
-        self.push(Op::Return(v), void);
-    }
 
     /// Calls consume and read their scratch in one basic block. Every piece may
-    /// therefore have its own entry-block allocation for wide SMEM returns.
+    /// therefore have its own entry-block allocation for SMEM results.
     pub fn return_slot(&mut self) -> Value {
         if let Some(slot) = self.return_slot { return slot; }
         let word = self.i32();
@@ -970,17 +963,14 @@ impl Module {
         w.record(PARAMATTR_GRP_CODE_ENTRY, &[3, FN, 0, ATTR_NOUNWIND]);
         w.record(PARAMATTR_GRP_CODE_ENTRY, &[4, FN, 0, ATTR_NODUPLICATE, 0, ATTR_NOUNWIND]);
         let scalar_out = self.funcs.iter().zip(&fused).any(|(f, used)| *used && f.attrs == FnAttrs::NoInlineScalarLoadOut);
-        let groups = if self.helpers.is_empty() { 4 } else {
-            w.record(PARAMATTR_GRP_CODE_ENTRY, &[5, FN, 0, ATTR_NOINLINE, 0, ATTR_NOUNWIND]);
-            5
-        };
         if scalar_out {
+            w.record(PARAMATTR_GRP_CODE_ENTRY, &[5, FN, 0, ATTR_NOINLINE, 0, ATTR_NOUNWIND]);
             // LLVM attribute index 0 is the return value, 1 is the first parameter.
             w.record(PARAMATTR_GRP_CODE_ENTRY, &[6, 7, 0, ATTR_NOALIAS]);
         }
         w.end_block();
         w.enter_block(BLOCK_PARAMATTR);
-        for g in 1..=groups {
+        for g in 1..=4 {
             w.record(PARAMATTR_CODE_ENTRY, &[g]);
         }
         if scalar_out {
@@ -1236,7 +1226,7 @@ impl Module {
                     r(a);
                     r(b)
                 }
-                Op::Return(a) | Op::Cast(_, a, _) | Op::Extract(a, _) | Op::Load(a, _) | Op::CondBr(a, _, _) | Op::Alloca(_, a, _) => r(a),
+                Op::Cast(_, a, _) | Op::Extract(a, _) | Op::Load(a, _) | Op::CondBr(a, _, _) | Op::Alloca(_, a, _) => r(a),
                 Op::Select(a, b, c) | Op::CmpXchg(a, b, c) => {
                     r(a);
                     r(b);
@@ -1299,7 +1289,6 @@ impl Module {
             Op::Cast(op, v, t) => w.record(FUNC_CODE_INST_CAST, &[rel(*v), t.0 as u64, *op as u64]),
             Op::Cmp(p, a, b) => w.record(FUNC_CODE_INST_CMP2, &[rel(*a), rel(*b), *p as u64]),
             Op::Select(c, t, f) => w.record(FUNC_CODE_INST_VSELECT, &[rel(*t), rel(*f), rel(*c)]),
-            Op::Return(v) => w.record(FUNC_CODE_INST_RET, &[rel(*v)]),
             Op::Extract(a, idx) => w.record(FUNC_CODE_INST_EXTRACTVAL, &[rel(*a), *idx as u64]),
             Op::Call(f, args) => {
                 let fd = &self.funcs[*f as usize];
@@ -1496,7 +1485,6 @@ impl Module {
             Op::Br(b) => InstInfo::Term(None, vec![*b]),
             Op::CondBr(c, t, f) => InstInfo::Term(Some(*c), vec![*t, *f]),
             Op::Switch(v, d, cases) => InstInfo::Term(Some(*v), std::iter::once(*d).chain(cases.iter().map(|c| c.1)).collect()),
-            Op::Return(v) => InstInfo::Term(Some(*v), Vec::new()),
             Op::Ret | Op::Unreachable => InstInfo::Term(None, Vec::new()),
         }
     }
@@ -1659,10 +1647,11 @@ mod tests {
         shader.require(Feature::DisableMathRefactoring);
         let m = &mut shader.m;
         let (word, wide, double, float) = (m.i32(), m.i64(), m.f64(), m.f32());
-        let sig = m.func_ty(word, &[word]);
-        let outer = m.declare("outer", sig, FnAttrs::NoInline);
+        let void = m.void();
+        let sig = m.func_ty(void, &[word]);
+        let outer = m.declare("outer", sig, FnAttrs::NoUnwind);
         let mut outer_body = m.declarations();
-        let inner = outer_body.declare("inner", sig, FnAttrs::NoInline);
+        let inner = outer_body.declare("inner", sig, FnAttrs::NoUnwind);
         let mut body = outer_body.declarations();
         let p = Value::Param(word, 0);
         let w = body.cast(CastOp::ZExt, p, wide);
@@ -1675,10 +1664,10 @@ mod tests {
         let result = body.bitcast(mad, word);
         let shared = body.global("helper_word", word, 3, None, false, 4);
         body.store(shared, result, 4);
-        body.return_word(result);
+        body.ret();
         outer_body.finish_helper(inner, body);
-        let v = outer_body.call(inner, &[p]);
-        outer_body.return_word(v);
+        outer_body.call(inner, &[p]);
+        outer_body.ret();
         m.finish_helper(outer, outer_body);
         let dead = m.new_block();
         m.set_block(dead);
