@@ -270,7 +270,9 @@ xcl pipelines D:\Games\SomeTitle [--watch]  # compile the pipelines a run queued
   `XCL_DIRECT_SPLIT_INSTRUCTIONS` sets the target instructions per piece (default 12500,
   zero disables splitting). Loops stay in one piece. A strongly connected component over the
   target gets its own piece, up to four times the target. Larger components and indirect
-  dispatches use the whole pipeline.
+  dispatches use the whole pipeline. A UAV integer add can carry its returned value into a
+  later piece. Programs with such an add and a loop that reads writable global memory use the
+  whole pipeline.
 - Huge pipelines (translated DXIL of `XCL_HUGE_PSO_BYTES` or more, default 262144) built on the
   background `xcl-pso*` workers default to one concurrent driver compile per four available logical
   CPUs, rounded down, with at least one slot and at most four. `XCL_HUGE_PSO_CONCURRENCY`
