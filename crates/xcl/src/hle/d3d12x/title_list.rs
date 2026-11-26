@@ -194,6 +194,9 @@ pub(super) unsafe extern "system" fn reset(this: *mut c_void, alloc: usize, pso:
             for seg in moved {
                 super::bind::reset(seg as *mut c_void, 0, 0);
                 super::list_x::clear_segment_state(seg);
+                if park_spares() {
+                    super::alloc_pool::park_list(seg);
+                }
             }
         }
         *((this as usize + F_RING_AT) as *mut usize) = 0;
@@ -275,6 +278,13 @@ pub(super) fn can_split(wrapper: *mut c_void, n: usize) -> bool {
     sg.as_ref()
         .and_then(|m| m.get(&(wrapper as usize)))
         .is_none_or(|b| b.extra_active.len() + n <= MAX_EXTRA_SEGMENTS)
+}
+
+/// `XCL_PARK_SPARES=1` (scratch): segments parked as spares stop holding their PC allocator
+/// (`alloc_pool::park_list`), so put-aside allocators are reused instead of piling up.
+fn park_spares() -> bool {
+    static ON: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
+    *ON.get_or_init(|| std::env::var("XCL_PARK_SPARES").is_ok_and(|v| v.trim() == "1"))
 }
 
 /// Pop a previously created closed extra PC command list from `wrapper`'s spare pool for reuse
