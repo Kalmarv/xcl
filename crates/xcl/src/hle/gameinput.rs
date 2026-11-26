@@ -252,14 +252,33 @@ fn parse_presses(script: &str, a_only: &str) -> Vec<(f64, u32)> {
     v
 }
 
+/// when the local user reached the title (log seconds; `XCL_PRESS_FROM=user`)
+static USER_AT: OnceLock<f64> = OnceLock::new();
+
+/// (scratch) The local user reached the title: with `XCL_PRESS_FROM=user` the scripted presses
+/// count from now, so a slow boot does not leave the walk on a menu.
+pub fn note_user_reached() {
+    let t = crate::log::uptime();
+    if USER_AT.set(t).is_ok() && std::env::var("XCL_PRESS_FROM").is_ok_and(|v| v == "user") {
+        crate::xlog_info!("GameInput: scripted presses count from {t:.3} s (XCL_PRESS_FROM=user)");
+    }
+}
+
 fn scripted() -> u32 {
     static AT: OnceLock<Vec<(f64, u32)>> = OnceLock::new();
     let at = AT.get_or_init(|| {
         let var = |n: &str| std::env::var(n).unwrap_or_default();
         parse_presses(&var("XCL_PRESS_AT"), &var("XCL_PRESS_A_AT"))
     });
-    // seconds since the host started, as the log's times (not since the title first polled)
-    let t = crate::log::uptime();
+    // seconds since the host started, as the log's times (not since the title first polled);
+    // `XCL_PRESS_FROM=user`: since the local user reached the title, none before
+    static FROM_USER: OnceLock<bool> = OnceLock::new();
+    let t = if *FROM_USER.get_or_init(|| std::env::var("XCL_PRESS_FROM").is_ok_and(|v| v == "user")) {
+        let Some(&u) = USER_AT.get() else { return 0 };
+        crate::log::uptime() - u
+    } else {
+        crate::log::uptime()
+    };
     at.iter().filter(|&&(s, _)| t >= s && t < s + 0.2).fold(0, |b, &(_, g)| b | g)
 }
 

@@ -1050,6 +1050,7 @@ pub(super) unsafe fn unmap_superseded(res: &ID3D12Resource) {
             LEVEL_STATS[2].fetch_sub(l.mapped_tiles(), std::sync::atomic::Ordering::Relaxed);
             l.groups.iter_mut().for_each(|g| g.3 = false);
         }
+        super::title_textures::wait_for_uploads(&pages.queue);
         pages.unmap(res, total);
         pages.release_tiles(used, used_extra, now, true);
         return;
