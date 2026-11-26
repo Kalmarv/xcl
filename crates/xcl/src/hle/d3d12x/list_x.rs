@@ -835,6 +835,7 @@ pub unsafe fn on_create(list: *mut c_void, alloc: usize, pso: usize, ty: D3D12_C
 
 /// Clean up all tracked state when a command list is released for good.
 pub(super) fn on_release(list: usize) {
+    trace_list(list, ListEvent::Released);
     super::alloc_pool::forget_list(list);
     release_copy_scratch(list);
     super::title_textures::list_reset(list);
@@ -854,6 +855,7 @@ pub(super) fn on_release(list: usize) {
 
 /// Clear per-recording sync/write tracking on a split segment moved into `title_list`'s spare pool.
 pub(super) fn clear_segment_state(list: usize) {
+    trace_list(list, ListEvent::Reset);
     super::title_textures::list_reset(list);
     if let Some(s) = LISTS.lock().unwrap().as_mut().and_then(|m| m.get_mut(&list)) {
         s.occlusion = Occlusion::default();
@@ -1106,6 +1108,8 @@ struct SyncCell {
     recorded_list_type: Option<D3D12_COMMAND_LIST_TYPE>,
     /// Last queue the recording list was executed on (if known).
     recorded_last_queue: Option<usize>,
+    /// The PC list of the recording that set `recorded_max`, and when (the sync-state dump).
+    recorded_by: Option<(usize, Instant)>,
     /// Highest value submitted via `queue.Signal(&fence, v)` or released on CPU.
     submitted_max: u64,
     /// Queue that issued the latest GPU `Signal` (`None` if released on CPU).
@@ -1150,6 +1154,46 @@ impl SyncGraph {
 
 static SYNC_GRAPH: Mutex<Option<SyncGraph>> = Mutex::new(None);
 static ARMED_GPU_WAITS: AtomicUsize = AtomicUsize::new(0);
+
+/// What became of a PC list that recorded a `Write64BitValue*`: when it was last executed, reset
+/// and released (the sync-state dump; a cell recorded and never submitted names its list).
+#[derive(Default, Clone, Copy)]
+struct ListTrace {
+    executed: Option<Instant>,
+    reset: Option<Instant>,
+    released: Option<Instant>,
+}
+
+#[derive(Clone, Copy)]
+enum ListEvent {
+    Executed,
+    Reset,
+    Released,
+}
+
+static WRITE64_LISTS: Mutex<Option<HashMap<usize, ListTrace>>> = Mutex::new(None);
+
+/// Notes `event` on `list` when it ever recorded a `Write64BitValue*`.
+fn trace_list(list: usize, event: ListEvent) {
+    let mut g = WRITE64_LISTS.lock().unwrap();
+    if let Some(t) = g.as_mut().and_then(|m| m.get_mut(&list)) {
+        let at = Some(Instant::now());
+        match event {
+            ListEvent::Executed => t.executed = at,
+            ListEvent::Reset => t.reset = at,
+            ListEvent::Released => t.released = at,
+        }
+    }
+}
+
+/// `by <list> <age> ms ago (executed …, reset …, released …)`: each as its time after the
+/// recording, or `no` when it has not come since.
+fn recording_trace(list: usize, at: Instant) -> String {
+    let t = WRITE64_LISTS.try_lock().ok().and_then(|g| g.as_ref().and_then(|m| m.get(&list).copied()));
+    let Some(t) = t else { return format!("by {list:#x} {} ms ago", at.elapsed().as_millis()) };
+    let after = |e: Option<Instant>| e.filter(|&e| e >= at).map_or("no".to_string(), |e| format!("+{} ms", (e - at).as_millis()));
+    format!("by {list:#x} {} ms ago (executed {}, reset {}, released {})", at.elapsed().as_millis(), after(t.executed), after(t.reset), after(t.released))
+}
 static SYNC_WATCHDOG_WAKE: OnceLock<(Mutex<()>, Condvar)> = OnceLock::new();
 static QUEUE_IDS: Mutex<Vec<usize>> = Mutex::new(Vec::new());
 
@@ -1209,10 +1253,11 @@ fn cells_behind_summary() -> String {
             let mem = if unsafe { crate::hle::dstorage::read_own(va as usize, &mut v as *mut u64 as *mut u8, 8) } { format!("{v:#x}") } else { "unreadable".into() };
             let armed: Vec<String> = c.armed_waits.iter().map(|a| format!("{:#x}@q{} {} ms", a.val, queue_id(a.waiting_queue), a.armed_at.elapsed().as_millis())).collect();
             parts.push(format!(
-                "{va:#x}: mem {mem} done {done:#x} sub {:#x}@q{:?} rec {:#x} cpu {:#x}{} armed [{}]",
+                "{va:#x}: mem {mem} done {done:#x} sub {:#x}@q{:?} rec {:#x}{} cpu {:#x}{} armed [{}]",
                 c.submitted_max,
                 c.submitted_queue.map(queue_id),
                 c.recorded_max,
+                c.recorded_by.map_or(String::new(), |(l, at)| format!(" {}", recording_trace(l, at))),
                 c.cpu_signaled_max,
                 if c.non_monotonic { " non-monotonic" } else { "" },
                 armed.join(", ")
@@ -1709,6 +1754,7 @@ fn note_write64_recorded(list: *mut c_void, va: u64, value: u64) {
         s.push_write64_signal(va, value);
         (s.list_type, s.last_queue)
     };
+    WRITE64_LISTS.lock().unwrap().get_or_insert_with(HashMap::new).entry(list as usize).or_default();
     let rescue: Option<(ID3D12Fence, u64, u64)> = {
         let mut g = SYNC_GRAPH.lock().unwrap();
         let cell = g.get_or_insert_with(SyncGraph::default).cells.entry(va).or_default();
@@ -1732,6 +1778,7 @@ fn note_write64_recorded(list: *mut c_void, va: u64, value: u64) {
         } else {
             if value > cell.recorded_max {
                 cell.recorded_max = value;
+                cell.recorded_by = Some((list as usize, Instant::now()));
                 if lty.is_some() {
                     cell.recorded_list_type = lty;
                 }
@@ -1880,6 +1927,9 @@ unsafe fn signal_write64_pairs(queue: *mut c_void, pairs: &[(u64, u64)]) {
 pub(super) unsafe fn signal_write64_fences(queue: *mut c_void, lists: &[*mut c_void]) {
     if WRITE64_SIGNAL_LISTS.load(Ordering::Acquire) == 0 || queue.is_null() || lists.is_empty() {
         return;
+    }
+    for &l in lists {
+        trace_list(l as usize, ListEvent::Executed);
     }
     let pairs: Vec<(u64, u64)> = {
         let g = LISTS.lock().unwrap();
@@ -3226,6 +3276,7 @@ pub unsafe extern "system" fn kickoff_x(this: *mut c_void) {
 
     let one = [this];
     exec(q_raw, 1, one.as_ptr());
+    trace_list(this as usize, ListEvent::Executed);
     copy_scratch_submitted(q_raw, &one);
     super::alloc_pool::executed(q_raw, &one);
     signal_write64_pairs(q_raw, &write64_signals);
@@ -3944,6 +3995,7 @@ pub(super) unsafe fn reset_pc(this: *mut c_void, alloc: usize, pso: usize) -> i3
     if hr < 0 {
         return hr;
     }
+    trace_list(this as usize, ListEvent::Reset);
 
     reset_copy_scratch(this);
     let is_bundle = {
@@ -4506,6 +4558,44 @@ mod tests {
             assert!(s.contains(&format!("{decommitted:#x}: mem unreadable done 0x0")), "{s}");
             assert!(s.contains(&format!("{protected:#x}: mem unreadable done 0x0")), "{s}");
         }
+    }
+
+    /// A cell recorded and never submitted names the list that recorded it, and what came to that
+    /// list after the recording: here a Reset and then a Release, and no execute.
+    #[test]
+    fn the_cells_behind_summary_names_the_recording_list_and_what_came_to_it() {
+        let cell = Box::new(AtomicU64::new(0));
+        let va = &*cell as *const AtomicU64 as u64;
+        // (an address no real list has: the box's own)
+        let token = Box::new(0u64);
+        let list = &*token as *const u64 as usize;
+        let summary = || {
+            // (other tests take the graph too: the summary only tries the lock)
+            for _ in 0..200 {
+                let s = cells_behind_summary();
+                if !s.contains("(sync graph locked)") {
+                    return s;
+                }
+                std::thread::sleep(std::time::Duration::from_millis(5));
+            }
+            panic!("the sync graph stayed locked");
+        };
+        let entry = |s: &str| s.split("; ").find(|p| p.starts_with(&format!("{va:#x}:"))).map(str::to_string).unwrap_or_else(|| panic!("{s}"));
+
+        note_write64_recorded(list as *mut c_void, va, 0x619);
+        let s = entry(&summary());
+        assert!(s.contains(&format!("rec 0x619 by {list:#x} ")), "{s}");
+        assert!(s.contains("(executed no, reset no, released no)"), "{s}");
+        trace_list(list, ListEvent::Reset);
+        on_release(list);
+        let s = entry(&summary());
+        assert!(s.contains("(executed no, reset +"), "{s}");
+        assert!(s.contains(", released +"), "{s}");
+
+        if let Some(gr) = SYNC_GRAPH.lock().unwrap().as_mut() {
+            gr.cells.remove(&va);
+        }
+        WRITE64_LISTS.lock().unwrap().as_mut().map(|m| m.remove(&list));
     }
 
     /// An internal wait shows in the watchdog's summary while its fence is short of the value,
