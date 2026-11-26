@@ -40,6 +40,12 @@ pub struct KernelOptions {
 /// (the `gpu/dxil` sources are not in build.rs's translator source hash).
 pub const TRANSLATOR_VERSION: u32 = 9;
 
+/// Opt in for dispatches whose guest LDS contract is fixed by the pipeline header.
+pub fn declared_lds_enabled() -> bool {
+    static ENABLED: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
+    *ENABLED.get_or_init(|| std::env::var("XCL_DECLARED_LDS").is_ok_and(|value| value == "1"))
+}
+
 /// `XCL_DIRECT_DXIL=1`: console compute shaders (and the kernel tests) go through this
 /// translator, with the HLSL path as the fallback for what it cannot translate yet.
 pub fn enabled() -> bool {
@@ -502,7 +508,7 @@ impl Lw {
             s.enable_rov();
         }
         let coherent = cs.is_some() && crate::gpu::recomp::needs_coherent_mem(insts);
-        let (mems, heap_mem) = mem_windows(&mut s, o.mem_windows, coherent);
+        let (mems, heap_mem) = mem_windows(&mut s, o.mem_windows & !crate::gpu::recomp::BYTE_WINDOWS, coherent);
         let i32 = s.m.i32();
         let z = s.m.i32c(0);
         let mut lw = Lw {
@@ -517,6 +523,7 @@ impl Lw {
             half: z,
             mems,
             heap_mem,
+            byte_windows: o.mem_windows & crate::gpu::recomp::BYTE_WINDOWS != 0 && heap_mem.is_some(),
             res,
             fmt_table: None,
             fmt_desc_cache: HashMap::new(),
@@ -598,7 +605,14 @@ impl Lw {
         if split && std::env::var_os("XCL_X64_ALL_MASKS").is_none() {
             lw.whole_live = crate::gpu::recomp::x64_masks::by_pc(insts, kernel);
         }
-        lw.setup_storage(uses_lds, if split { slot } else { 1 });
+        let (declared, native_counter) = match entry {
+            Entry::Compute(cs) => {
+                let declared = if declared_lds_enabled() { cs.lds_dwords } else { 0 };
+                (declared, !split && (cs.threads[1] > 1 || cs.threads[2] > 1))
+            }
+            _ => (0, false),
+        };
+        lw.setup_storage(uses_lds, slot, declared, native_counter);
         if let (Some(t), true) = (group_threads, split) {
             lw.partner = match t {
                 0..=32 => Partner::Missing,

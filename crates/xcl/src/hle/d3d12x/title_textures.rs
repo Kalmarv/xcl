@@ -914,11 +914,18 @@ unsafe fn refresh_once(queue: *mut c_void) {
             if buf.len() < 16384 {
                 buf.resize(16384, std::ptr::null_mut());
             }
-            for &(base, size) in ranges.iter() {
-                take_written(base, size, &mut buf, &mut dirty, &mut page);
+            if super::watch_trap::on() {
+                let mut p = page;
+                super::watch_trap::look(&ranges, &mut dirty, 0x1000, |a, n, d| take_written(a, n, &mut buf, d, &mut p));
+                page = p;
+            } else {
+                for &(base, size) in ranges.iter() {
+                    take_written(base, size, &mut buf, &mut dirty, &mut page);
+                }
             }
         });
         dirty.sort_unstable();
+        dirty.dedup();
         dirty.len()
     });
     super::sparse::note_watch(watch_t0.elapsed(), dirty_len);

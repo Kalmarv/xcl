@@ -311,14 +311,14 @@ unsafe fn check_uma_import(device: &ID3D12Device, u: &crate::gpu::uma::Uma, bufs
     Ok(format!("ok, {} window(s), {} µs", probes.len(), t0.elapsed().as_micros()))
 }
 
-unsafe fn open_uma(device: &ID3D12Device) {
+unsafe fn open_uma(device: &ID3D12Device, allow_driver_remap: bool) {
     let Some(u) = crate::gpu::uma::get() else {
         *UMA_ERROR.lock().unwrap() = "no UMA region".into();
         return;
     };
     let open = |k: usize| -> Result<(usize, u64, usize), String> {
         let (base, size) = u.window(k);
-        if let Some(upload) = super::uma_driver::mode() {
+        if let Some(upload) = super::uma_driver::mode().filter(|_| allow_driver_remap) {
             match super::uma_driver::remake(device, base, size, upload) {
                 Ok((heap, buf, watched)) => {
                     UMA_DRIVER.store(true, Ordering::Relaxed);
@@ -494,6 +494,10 @@ fn graphics_wave32(device: *mut c_void) -> bool {
 /// by default the high-performance GPU → WARP); once – later calls
 /// return the existing device's adapter.
 pub fn init() -> Result<String, String> {
+    init_with_remap(false)
+}
+
+pub(super) fn init_with_remap(allow_driver_remap: bool) -> Result<String, String> {
     if !device_raw().is_null() {
         return Ok(ADAPTER.lock().map(|a| a.clone()).unwrap_or_default());
     }
@@ -570,7 +574,7 @@ pub fn init() -> Result<String, String> {
                 let _ = q.RegisterMessageCallback(Some(debug_message), D3D12_MESSAGE_CALLBACK_FLAG_NONE, std::ptr::null_mut(), &mut cookie);
             }
         }
-        open_uma(&device);
+        open_uma(&device, allow_driver_remap);
         super::device_x::probe_dynamic_depth_bias(&device);
         let raw = device.into_raw(); // one reference kept for the process lifetime
         adopt(raw, Kind::Device);
