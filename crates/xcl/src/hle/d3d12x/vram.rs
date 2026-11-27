@@ -325,6 +325,11 @@ fn level_tiles_cap() -> u32 {
 #[cfg(test)]
 pub(super) static LEVEL_PAGES_FOR_TEST: std::sync::atomic::AtomicBool = std::sync::atomic::AtomicBool::new(false);
 
+#[cfg(test)]
+thread_local! {
+    pub(super) static FAIL_LEVEL_BIND_FOR_TEST: std::cell::Cell<Option<(usize, u32)>> = const { std::cell::Cell::new(None) };
+}
+
 /// Of the textures with lazy levels there are now: how many, the tiles they stand for, and the
 /// tiles of them that have pages; and the level groups given pages so far.
 static LEVEL_STATS: [std::sync::atomic::AtomicU64; 4] = [const { std::sync::atomic::AtomicU64::new(0) }; 4];
@@ -878,6 +883,16 @@ impl Pages {
     /// `bind` for the tiles `range` of the resource's `total`, which start at subresource `sub`.
     #[allow(clippy::too_many_arguments)]
     unsafe fn bind_range(&mut self, dev: &ID3D12Device, res: &ID3D12Resource, va: usize, console_bytes: Option<u64>, total: u32, sub: u32, range: std::ops::Range<usize>, cold: bool) -> Option<(Vec<usize>, Vec<(usize, usize)>)> {
+        #[cfg(test)]
+        if FAIL_LEVEL_BIND_FOR_TEST.with(|failure| {
+            if failure.get() != Some((res.as_raw() as usize, sub)) {
+                return false;
+            }
+            failure.take();
+            true
+        }) {
+            return None;
+        }
         let cold = cold && super::uma_driver::hot_priority_wanted();
         let (first, own) = (total > 0).then(|| owned_pages(va, console_bytes, total as usize)).flatten()?;
         let now = std::time::Instant::now();

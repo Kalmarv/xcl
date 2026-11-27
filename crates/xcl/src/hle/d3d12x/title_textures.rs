@@ -4680,6 +4680,22 @@ pub(super) mod tests {
             assert!(!VirtualAlloc((at + top) as *const c_void, size - top, MEM_COMMIT, PAGE_READWRITE).is_null());
             std::ptr::copy_nonoverlapping(whole.as_ptr().add(top), (at + top) as *mut u8, size - top);
             let full = place_tex(at);
+            let full_key = full.as_raw() as usize;
+            super::super::vram::FAIL_LEVEL_BIND_FOR_TEST.with(|failure| failure.set(Some((full_key, 0))));
+            refresh(queue.as_raw());
+            assert_eq!(dev_pages() - p0, ((all - top_tiles) as usize) << 16, "the failed mapping left mip 0 without pages");
+            assert!(read_sub(&full, 0).iter().all(|&b| b == 0), "the failed mip still reads as zeros");
+            assert!(read_sub(&full, 1) == want[1].data, "the other mips still upload");
+
+            // Offer the texture again with the same source bytes.
+            {
+                let mut textures = TEXTURES.lock().unwrap();
+                let entry = textures.by_res.get_mut(&full_key).unwrap();
+                assert!(!entry.pending);
+                entry.pending = true;
+                textures.pending_res.insert(full_key);
+                adjust_pending(1);
+            }
             refresh(queue.as_raw());
             assert_eq!(dev_pages() - p0, (all as usize) << 16, "mip 0's pages come with its texels; the other levels' are shared");
             assert!(!super::super::vram::has_unmapped_levels(full.as_raw() as usize));
