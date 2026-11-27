@@ -90,6 +90,14 @@ impl DxilIr {
                 ids = Some(lw.setup_lanes_compute(cs.threads, lds));
                 true
             }
+            Entry::Mesh(ms) => {
+                let lds = lw.lds.is_some();
+                let (tid, gtid) = lw.setup_lanes_compute([ms.threads, 1, 1], lds);
+                ids = Some((tid, gtid));
+                let io = lw.init.io.expect("the I/O buffer");
+                crate::gpu::dxil::kernel::mesh_init(&mut lw, ms, tid, io);
+                true
+            }
             _ => false,
         };
         let io = lw.init.io.expect("the I/O buffer");
@@ -349,6 +357,12 @@ impl Ir for DxilIr {
     fn ret(&mut self) {
         self.lw.s.m.ret();
     }
+    fn mesh_start(&mut self) -> Option<(Value, Value)> {
+        let init = self.lw.init.compute.as_ref()?;
+        let s3 = *init.sgpr.get(&3)?;
+        let v5 = *init.vgpr.get(&5)?;
+        Some((s3, v5))
+    }
 }
 
 /// A kernel-mode program in its per-lane form, as a signed DXIL container (one wave of
@@ -416,6 +430,38 @@ pub fn compute(insts: &[Decoded], cs: &super::CsInterface, wave64: bool) -> Resu
 /// #1426's per-instruction form, then the HLSL path.
 pub fn enabled() -> bool {
     std::env::var("XCL_PER_LANE").is_ok_and(|v| v == "1")
+}
+
+/// `XCL_PER_LANE_MESH=1`: also try the per-lane form on two-pass mesh compute programs (`Entry::Mesh`).
+pub fn mesh_enabled() -> bool {
+    static ON: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
+    *ON.get_or_init(|| std::env::var("XCL_PER_LANE_MESH").is_ok_and(|v| v.trim() == "1"))
+}
+
+/// A two-pass mesh compute program in its per-lane form with runtime options `o` (`pso::direct_mesh`).
+pub fn mesh_with(code: &[u8], ms: &super::MsInterface, o: KernelOptions) -> Result<crate::gpu::dxil::kernel::Kernel, String> {
+    let mut insts = Vec::new();
+    let mut off = 0usize;
+    while off + 4 <= code.len() {
+        let d = crate::gpu::rdna2::decode(&code[off..], off as u64).map_err(|e| format!("cannot decode ({e:?})"))?;
+        off += d.len;
+        insts.push(d);
+    }
+    crate::gpu::rdna2::resolve_far_jumps(&mut insts);
+    let ms = ms.clone();
+    std::thread::Builder::new()
+        .name("xcl-per-lane-ms".into())
+        .stack_size(256 << 20)
+        .spawn(move || {
+            let ir = lower::lower_mesh(&insts, &ms, o.wave64, DxilIr::with(&insts, o, &Entry::Mesh(ms.clone())))?;
+            ir.finish([ms.threads, 1, 1], if o.wave64 && !o.split { 64 } else { 32 })
+        })
+        .map_err(|e| format!("per-lane mesh thread: {e}"))?
+        .join()
+        .map_err(|e| {
+            let msg = e.downcast_ref::<String>().cloned().or_else(|| e.downcast_ref::<&str>().map(|s| s.to_string())).unwrap_or_default();
+            format!("the per-lane mesh lowering panicked: {msg}")
+        })?
 }
 
 /// A compute program in its per-lane form with the runtime's options `o` (`pso::direct_compute`):

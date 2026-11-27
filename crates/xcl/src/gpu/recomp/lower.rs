@@ -133,6 +133,10 @@ pub trait Ir: Sink {
     }
     /// … and its end (`finish_gfx`: the outputs, the PS discard), where every lane is back
     fn graphics_end(&mut self) {}
+    /// Mesh two-pass compute (`Entry::Mesh`): returns `(s3, v5)` initialized by `mesh_init`.
+    fn mesh_start(&mut self) -> Option<(Self::V, Self::V)> {
+        None
+    }
 }
 
 /// What a VS / PS starts with (`Ir::graphics_start`).
@@ -156,6 +160,9 @@ pub enum Stage<'a> {
     /// a compute program: user SGPRs from `io`, then the group ids and TG_SIZE it enables,
     /// thread ids in v0–v2; it ends without storing registers
     Compute(&'a super::CsInterface),
+    /// a mesh shader's compute pass: user SGPRs from `io`, s3 wave index and v5 thread slot from
+    /// `Ir::mesh_start`, exports bridged via `foreign`
+    Mesh(&'a super::MsInterface),
     /// a vertex / pixel shader: user SGPRs from `io`, the rest from `Ir::graphics_start`; it ends
     /// in `Ir::graphics_end`
     Vertex,
@@ -1177,6 +1184,11 @@ pub fn lower_compute<I: Ir>(insts: &[Decoded], cs: &super::CsInterface, wave64: 
     Ok(lower(insts, Stage::Compute(cs), wave64, ir)?.0)
 }
 
+/// Lowers a two-pass mesh compute program (far jumps resolved) into `ir`.
+pub fn lower_mesh<I: Ir>(insts: &[Decoded], ms: &super::MsInterface, wave64: bool, ir: I) -> R<I> {
+    Ok(lower(insts, Stage::Mesh(ms), wave64, ir)?.0)
+}
+
 /// Lowers a vertex or pixel shader (`pixel`; far jumps resolved) into `ir`. `lanes32`: a wave64
 /// program runs in 32-lane hardware waves (NVIDIA), as the HLSL path runs it with `upper_lanes`;
 /// the per-lane form takes such a program only where it reads no lane 32–63 that holds anything.
@@ -1248,8 +1260,13 @@ pub fn survey_compute<I: Ir>(insts: &[Decoded], cs: &super::CsInterface, wave64:
 fn lower_with<I: Ir>(insts: &[Decoded], stage: Stage, wave64: bool, mut ir: I, survey: bool) -> R<(I, Vec<u8>, Vec<String>)> {
     // the lanes past a dispatch's thread limit leave at the start (`IO_THREAD_LIMIT`): a group
     // barrier would wait for them (#1426's form keeps them, out of EXEC, in such a program)
-    if matches!(stage, Stage::Compute(_)) && insts.iter().any(|d| d.inst.name == "S_BARRIER") {
+    if matches!(stage, Stage::Compute(_) | Stage::Mesh(_)) && insts.iter().any(|d| d.inst.name == "S_BARRIER") {
         return Err("s_barrier: the lanes past a dispatch's thread limit leave at the start".into());
+    }
+    if let Stage::Mesh(ms) = stage {
+        if ms.threads == 0 || ms.threads % (if wave64 { 64 } else { 32 }) != 0 {
+            return Err(format!("mesh group of {} threads is not a whole multiple of wave size", ms.threads));
+        }
     }
     let kernel = matches!(stage, Stage::Kernel);
     let graphics = matches!(stage, Stage::Vertex | Stage::Pixel);
@@ -1258,7 +1275,8 @@ fn lower_with<I: Ir>(insts: &[Decoded], stage: Stage, wave64: bool, mut ir: I, s
     let pixel = matches!(stage, Stage::Pixel);
     let launch = if pixel { lane_masks::LaunchExec::Unknown } else { lane_masks::LaunchExec::All };
     // Ballots reconstruct every bit only when the entire console wave is present.
-    let wave_branches = matches!(stage, Stage::Compute(cs) if cs.threads.iter().product::<u32>() % (if wave64 { 64 } else { 32 }) == 0)
+    let wave_branches = (matches!(stage, Stage::Compute(cs) if cs.threads.iter().product::<u32>() % (if wave64 { 64 } else { 32 }) == 0)
+        || matches!(stage, Stage::Mesh(_)))
         && ir.can_wave_branch();
     let sum = lane_masks::analyze_branches(insts, wave64, launch, wave_branches).map_err(|e| e.to_string())?;
     let scc_live_after = if wave_branches {
@@ -1492,6 +1510,21 @@ fn lower_with<I: Ir>(insts: &[Decoded], stage: Stage, wave64: bool, mut ir: I, s
             l.ir.at(skip);
             l.ssa.seal(&mut l.ir, skip);
             l.ir.ret();
+        }
+        Stage::Mesh(_) => {
+            let Some((s3, v5)) = l.ir.mesh_start() else {
+                return Err("MS: this IR has no mesh entry".into());
+            };
+            l.write_num(0, 3, s3);
+            let f = l.ir.boolean(false);
+            l.ssa.write(0, Var::Scc, f);
+            for &v in &vregs {
+                let x = if v == 5 { v5 } else { l.ir.int(0) };
+                l.ssa.write(0, Var::V(v), x);
+            }
+            let t = l.ir.boolean(true);
+            l.write_bit(0, EXEC, t);
+            l.ir.br(blk(0));
         }
         Stage::Vertex | Stage::Pixel => {
             let Some(start) = l.ir.graphics_start(&vregs) else {

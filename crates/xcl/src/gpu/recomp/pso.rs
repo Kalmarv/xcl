@@ -329,6 +329,12 @@ mod translated {
             } else {
                 id
             };
+            // `XCL_PER_LANE_MESH=1`: per-lane two-pass mesh compute under its own identity
+            let id = if Backend::current() != Backend::Hlsl && crate::gpu::recomp::lower_dxil::mesh_enabled() {
+                identity_for(&id.to_string(), "xcl-per-lane-mesh-1")
+            } else {
+                id
+            };
             // `XCL_PER_LANE=1` (direct compute only): its entries under their own identity
             if Backend::current() != Backend::Hlsl && crate::gpu::recomp::lower_dxil::enabled() {
                 identity_for(&id.to_string(), concat!("xcl-per-lane-", env!("XCL_PER_LANE_SOURCE_ID")))
@@ -1275,6 +1281,16 @@ fn compile_console_mesh(
             mem_windows: windows,
             sampler_base: 0,
         };
+        if super::lower_dxil::mesh_enabled() && rodata.is_empty() {
+            match super::lower_dxil::mesh_with(code, ms, o) {
+                Ok(k) => {
+                    crate::gpu::dxil::coverage::record_translated("MS");
+                    dump_direct(blob, &k.dxil);
+                    return Ok(Compiled { dispatch_chain: None, dxil: k.dxil, samplers: k.static_samplers });
+                }
+                Err(_) => {}
+            }
+        }
         match crate::gpu::dxil::kernel::translate_entry_rodata(code, o, crate::gpu::dxil::kernel::Entry::Mesh(ms.clone()), &rodata) {
             Ok(k) => {
                 crate::gpu::dxil::coverage::record_translated("MS");
