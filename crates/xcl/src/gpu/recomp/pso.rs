@@ -139,6 +139,12 @@ pub fn heap_windows() -> bool {
     *ENV.get_or_init(|| std::env::var("XCL_HEAP_WINDOWS").is_ok_and(|v| v.trim() == "1")) && !crate::hle::d3d12x::console_heap::window_views_failed()
 }
 
+/// Scope an experimental byte-store comparison to a single console compute shader.
+pub(crate) fn byte_store_program() -> Option<u64> {
+    static PROGRAM: OnceLock<Option<u64>> = OnceLock::new();
+    *PROGRAM.get_or_init(|| u64::from_str_radix(std::env::var("XCL_BYTE_STORE_CS").ok()?.trim(), 16).ok())
+}
+
 /// A static sampler of a translated program: (S#, comparison) – see `Translation`.
 pub type StaticSampler = ([u32; 4], bool);
 
@@ -174,6 +180,16 @@ fn shader_cache() -> &'static Mutex<ShaderCache> {
 /// `console_to_dxil_for` with the title's memory windows given (`xcl shaders --precompile`
 /// fills the caches without a title: the same keys as at its run).
 pub fn console_to_dxil_in(blob: &[u8], stage: Stage, sampler_base: u32, split_wave64: bool, windows: u32) -> Result<Compiled, String> {
+    let hash = crate::gpu::shader::fnv64(blob);
+    let windows = if stage == Stage::Compute
+        && windows & super::HEAP_WINDOWS != 0
+        && super::byte_view_layout(windows & !super::HEAP_WINDOWS)
+        && byte_store_program() == Some(hash)
+        && crate::gpu::dxil::kernel::enabled() && !super::lower_dxil::enabled()
+        && !crate::hle::d3d12x::console_heap::byte_views_unavailable()
+    {
+        windows | super::BYTE_WINDOWS
+    } else { windows };
     let compile_one = || compile_console_shader(blob, stage, sampler_base, windows, split_wave64);
     // (the compute shader `XCL_DEBUG_CS_SUB` names: neither the memory nor the disk entry of its
     // bytes, which hold it unchanged – translated again, and the result kept in neither)
@@ -181,7 +197,7 @@ pub fn console_to_dxil_in(blob: &[u8], stage: Stage, sampler_base: u32, split_wa
         return compile_one().map(|(c, _)| c);
     }
     let key = ShaderKey {
-        hash: crate::gpu::shader::fnv64(blob),
+        hash,
         stage,
         sampler_base,
         windows,
@@ -641,6 +657,7 @@ fn compile_console_shader(blob: &[u8], stage: Stage, sampler_base: u32, windows:
             Err(e) => direct_fallback("CS", &e),
         }
     }
+    let windows = windows & !super::BYTE_WINDOWS;
     // `XCL_DIRECT_DXIL=all`: vertex / pixel shaders too (not with the PS debug hooks below)
     let ps_debug = stage == Stage::Pixel
         && (debug_color(blob).is_some() || ["XCL_DEBUG_LOD0", "XCL_DEBUG_PS_SUB", "XCL_DEBUG_PS_EXPR"].iter().any(|v| std::env::var_os(v).is_some()));

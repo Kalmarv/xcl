@@ -304,6 +304,14 @@ pub unsafe fn shared_heap(dev: &ID3D12Device) -> bool {
     // look up the console heaps (`HEAPS`, then `GLOBAL`). Two threads that get here at once both
     // make one; the first to store it wins.
     let cap = global_cap(dev);
+    // Title descriptors start after all raw slots and any enabled R8_UINT slots.
+    let mut next = crate::gpu::recomp::BYTE_HEAP_BASE;
+    if crate::gpu::recomp::pso::byte_store_program().is_some() {
+        next += crate::gpu::recomp::BYTE_VIEW_WINDOWS * crate::gpu::recomp::BYTE_SEGMENTS;
+        if next > cap {
+            return false;
+        }
+    }
     let d = D3D12_DESCRIPTOR_HEAP_DESC { Type: D3D12_DESCRIPTOR_HEAP_TYPE_CBV_SRV_UAV, NumDescriptors: cap, Flags: D3D12_DESCRIPTOR_HEAP_FLAG_SHADER_VISIBLE, NodeMask: 0 };
     let heap = match dev.CreateDescriptorHeap::<ID3D12DescriptorHeap>(&d) {
         Ok(h) => h,
@@ -346,8 +354,7 @@ pub unsafe fn shared_heap(dev: &ID3D12Device) -> bool {
             inc,
             heap,
             cap,
-            // the memory windows' raw UAVs (`set_window_views`) come first
-            next: crate::gpu::recomp::MEM_HEAP_BASE + crate::gpu::uma::MAX_HEAP_WINDOWS as u32,
+            next,
             free: Vec::new(),
             nulls,
         });
@@ -385,6 +392,12 @@ unsafe fn null_views_in(dev: &ID3D12Device, cpu: u64, inc: u32, n: u64) {
     }
 }
 
+static BYTE_VIEWS_UNAVAILABLE: std::sync::atomic::AtomicBool = std::sync::atomic::AtomicBool::new(false);
+
+pub(crate) fn byte_views_unavailable() -> bool {
+    BYTE_VIEWS_UNAVAILABLE.load(std::sync::atomic::Ordering::Relaxed)
+}
+
 static WINDOW_VIEWS_FAILED: std::sync::atomic::AtomicBool = std::sync::atomic::AtomicBool::new(false);
 
 /// Whether the memory windows could not be put in the shared heap (`set_window_views`):
@@ -408,12 +421,23 @@ pub unsafe fn set_window_views(dev: &ID3D12Device, windows: &[(usize, usize)]) -
             let s = g.as_ref().unwrap();
             (s.dev.clone(), s.cpu, s.inc)
         };
+        let mut bytes_enabled = crate::gpu::recomp::byte_view_layout(count as u32) && crate::gpu::recomp::pso::byte_store_program().is_some();
+        if bytes_enabled {
+            use windows::Win32::Graphics::Dxgi::Common::DXGI_FORMAT_R8_UINT;
+            let mut support = D3D12_FEATURE_DATA_FORMAT_SUPPORT { Format: DXGI_FORMAT_R8_UINT, ..Default::default() };
+            bytes_enabled = device.CheckFeatureSupport(D3D12_FEATURE_FORMAT_SUPPORT, (&raw mut support).cast(), std::mem::size_of_val(&support) as u32).is_ok()
+                && support.Support1.contains(D3D12_FORMAT_SUPPORT1_BUFFER | D3D12_FORMAT_SUPPORT1_TYPED_UNORDERED_ACCESS_VIEW)
+                && support.Support2.contains(D3D12_FORMAT_SUPPORT2_UAV_TYPED_STORE);
+            BYTE_VIEWS_UNAVAILABLE.store(!bytes_enabled, std::sync::atomic::Ordering::Relaxed);
+            crate::xlog_info!("byte stores: R8_UINT buffer UAVs available={bytes_enabled}, first slot {}", crate::gpu::recomp::BYTE_HEAP_BASE);
+        }
         // The device may be adopted: its UAV hook re-enters descriptor bookkeeping.
         for k in 0..count {
             let (raw, bytes) = windows.get(k).copied().unwrap_or((0, 0));
             let raw = raw as *mut std::ffi::c_void;
             let at = D3D12_CPU_DESCRIPTOR_HANDLE { ptr: (cpu + (crate::gpu::recomp::MEM_HEAP_BASE as u64 + k as u64) * inc as u64) as usize };
-            match ID3D12Resource::from_raw_borrowed(&raw) {
+            let resource = ID3D12Resource::from_raw_borrowed(&raw);
+            match resource {
                 Some(r) => device.CreateUnorderedAccessView(r, None::<&ID3D12Resource>, Some(&crate::gpu::recomp::runner::raw_window_uav(bytes as u64)), at),
                 None => device.CreateUnorderedAccessView(
                     None::<&ID3D12Resource>,
@@ -421,6 +445,9 @@ pub unsafe fn set_window_views(dev: &ID3D12Device, windows: &[(usize, usize)]) -
                     Some(&crate::gpu::recomp::runner::raw_window_uav(crate::gpu::uma::MAX_SIZE as u64)),
                     at,
                 ),
+            }
+            if bytes_enabled && k < crate::gpu::recomp::BYTE_VIEW_WINDOWS as usize {
+                set_byte_window_views(&device, resource, bytes, cpu, inc, k);
             }
         }
         true
@@ -430,6 +457,30 @@ pub unsafe fn set_window_views(dev: &ID3D12Device, windows: &[(usize, usize)]) -
         crate::xlog_warn!("memory windows: could not bind {count} window(s) in the shared descriptor heap");
     }
     ok
+}
+
+/// One typed UAV may address at most 2^27 elements. Empty segments use a null UAV
+/// so writes outside the valid bytes have the same bounds as the window's raw view.
+unsafe fn set_byte_window_views(dev: &ID3D12Device, resource: Option<&ID3D12Resource>, bytes: usize, cpu: u64, inc: u32, window: usize) {
+    use crate::gpu::recomp::{BYTE_HEAP_BASE, BYTE_SEGMENTS, BYTE_SEGMENT_SHIFT};
+    use windows::Win32::Graphics::Dxgi::Common::DXGI_FORMAT_R8_UINT;
+    let raw = crate::gpu::recomp::runner::raw_window_uav(bytes as u64);
+    let size = u64::from(raw.Anonymous.Buffer.NumElements) * 4;
+    let segment = 1u64 << BYTE_SEGMENT_SHIFT;
+    for part in 0..BYTE_SEGMENTS {
+        let offset = u64::from(part) * segment;
+        let len = size.saturating_sub(offset).min(segment);
+        let slot = BYTE_HEAP_BASE + window as u32 * BYTE_SEGMENTS + part;
+        let at = D3D12_CPU_DESCRIPTOR_HANDLE { ptr: (cpu + u64::from(slot) * u64::from(inc)) as usize };
+        let view = D3D12_UNORDERED_ACCESS_VIEW_DESC {
+            Format: DXGI_FORMAT_R8_UINT,
+            ViewDimension: D3D12_UAV_DIMENSION_BUFFER,
+            Anonymous: D3D12_UNORDERED_ACCESS_VIEW_DESC_0 { Buffer: D3D12_BUFFER_UAV {
+                FirstElement: if len > 0 { offset } else { 0 }, NumElements: len.max(1) as u32, ..Default::default()
+            } },
+        };
+        dev.CreateUnorderedAccessView(resource.filter(|_| len > 0), None::<&ID3D12Resource>, Some(&view), at);
+    }
 }
 
 /// `count` descriptors of the shared heap: the index of the first. None: no shared heap, or
@@ -1199,6 +1250,7 @@ mod tests {
             let output = std::process::Command::new(std::env::current_exe().unwrap())
                 .args(["--exact", "hle::d3d12x::console_heap::tests::window_views_do_not_hold_global_during_device_calls", "--nocapture"])
                 .env(CHILD, "1")
+                .env("XCL_BYTE_STORE_CS", "e166372fa54a77c7")
                 .output()
                 .unwrap();
             assert!(output.status.success(), "{}\n{}", String::from_utf8_lossy(&output.stdout), String::from_utf8_lossy(&output.stderr));
@@ -1208,6 +1260,13 @@ mod tests {
         use std::sync::atomic::{AtomicBool, AtomicU32, Ordering};
         static UNLOCKED: AtomicBool = AtomicBool::new(true);
         static CALLS: AtomicU32 = AtomicU32::new(0);
+        static TYPED: Mutex<Vec<(usize, bool)>> = Mutex::new(Vec::new());
+        unsafe extern "system" fn check_format(_: *mut c_void, _: i32, data: *mut c_void, _: u32) -> i32 {
+            let format = &mut *data.cast::<D3D12_FEATURE_DATA_FORMAT_SUPPORT>();
+            format.Support1 = D3D12_FORMAT_SUPPORT1_BUFFER | D3D12_FORMAT_SUPPORT1_TYPED_UNORDERED_ACCESS_VIEW;
+            format.Support2 = D3D12_FORMAT_SUPPORT2_UAV_TYPED_STORE;
+            0
+        }
         // slot k (bit k) got a null resource
         static NULLS: AtomicU32 = AtomicU32::new(0);
         #[repr(C)]
@@ -1216,6 +1275,10 @@ mod tests {
         unsafe extern "system" fn create_uav(_this: *mut c_void, resource: *mut c_void, _counter: *mut c_void, _desc: *const D3D12_UNORDERED_ACCESS_VIEW_DESC, at: D3D12_CPU_DESCRIPTOR_HANDLE) {
             // The adopted device hook can re-enter descriptor bookkeeping.
             UNLOCKED.fetch_and(GLOBAL.try_lock().is_ok(), Ordering::Relaxed);
+            if (*_desc).Format == windows::Win32::Graphics::Dxgi::Common::DXGI_FORMAT_R8_UINT {
+                TYPED.lock().unwrap().push(((at.ptr - 0x1000) / 32, resource.is_null()));
+                return;
+            }
             CALLS.fetch_add(1, Ordering::Relaxed);
             if resource.is_null() {
                 let k = (at.ptr - 0x1000) / 32 - crate::gpu::recomp::MEM_HEAP_BASE as usize;
@@ -1225,6 +1288,7 @@ mod tests {
         let mut vt = [0usize; 20];
         vt[1] = retain as usize;
         vt[2] = retain as usize;
+        vt[13] = check_format as usize;
         vt[19] = create_uav as usize;
         let mut device = Object { vt: vt.as_ptr() };
         let mut heap = Object { vt: vt.as_ptr() };
@@ -1248,11 +1312,20 @@ mod tests {
             assert_eq!(NULLS.swap(0, Ordering::Relaxed), 0);
             // A window without memory `(0, 0)` (16 windows: the ones after the views) gets a null
             // view; an active window that failed to open `(0, bytes > 0)` is rejected.
+            TYPED.lock().unwrap().clear();
+            windows[2] = (0, 0);
             windows[7] = (0, 0);
             windows[15] = (0, 0);
             assert!(set_window_views(&dev, &windows));
             assert_eq!(CALLS.swap(0, Ordering::Relaxed), windows.len() as u32);
-            assert_eq!(NULLS.swap(0, Ordering::Relaxed), 1 << 7 | 1 << 15);
+            assert_eq!(NULLS.swap(0, Ordering::Relaxed), 1 << 2 | 1 << 7 | 1 << 15);
+            let seen = std::mem::take(&mut *TYPED.lock().unwrap());
+            let segments = crate::gpu::recomp::BYTE_SEGMENTS as usize;
+            assert_eq!(seen.len(), 4 * segments);
+            for (i, &(slot, null)) in seen.iter().enumerate() {
+                assert_eq!(slot, crate::gpu::recomp::BYTE_HEAP_BASE as usize + i);
+                assert_eq!(null, i / segments == 2 || i % segments != 0);
+            }
             windows[7] = (0, 0x10000);
             assert!(!set_window_views(&dev, &windows));
             assert_eq!(CALLS.load(Ordering::Relaxed), 0);

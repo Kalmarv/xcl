@@ -742,6 +742,31 @@ fn gpu_direct_unaligned_multi_dword_format_store() {
 }
 
 #[test]
+fn typed_byte_store_adds_a_byte_view_and_keeps_the_raw_fallback() {
+    use crate::gpu::recomp::{BYTE_WINDOWS, HEAP_WINDOWS};
+    let code = prog(&[
+        ("BUFFER_STORE_FORMAT_X", "ENC_MUBUF", &[("VDATA", 10), ("VADDR", 1), ("SRSRC", 3), ("SOFFSET", 128), ("OFFEN", 1)], None),
+    ]);
+    let disassembly = |windows| {
+        let ko = KernelOptions { wave64: false, split: false, mem_windows: windows, sampler_base: 0 };
+        let dxil = translate(&code, ko).expect("formatted store translates");
+        super::validate::validate(&dxil).expect("valid formatted store DXIL");
+        super::validate::disassemble(&dxil).expect("disassemble formatted store")
+    };
+    let stores = |s: &str| s.matches("call void @dx.op.bufferStore.i32(").count();
+    let four_window_checks = |s: &str| s.lines().filter(|l| l.contains("icmp ult i32") && l.trim_end().ends_with(", 4")).count();
+    for windows in [4, 16] {
+        let normal = disassembly(windows | HEAP_WINDOWS);
+        let typed = disassembly(windows | HEAP_WINDOWS | BYTE_WINDOWS);
+        assert_eq!(stores(&typed), stores(&normal) + 1);
+        assert!(typed.contains("call i32 @dx.op.atomicBinOp.i32"), "raw partial stores remain available");
+        if windows == 16 {
+            assert_eq!(four_window_checks(&typed), four_window_checks(&normal) + 1, "only windows 0..4 have byte views");
+        }
+    }
+}
+
+#[test]
 fn window_at_lowers_to_32bit_carry_without_int64() {
     let ko = KernelOptions { wave64: false, split: false, mem_windows: 4, sampler_base: 0 };
     let with_adds = prog(&[
