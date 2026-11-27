@@ -134,24 +134,25 @@ pub fn want(path: Path, va: u64, len: u64) -> bool {
     true
 }
 
-/// A view whose size the title does not give – a root view, a mesh stage's root view, an
-/// acceleration structure – is asked for more than 64 KiB from its address on, as far as that
-/// still lies in a view window. Tiles whose CPU pages are not committed get no video memory
-/// (`sparse::fill_later`), so the cost is what the title really has there.
-///
-/// By default mesh stage views reach 1 MiB: a mesh stage reads vertex and
-/// index data through them, and a detailed mesh's buffers are longer than 64 KiB (the rest
-/// read as zero: its vertices collapsed onto a few points and the mesh drew as a slab).
-/// Root views of other stages keep 64 KiB: with 1 MiB a title's character lighting read
-/// tiles not yet filled and went black.
-/// `XCL_VIEW_REACH_MB=n`: `n` MiB instead, for all three kinds; 0: 64 KiB as before.
-/// `XCL_VIEW_REACH=bvh,root,mesh`: only those kinds.
+/// `XCL_VIEW_REACH_MB=n` (an experiment): a view whose size the title does not give – a root
+/// view, a mesh stage's root view, an acceleration structure – is asked for `n` MiB from its
+/// address on instead of 64 KiB, as far as that still lies in a view window. Tiles whose CPU
+/// pages are not committed get no video memory (`sparse::fill_later`), so the cost is what the
+/// title really has there. Off (0) by default.
 fn reach(path: Path, va: u64, len: u64) -> u64 {
-    static SET: std::sync::OnceLock<(u64, [bool; 3])> = std::sync::OnceLock::new();
-    let (mb, kinds) = *SET.get_or_init(|| {
-        let set = reach_setting(std::env::var("XCL_VIEW_REACH_MB").ok().as_deref(), std::env::var("XCL_VIEW_REACH").ok().as_deref());
-        crate::xlog_info!("D3D12.X: views without a size are asked for {} MiB from their address on (acceleration structures {}, root views {}, mesh stage views {}; XCL_VIEW_REACH_MB, XCL_VIEW_REACH)", set.0, set.1[0], set.1[1], set.1[2]);
-        set
+    static MB: std::sync::OnceLock<u64> = std::sync::OnceLock::new();
+    let mb = *MB.get_or_init(|| {
+        let mb = std::env::var("XCL_VIEW_REACH_MB").ok().and_then(|v| v.trim().parse::<u64>().ok()).unwrap_or(0).min(4096);
+        if mb != 0 {
+            crate::xlog_info!("D3D12.X: XCL_VIEW_REACH_MB: root views, mesh stage views and acceleration structures are asked for {mb} MiB from their address on");
+        }
+        mb
+    });
+    // `XCL_VIEW_REACH=bvh,root,mesh`: only those kinds (all three without it)
+    static KINDS: std::sync::OnceLock<[bool; 3]> = std::sync::OnceLock::new();
+    let kinds = KINDS.get_or_init(|| match std::env::var("XCL_VIEW_REACH") {
+        Ok(v) => ["bvh", "root", "mesh"].map(|k| v.split(',').any(|x| x.trim().eq_ignore_ascii_case(k))),
+        Err(_) => [true; 3],
     });
     let sizeless = match path {
         Path::Bvh => kinds[0],
@@ -160,16 +161,6 @@ fn reach(path: Path, va: u64, len: u64) -> u64 {
         _ => false,
     };
     longer(sizeless, mb, len, |end| is_view(va.saturating_add(end - 1)))
-}
-
-/// The MiB a sizeless view reaches and the kinds that do (acceleration structure, root view,
-/// mesh stage view), from `XCL_VIEW_REACH_MB` and `XCL_VIEW_REACH`.
-fn reach_setting(mb: Option<&str>, kinds: Option<&str>) -> (u64, [bool; 3]) {
-    let named = kinds.map(|v| ["bvh", "root", "mesh"].map(|k| v.split(',').any(|x| x.trim().eq_ignore_ascii_case(k))));
-    match mb.and_then(|v| v.trim().parse::<u64>().ok()) {
-        Some(mb) => (mb.min(4096), named.unwrap_or([true; 3])),
-        None => (1, named.unwrap_or([false, false, true])),
-    }
 }
 
 /// `len`, or `mb` MiB when that is more, the path has no size (`sizeless`) and the last byte
@@ -230,18 +221,6 @@ mod reach_tests {
         assert_eq!(super::longer(false, 64, 0x1_0000, all), 0x1_0000, "a view with a size keeps it");
         assert_eq!(super::longer(true, 1, 8 << 20, all), 8 << 20, "never shorter");
         assert_eq!(super::longer(true, 64, 0x1_0000, |end| end <= 32 << 20), 0x1_0000, "past the window");
-    }
-
-    /// Mesh stage views reach 1 MiB unless told otherwise; a number sets the
-    /// reach of all three kinds, 0 turns it off, and the kinds can be named.
-    #[test]
-    fn mesh_stage_views_reach_a_mebibyte_by_default() {
-        assert_eq!(super::reach_setting(None, None), (1, [false, false, true]));
-        assert_eq!(super::reach_setting(Some("4"), None), (4, [true; 3]));
-        assert_eq!(super::reach_setting(Some(" 0 "), None), (0, [true; 3]), "off");
-        assert_eq!(super::reach_setting(None, Some("mesh")), (1, [false, false, true]));
-        assert_eq!(super::reach_setting(Some("2"), Some("bvh, Root")), (2, [true, true, false]));
-        assert_eq!(super::longer(true, super::reach_setting(None, None).0, 0x1_0000, |_| true), 1 << 20);
     }
 }
 

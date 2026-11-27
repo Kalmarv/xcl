@@ -2501,8 +2501,9 @@ pub unsafe fn upload_and_wait(dev: &ID3D12Device, queue: &ID3D12CommandQueue, re
 }
 
 /// (`vram::level_pages`) Before an upload of title texture `r`: its levels with texels in `subs`
-/// (its subresources as they go up) get their video memory pages if they have none - a texture
-/// placed with lazy levels; any other: nothing to do. A level of zeros has no texels: a streamed
+/// (its subresources as they go up) get their video memory pages if they have none, and those
+/// with pages and no texels now give them back (`vram::unmap_levels`) - a texture placed with
+/// lazy levels; any other: nothing to do. A level of zeros has no texels: a streamed
 /// texture's larger levels before the title has memory behind them (read as zeros,
 /// `read_committed`). It keeps no pages, reads as zeros as it would with them, and its copy goes
 /// to tiles that are not mapped, which drops it (tiled resources tier 2). Returns the levels that
@@ -2513,6 +2514,10 @@ unsafe fn map_levels_with_texels(r: &ID3D12Resource, subs: &[Subresource]) -> Ve
     }
     // (one slice: its subresources are its levels)
     let present: Vec<u32> = subs.iter().enumerate().filter(|(_, s)| !all_zero(&s.data)).map(|(i, _)| i as u32).collect();
+    // a level that had texels and has none now: the title took its memory, and it gives back its
+    // pages (this upload would only have written zeros to them)
+    let zero: Vec<u32> = (0..subs.len() as u32).filter(|l| !present.contains(l)).collect();
+    super::vram::unmap_levels(r, &zero);
     super::vram::map_levels(r, Some(&present))
 }
 
@@ -4555,7 +4560,9 @@ pub(super) mod tests {
     /// first upload, then pages for those levels only and their texels right, zeros where there
     /// are none. With memory under the largest level too, a texture placed there again (as a
     /// title does) takes that level's pages - the others are shared - and holds all of it. A
-    /// texture the GPU writes gets the pages of all its levels.
+    /// texture the GPU writes gets the pages of all its levels. When the title takes the memory
+    /// from under the largest level again, that level gives its pages back at the next upload
+    /// (the other texture on them keeps them), and gets them again with its texels.
     #[test]
     fn a_placed_texture_gets_the_pages_of_a_level_with_its_texels() {
         let _vram_guard = super::super::vram::VRAM_TEST_LOCK.lock().unwrap();
@@ -4563,7 +4570,7 @@ pub(super) mod tests {
         use windows::Win32::Graphics::Direct3D::D3D_FEATURE_LEVEL_11_0;
         use windows::Win32::Graphics::Dxgi::Common::DXGI_SAMPLE_DESC;
         use windows::Win32::Graphics::Dxgi::*;
-        use windows_sys::Win32::System::Memory::{VirtualAlloc, VirtualFree, MEM_COMMIT, MEM_RELEASE, MEM_RESERVE, PAGE_READWRITE};
+        use windows_sys::Win32::System::Memory::{VirtualAlloc, VirtualFree, MEM_COMMIT, MEM_DECOMMIT, MEM_RELEASE, MEM_RESERVE, PAGE_READWRITE};
         const NAME: &str = "a_placed_texture_gets_the_pages_of_a_level_with_its_texels";
         unsafe {
             let factory: IDXGIFactory4 = CreateDXGIFactory1().expect("DXGI factory");
@@ -4684,6 +4691,26 @@ pub(super) mod tests {
             note_gpu_write(0, small.as_raw() as usize);
             assert_eq!(dev_pages() - p0, (all as usize) << 16, "the same pages");
             assert!(read_sub(&small, 0) == want[0].data, "a GPU-written texture has pages under all its levels");
+            // the title takes the memory from under mip 0 again (a streamed level it let go): the
+            // second texture's next upload finds mip 0 all zeros, and mip 0 gives back its pages;
+            // the first one, on the same pages, keeps them
+            let full_key = full.as_raw() as usize;
+            assert_eq!(super::super::vram::mapped_level_tiles(full_key), Some(all as u64));
+            assert_ne!(VirtualFree((at + top) as *mut c_void, size - top, MEM_DECOMMIT), 0);
+            assert!(map_levels_with_texels(&full, &subresources(at, &tex)).is_empty(), "no level got pages");
+            assert_eq!(super::super::vram::mapped_level_tiles(full_key), Some((all - top_tiles) as u64), "mip 0 gave its pages back");
+            assert!(super::super::vram::has_unmapped_levels(full_key));
+            assert!(read_sub(&full, 0).iter().all(|&b| b == 0), "a level that gave its pages back reads as zeros");
+            for sub in 1..11u32 {
+                assert!(read_sub(&full, sub) == want[sub as usize].data, "level {sub} keeps its pages and texels");
+            }
+            assert!(read_sub(&small, 0) == want[0].data, "the other texture on those pages keeps them");
+            // mip 0's texels come back: its pages too, the ones the other texture holds
+            assert!(!VirtualAlloc((at + top) as *const c_void, size - top, MEM_COMMIT, PAGE_READWRITE).is_null());
+            std::ptr::copy_nonoverlapping(whole.as_ptr().add(top), (at + top) as *mut u8, size - top);
+            assert_eq!(map_levels_with_texels(&full, &subresources(at, &tex)), vec![0], "mip 0 got its pages again");
+            assert_eq!(super::super::vram::mapped_level_tiles(full_key), Some(all as u64));
+            assert!(read_sub(&full, 0) == want[0].data, "mip 0 on the pages the other texture kept");
             super::super::vram::LEVEL_PAGES_FOR_TEST.store(false, Ordering::Relaxed);
             drop((small, full));
             VirtualFree(at as *mut c_void, 0, MEM_RELEASE);

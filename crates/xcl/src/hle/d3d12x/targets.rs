@@ -446,7 +446,7 @@ fn log_computes(n: u64, f: &Frame) -> Vec<ShaderFile> {
 }
 
 /// pipelines a written target lists
-const PIPELINES_MOST: usize = 12;
+const PIPELINES_MOST: usize = 48;
 /// console shader bytes kept for the dumps at most
 const BLOB_BYTES_MOST: usize = 512 << 20;
 

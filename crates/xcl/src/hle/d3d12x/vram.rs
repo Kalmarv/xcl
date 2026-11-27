@@ -801,10 +801,16 @@ impl Pages {
     /// Unmap every tile of `res` (`D3D12_TILE_RANGE_FLAG_NULL`) so its unshared tiles can return
     /// to the pool even while the title keeps the COM object alive.
     unsafe fn unmap(&mut self, res: &ID3D12Resource, total: u32) {
+        self.unmap_range(res, 0, total);
+    }
+
+    /// `unmap` for the `n` tiles of `res` from the first one of subresource `sub` on.
+    unsafe fn unmap_range(&mut self, res: &ID3D12Resource, sub: u32, n: u32) {
+        let total = n;
         if total == 0 {
             return;
         }
-        let coord = D3D12_TILED_RESOURCE_COORDINATE::default();
+        let coord = D3D12_TILED_RESOURCE_COORDINATE { Subresource: sub, ..Default::default() };
         let region = D3D12_TILE_REGION_SIZE { NumTiles: total, UseBox: false.into(), ..Default::default() };
         let flag = D3D12_TILE_RANGE_FLAG_NULL;
         self.queue.UpdateTileMappings(
@@ -1581,6 +1587,88 @@ pub(super) unsafe fn map_levels(res: &ID3D12Resource, levels: Option<&[u32]>) ->
     Vec::new()
 }
 
+/// The levels `zero` of `res` hold no texels now: the title took the memory from under them, as
+/// a streaming title does with the levels of a texture it no longer shows at that size. A
+/// texture placed with lazy levels gives back the pages of each group of levels that has pages
+/// and whose levels are all in `zero`, as it had none before their first texels (`map_levels`
+/// gives them pages again with their next ones): tiles without memory read as zeros, as those
+/// levels would with it (tiled resources tier 2). Its pages go back to the pools when no other
+/// texture uses them (`release_tiles`, `IDLE`). Returns the tiles that lost their pages.
+pub(super) unsafe fn unmap_levels(res: &ID3D12Resource, zero: &[u32]) -> u64 {
+    let key = res.as_raw() as usize;
+    let mut g = PAGES.lock().unwrap();
+    for pages in g.values_mut().flatten() {
+        let Some(t) = pages.targets.get_mut(&key) else { continue };
+        let (va, console_bytes, total) = (t.va, t.console_bytes, t.total);
+        let Some(lv) = t.levels.as_mut().filter(|_| t.mapped) else { return 0 };
+        let Some((first_page, own)) = owned_pages(va, console_bytes, total as usize) else { return 0 };
+        let mut ranges = Vec::new();
+        let (mut gone, mut gone_extra) = (Vec::new(), Vec::new());
+        for k in 0..lv.groups.len() {
+            if !lv.groups[k].3 || !lv.levels_of(k).all(|l| zero.contains(&l)) {
+                continue;
+            }
+            let (sub, first, n, _) = lv.groups[k];
+            lv.groups[k].3 = false;
+            ranges.push((sub, n));
+            // (the keys `bind_range` gave these tiles)
+            for i in first as usize..(first + n) as usize {
+                if i < own {
+                    gone.push(first_page + i * PAGE);
+                } else {
+                    gone_extra.push((va, i));
+                }
+            }
+        }
+        if ranges.is_empty() {
+            return 0;
+        }
+        remove_once_each(&mut t.used, &gone);
+        remove_once_each(&mut t.used_extra, &gone_extra);
+        let freed: u64 = ranges.iter().map(|&(_, n)| n as u64).sum();
+        for (sub, n) in ranges {
+            pages.unmap_range(res, sub, n);
+        }
+        pages.release_tiles(gone, gone_extra, std::time::Instant::now(), false);
+        LEVEL_STATS[2].fetch_sub(freed, std::sync::atomic::Ordering::Relaxed);
+        let n = LEVELS_GIVEN_BACK.fetch_add(1, std::sync::atomic::Ordering::Relaxed) + 1;
+        if n.is_power_of_two() && n >= 64 {
+            let (textures, stand, mapped, _) = level_stats();
+            crate::xlog_info!("D3D12.X: level pages: {n} times a texture's levels lost their texels and gave their pages back; {textures} textures standing for {} MB have pages for {} MB", stand >> 4, mapped >> 4);
+        }
+        return freed;
+    }
+    0
+}
+
+/// The times `unmap_levels` gave pages back.
+static LEVELS_GIVEN_BACK: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
+
+/// `v` without one occurrence of each item of `gone` (an item named twice: two of them), in one
+/// pass: a search of `v` for each would go over it again for every page of a large level.
+fn remove_once_each<T: Copy + Eq + std::hash::Hash>(v: &mut Vec<T>, gone: &[T]) {
+    if gone.is_empty() {
+        return;
+    }
+    let mut left: std::collections::HashMap<T, u32> = std::collections::HashMap::with_capacity(gone.len());
+    for &g in gone {
+        *left.entry(g).or_insert(0) += 1;
+    }
+    v.retain(|x| match left.get_mut(x) {
+        Some(n) if *n > 0 => {
+            *n -= 1;
+            false
+        }
+        _ => true,
+    });
+}
+
+/// The tiles of texture `resource` (lazy levels) that have pages: for a test.
+#[cfg(test)]
+pub(super) fn mapped_level_tiles(resource: usize) -> Option<u64> {
+    PAGES.lock().unwrap().values().flatten().find_map(|p| p.targets.get(&resource).and_then(|t| t.levels.as_ref()).map(|l| l.mapped_tiles()))
+}
+
 /// Whether `resource` is a texture whose levels get their pages one by one (`map_levels`).
 pub(super) fn has_lazy_levels(resource: usize) -> bool {
     PAGES.lock().unwrap().values().flatten().any(|p| p.targets.get(&resource).is_some_and(|t| t.levels.is_some()))
@@ -1703,6 +1791,20 @@ mod tests {
     use std::time::{Duration, Instant};
 
     const MIB: usize = 1 << 20;
+
+    /// `remove_once_each` takes one occurrence for each time an item is named, keeps the rest
+    /// (duplicates too) and items not named, and leaves the list as it was for nothing to take.
+    #[test]
+    fn remove_once_each_takes_one_occurrence_for_each_naming() {
+        let mut v = vec![1, 2, 3, 2, 4, 2, 5];
+        remove_once_each(&mut v, &[2, 4, 2, 9]);
+        assert_eq!(v, vec![1, 3, 2, 5]);
+        let mut w = vec![(1, 1), (1, 2)];
+        remove_once_each(&mut w, &[]);
+        assert_eq!(w, vec![(1, 1), (1, 2)]);
+        remove_once_each(&mut w, &[(1, 2), (1, 2)]);
+        assert_eq!(w, vec![(1, 1)]);
+    }
 
     /// The levels of a texture with lazy levels: a group of tiles for each level with tiles of its
     /// own and one for the packed levels; a level past the last standard one is in the packed

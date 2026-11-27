@@ -7553,6 +7553,35 @@ mod mesh_slot_tests {
         s
     }
 
+    /// `XCL_DUMP_TARGETS` notes a mesh pipeline's console MS (also from the AS slot) and its PS,
+    /// render target 0's blend and the formats; a stream with a PC mesh shader is not noted.
+    #[test]
+    fn a_dumped_target_knows_the_shaders_of_a_console_mesh_pipeline() {
+        let ms = sample(13, &[fssm(&CODE, &[(8, 13)])]);
+        let ps = b"DXBC-a-pixel-shader".to_vec();
+        // D3D12_RT_FORMAT_ARRAY: RTFormats[8], then NumRenderTargets; two targets,
+        // R8G8B8A8_UNORM_SRGB (29) and R10G10B10A2_UNORM (24)
+        let mut formats = vec![0u8; 36];
+        formats[..4].copy_from_slice(&29u32.to_le_bytes());
+        formats[4..8].copy_from_slice(&24u32.to_le_bytes());
+        formats[32..36].copy_from_slice(&2u32.to_le_bytes());
+        let mut stream = sub(0, &0u64.to_le_bytes()); // ROOT_SIGNATURE: null
+        stream.extend_from_slice(&sub(24, &bytecode(&ms))); // the MS in the AS slot
+        stream.extend_from_slice(&sub(2, &bytecode(&ps)));
+        stream.extend_from_slice(&sub(8, &vec![0u8; 328])); // BLEND
+        stream.extend_from_slice(&sub(15, &formats));
+        let subs = super::stream_subobjects(&stream).unwrap();
+        let m = unsafe { super::mesh_stream_for_dump(&subs) }.expect("a console mesh pipeline is noted");
+        assert_eq!(m.stages.iter().map(|s| s.0).collect::<Vec<_>>(), ["ms", "ps"]);
+        assert_eq!(m.stages[0].1, ms.as_slice(), "the MS, moved out of the AS slot");
+        assert_eq!(m.stages[1].1, ps.as_slice());
+        assert_eq!(m.formats.iter().map(|f| f.0).collect::<Vec<_>>(), [29, 24]);
+        // a PC mesh shader (not a console container) is left to the PC paths
+        let pc = b"DXBC-a-pc-mesh-shader".to_vec();
+        let stream = as_slot_ms_stream(&pc, &ps);
+        assert!(unsafe { super::mesh_stream_for_dump(&super::stream_subobjects(&stream).unwrap()) }.is_none());
+    }
+
     /// The stand-in for a console MS alone in the AS slot is a mesh pipeline: the subobject is
     /// retyped to MS with the dummy MS (as `translated_mesh_stream` reads the title's stream),
     /// the PS is the dummy PS. Left an empty AS and a PS, the stream had neither an MS nor a VS
@@ -8415,7 +8444,58 @@ pub(super) unsafe extern "system" fn dev_create_pipeline_state(this: *mut c_void
     if super::capture::enabled() && hr >= 0 && !ppv.is_null() {
         super::capture::note_stream(*ppv as usize);
     }
+    note_mesh_stream_for_dump(desc, ppv, hr);
     hr
+}
+
+/// `XCL_DUMP_TARGETS`: a pipeline stream with a console mesh shader (`translated_mesh_stream`)
+/// is noted with its MS and PS, render target 0's blend and the formats, as a graphics desc is
+/// (`note_pipeline_for_dump`): without it a dumped target drawn by mesh pipelines lists them as
+/// "not known" and their pixel shaders are not written.
+unsafe fn note_mesh_stream_for_dump(desc: *const c_void, ppv: *mut *mut c_void, hr: HRESULT) {
+    if !super::targets::enabled() || hr < 0 || ppv.is_null() || (*ppv).is_null() || !crate::gpu::shader::readable(desc as usize, 16) {
+        return;
+    }
+    let (size, base) = (*(desc as *const usize), *((desc as usize + 8) as *const usize));
+    if !crate::gpu::shader::readable(base, size) {
+        return;
+    }
+    let subs = known_subobjects(std::slice::from_raw_parts(base as *const u8, size));
+    if let Some(m) = mesh_stream_for_dump(&subs) {
+        super::targets::note_pipeline(*ppv as usize, &m.stages, &m.blend, &m.formats, false);
+    }
+}
+
+/// What `note_mesh_stream_for_dump` notes of a stream's subobjects: its MS (also from the AS
+/// slot, `mesh_shader_slots`) and PS if the MS is a console one, render target 0's blend and
+/// the render target formats.
+struct MeshStreamForDump<'a> {
+    stages: Vec<(&'static str, &'a [u8])>,
+    blend: D3D12_RENDER_TARGET_BLEND_DESC,
+    formats: Vec<windows::Win32::Graphics::Dxgi::Common::DXGI_FORMAT>,
+}
+
+unsafe fn mesh_stream_for_dump<'a>(subs: &[(u32, &'a [u8])]) -> Option<MeshStreamForDump<'a>> {
+    let shader = |ty: D3D12_PIPELINE_STATE_SUBOBJECT_TYPE| subs.iter().find(|s| s.0 == ty.0 as u32).and_then(|s| payload_shader(s.1));
+    let (ms, _) = mesh_shader_slots(shader(D3D12_PIPELINE_STATE_SUBOBJECT_TYPE_MS), shader(D3D12_PIPELINE_STATE_SUBOBJECT_TYPE_AS));
+    let ms = ms.filter(|ms| crate::gpu::recomp::pso::is_console(ms))?;
+    let mut stages = vec![("ms", ms)];
+    if let Some(ps) = shader(D3D12_PIPELINE_STATE_SUBOBJECT_TYPE_PS) {
+        stages.push(("ps", ps));
+    }
+    let payload = |ty: D3D12_PIPELINE_STATE_SUBOBJECT_TYPE| subs.iter().find(|s| s.0 == ty.0 as u32).map(|s| s.1);
+    let blend = payload(D3D12_PIPELINE_STATE_SUBOBJECT_TYPE_BLEND)
+        .filter(|p| p.len() >= std::mem::size_of::<D3D12_BLEND_DESC>())
+        .map(|p| std::ptr::read_unaligned(p.as_ptr() as *const D3D12_BLEND_DESC).RenderTarget[0])
+        .unwrap_or_default();
+    let formats = payload(D3D12_PIPELINE_STATE_SUBOBJECT_TYPE_RENDER_TARGET_FORMATS)
+        .filter(|p| p.len() >= std::mem::size_of::<D3D12_RT_FORMAT_ARRAY>())
+        .map(|p| {
+            let rt = std::ptr::read_unaligned(p.as_ptr() as *const D3D12_RT_FORMAT_ARRAY);
+            rt.RTFormats[..rt.NumRenderTargets.min(8) as usize].to_vec()
+        })
+        .unwrap_or_default();
+    Some(MeshStreamForDump { stages, blend, formats })
 }
 
 unsafe fn pipeline_state(this: *mut c_void, desc: *const c_void, riid: *const GUID, ppv: *mut *mut c_void) -> HRESULT {
