@@ -1036,9 +1036,9 @@ impl Pages {
                 self.unmap_tiles(&scratch_buf, chunk.len() as u32);
                 return false;
             }
-            super::title_textures::own_work(|| {
-                self.queue.ExecuteCommandLists(&[Some(list.cast().unwrap())]);
-            });
+            // the PC method, not XCL's hook: this runs under `PAGES`, and the hook's
+            // `present::note_execute` drains late releases, whose `unmap_placed` takes `PAGES`
+            super::sparse::pc_execute(&self.queue, &list);
             self.unmap_tiles(&scratch_buf, chunk.len() as u32);
             self.value += 1;
             let _ = self.queue.Signal(&self.fence, self.value);
