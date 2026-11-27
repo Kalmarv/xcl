@@ -1547,6 +1547,9 @@ unsafe fn shared_batch_buf(this: *mut c_void) -> Result<(ID3D12Resource, u64), S
         return Ok(r);
     }
     let entry = TwoPassBuf::make(&dev, batch_records_bytes(), "two-pass shared batch records")?;
+    if let Ok(p) = entry.res.cast::<ID3D12Pageable>() {
+        super::uma_driver::set_hot_priority(&dev, &p, "two-pass shared batch");
+    }
     let r = (entry.res.clone(), entry.bytes);
     let mut g = SHARED_BATCH.lock().unwrap();
     let m = g.get_or_insert_with(HashMap::new);
@@ -1744,6 +1747,9 @@ unsafe fn ensure_res_buffer(this: *mut c_void, need_bytes: u64) -> Result<(ID3D1
         }
         let alloc = need.max(INDIRECT_RECORDS).min(RECORD_MAX);
         let entry = TwoPassBuf::make(&dev, alloc, "two-pass shared res buffer")?;
+        if let Ok(p) = entry.res.cast::<ID3D12Pageable>() {
+            super::uma_driver::set_hot_priority(&dev, &p, "two-pass shared res");
+        }
         let (buf, cap, va) = (entry.res.clone(), entry.bytes, entry.res.GetGPUVirtualAddress());
         let mut g = SHARED_RES.lock().unwrap();
         let m = g.get_or_insert_with(HashMap::new);

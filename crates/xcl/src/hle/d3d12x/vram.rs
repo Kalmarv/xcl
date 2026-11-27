@@ -167,6 +167,11 @@ unsafe fn arena_heap(dev: &ID3D12Device, va: usize, size: usize, align: usize) -
     if n < 16 || n.is_power_of_two() {
         crate::xlog_info!("D3D12.X: video-memory arena #{n} for title addresses {va:#x}..{:#x} ({made} bytes of arenas made so far)", va + size);
     }
+    if let Some(ref h) = heap {
+        if let Ok(p) = h.cast::<ID3D12Pageable>() {
+            super::uma_driver::set_hot_priority(dev, &p, "vram arena");
+        }
+    }
     heap
 }
 

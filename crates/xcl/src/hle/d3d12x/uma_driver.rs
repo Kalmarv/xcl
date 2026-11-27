@@ -334,6 +334,36 @@ fn upload_priority_wanted() -> bool {
     *ON.get_or_init(|| std::env::var("XCL_UMA_UPLOAD_PRIORITY").is_ok_and(|v| v.trim() == "1"))
 }
 
+/// `XCL_VRAM_HOT_PRIORITY=1` (read once): sparse window tile pools, video-memory arenas, and
+/// shared two-pass record buffers get `D3D12_RESIDENCY_PRIORITY_HIGH` (below `GPU_UPLOAD`'s
+/// `MAXIMUM`, above tiled texture pools' `NORMAL`) so over-budget demotion hits cold texture
+/// pools first instead of hot geometry/buffer pools.
+pub(super) fn hot_priority_wanted() -> bool {
+    static ON: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
+    *ON.get_or_init(|| std::env::var("XCL_VRAM_HOT_PRIORITY").is_ok_and(|v| v.trim() == "1"))
+}
+
+pub(super) unsafe fn set_hot_priority(device: &ID3D12Device, obj: &ID3D12Pageable, what: &str) {
+    if !hot_priority_wanted() {
+        return;
+    }
+    let set = device.cast::<ID3D12Device1>().and_then(|d| d.SetResidencyPriority(1, &Some(obj.clone()), &D3D12_RESIDENCY_PRIORITY_HIGH));
+    static LOGGED: std::sync::atomic::AtomicU32 = std::sync::atomic::AtomicU32::new(0);
+    match set {
+        Ok(()) => {
+            let n = LOGGED.fetch_add(1, Ordering::Relaxed) + 1;
+            if n <= 4 || n.is_power_of_two() {
+                crate::xlog_info!("D3D12.X: XCL_VRAM_HOT_PRIORITY: {what} set to HIGH residency priority ({n} total)");
+            }
+        }
+        Err(e) => {
+            if LOGGED.fetch_add(1, Ordering::Relaxed) < 4 {
+                crate::xlog_warn!("D3D12.X: XCL_VRAM_HOT_PRIORITY: SetResidencyPriority({what}): {e}");
+            }
+        }
+    }
+}
+
 /// One segment of a mixed window: a heap of `size` bytes (write-watched when `watch`), a buffer
 /// over all of it and where the driver mapped it for the CPU.
 unsafe fn mapped_segment(device: &ID3D12Device, size: usize, upload: bool, watch: bool) -> Result<(ID3D12Heap, ID3D12Resource, usize), String> {
