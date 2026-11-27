@@ -260,7 +260,7 @@ impl Ir for DxilIr {
     /// doesn't know). A register it touches that is neither an input nor an output refuses the
     /// instruction: `Lw` would read that register's value at the program's start. Blocks it makes
     /// (a guarded access, the memory window switch) end the `Ir` block in the last of them.
-    fn foreign(&mut self, d: &Decoded, guard: Value, inputs: &[(Var, Value)], outputs: &[Var]) -> Result<Vec<Value>, String> {
+    fn foreign(&mut self, d: &Decoded, guard: Value, mask: Option<[Value; 2]>, inputs: &[(Var, Value)], outputs: &[Var]) -> Result<Vec<Value>, String> {
         use crate::gpu::dxil::lower::{VAR_BUDGET, VAR_SCC, VAR_VGPR};
         let var = |v: Var| match v {
             Var::S(r) => r as u32,
@@ -278,7 +278,7 @@ impl Ir for DxilIr {
         // form a ballot of this half is enough, and an exchange there would wait at a barrier
         // for a half that is elsewhere when only one half reaches this block
         self.lw.local_masks = true;
-        let r = self.lw.inst_guarded(d, guard, None);
+        let r = self.lw.inst_guarded(d, guard, mask.map(|[lo, hi]| (lo, hi)));
         self.lw.local_masks = false;
         let used = std::mem::replace(&mut self.lw.init.touched, before);
         self.lw.init.touched.extend(&used);
@@ -460,6 +460,52 @@ mod tests {
         true
     }
 
+    #[test]
+    fn per_lane_cvt_f16_sdwa_rounds_and_pads_the_high_word() {
+        use crate::gpu::rdna2::{decode, encode};
+        let mut bytes = Vec::new();
+        for (mode, dst) in [(0, 3), (3, 4)] {
+            bytes.extend(encode("S_SETREG_IMM32_B32", "ENC_SOPK",
+                &[("SIMM16", 0x881)], Some(mode)).unwrap());
+            bytes.extend(encode("V_CVT_F16_F32", "ENC_VOP1", &[("VDST", dst), ("SRC0", 249)], None).unwrap());
+            // DWORD source v1, WORD_1 destination with UNUSED_PAD.
+            bytes.extend(0x0006_0501u32.to_le_bytes());
+        }
+        bytes.extend(encode("S_ENDPGM", "ENC_SOPP", &[], None).unwrap());
+        let mut insts = Vec::new();
+        let mut pc = 0;
+        while pc < bytes.len() {
+            let d = decode(&bytes[pc..], pc as u64).unwrap();
+            pc += d.len;
+            insts.push(d);
+        }
+        let (dxil, _) = super::kernel(&insts, false).unwrap();
+        if !gpu() { return; }
+        let cases = [
+            (0x3300_0000, 0, 0),         // halfway to the first half subnormal
+            (0x3300_0001, 1, 0),
+            (0xb300_0001, 0x8001, 0x8000),
+            (3075.0f32.to_bits(), 0x6a02, 0x6a01),
+        ];
+        let mut st = runner::KernelState::default();
+        st.sgpr[126] = 0x5555_5555;
+        st.sgpr[127] = 0;
+        let before = 0x1357_abcd;
+        for lane in 0..32 {
+            st.vgpr[lane][1] = cases[lane / 2 % cases.len()].0;
+            st.vgpr[lane][3] = before;
+            st.vgpr[lane][4] = before;
+        }
+        let out = runner::run(&dxil, &st, &[]).unwrap();
+        for lane in 0..32 {
+            let (_, nearest, toward_zero) = cases[lane / 2 % cases.len()];
+            for (dst, half) in [(3, nearest), (4, toward_zero)] {
+                let want = if lane % 2 == 0 { half << 16 } else { before };
+                assert_eq!(out.vgpr[lane][dst], want, "lane {lane} v{dst}");
+            }
+        }
+    }
+
     /// A rounding mode #1426's lowering cannot honour refuses the program, as #1426 and the HLSL
     /// path do, instead of the per-lane form computing with the default mode (Kalmarv, #1745):
     /// f32 toward zero by `s_setreg`, f64 by `s_round_mode` and by `s_setreg`.
@@ -565,6 +611,143 @@ mod tests {
         let out = runner::run(&dxil, &st, &[]).unwrap();
         for l in 0..32 {
             assert_eq!(out.vgpr[l][3], l as u32, "lane {l}");
+        }
+    }
+
+    /// Per-lane lowering of buffer, global and LDS atomics only reads the operands each op uses
+    /// (not `vdata + 1` or `DATA1` for single-operand atomics) and matches the HLSL path on the GPU.
+    #[test]
+    fn per_lane_atomics_take_their_declared_operands() {
+        const LINES: &[I] = &[
+            ("BUFFER_ATOMIC_ADD", "ENC_MUBUF", &[("VDATA", 2), ("VADDR", 1), ("OFFEN", 1), ("SOFFSET", 128), ("GLC", 1)]),
+            ("BUFFER_ATOMIC_CMPSWAP", "ENC_MUBUF", &[("VDATA", 5), ("VADDR", 1), ("OFFEN", 1), ("SOFFSET", 128), ("GLC", 1)]),
+            ("GLOBAL_ATOMIC_ADD", "ENC_FLAT_GLBL", &[("ADDR", 1), ("DATA", 7), ("VDST", 12), ("SADDR", 0), ("OFFSET", 128), ("GLC", 1)]),
+            ("DS_WRITE_B32", "ENC_DS", &[("ADDR", 1), ("DATA0", 4)]),
+            ("DS_ADD_RTN_U32", "ENC_DS", &[("VDST", 8), ("ADDR", 1), ("DATA0", 7)]),
+            ("DS_CMPST_RTN_B32", "ENC_DS", &[("VDST", 10), ("ADDR", 1), ("DATA0", 6), ("DATA1", 9)]),
+            ("DS_READ_B32", "ENC_DS", &[("VDST", 11), ("ADDR", 1)]),
+            ENDPGM,
+        ];
+        let (direct, _) = super::kernel(&decode(LINES), false).unwrap();
+        crate::gpu::dxil::validate::validate(&direct).expect("valid DXIL");
+        if !gpu() {
+            return;
+        }
+        if dxc::location().is_err() {
+            runner::skip_test("no DXC");
+            return;
+        }
+        let mut st = runner::KernelState::default();
+        st.sgpr[126] = u32::MAX;
+        st.sgpr[2] = 128; // raw buffer size in bytes
+        let mut mem = vec![0; 64];
+        for (i, v) in st.vgpr[..32].iter_mut().enumerate() {
+            let lane = i as u32;
+            mem[i] = 100 + lane;
+            mem[32 + i] = 200 + lane;
+            v[1] = 4 * lane;
+            v[2] = 5;
+            v[4] = 100 + lane;
+            v[5] = 500 + lane;
+            v[6] = 105 + lane;
+            v[7] = 5;
+            v[9] = 300 + lane;
+        }
+        let bytes = LINES.iter().flat_map(encode_line).collect::<Vec<_>>();
+        let t = translate(&bytes, &Options { wave64: false, ..Default::default() }).unwrap();
+        assert!(t.complete(), "{:?}", t.unsupported_why);
+        let reference = dxc::compile(&t.hlsl, "main", "cs_6_6", &[]).unwrap();
+        let reference = runner::run(&reference, &st, &mem).unwrap();
+        let actual = runner::run(&direct, &st, &mem).unwrap();
+        assert_eq!(actual.mem, reference.mem);
+        for i in 0..32 {
+            let lane = i as u32;
+            assert_eq!((actual.mem[i], actual.mem[32 + i]), (500 + lane, 205 + lane));
+            for (r, expected) in [(2, 100), (5, 105), (8, 100), (10, 105), (11, 300), (12, 200)] {
+                assert_eq!(actual.vgpr[i][r], reference.vgpr[i][r]);
+                assert_eq!(actual.vgpr[i][r], expected + lane);
+            }
+        }
+    }
+
+    /// Per-lane lowering of MIMG instructions passes all VADDR (sequential and NSA) and VDATA VGPRs.
+    #[test]
+    fn per_lane_mimg_passes_all_vaddr_and_vdata() {
+        let mut bytes: Vec<u8> = Vec::new();
+        for &(name, fields) in &[
+            ("IMAGE_LOAD", &[("VDATA", 10), ("VADDR", 0), ("SRSRC", 4), ("DMASK", 0xF), ("DIM", 1), ("UNORM", 1)][..]),
+            ("IMAGE_STORE", &[("VDATA", 10), ("VADDR", 2), ("SRSRC", 8), ("DMASK", 0xF), ("DIM", 1), ("UNORM", 1)][..]),
+            ("IMAGE_SAMPLE_LZ", &[("VDATA", 14), ("VADDR", 4), ("SRSRC", 4), ("SSAMP", 6), ("DMASK", 0xF), ("DIM", 1)][..]),
+            ("IMAGE_GATHER4_LZ", &[("VDATA", 18), ("VADDR", 6), ("SRSRC", 4), ("SSAMP", 6), ("DMASK", 0x1), ("DIM", 1)][..]),
+            ("IMAGE_ATOMIC_ADD", &[("VDATA", 22), ("VADDR", 8), ("SRSRC", 8), ("DMASK", 0x1), ("DIM", 1), ("UNORM", 1)][..]),
+        ] {
+            bytes.extend(crate::gpu::rdna2::encode(name, "ENC_MIMG", fields, None).unwrap());
+        }
+        // NSA 2D IMAGE_LOAD with non-sequential VADDR = [v1, v5]
+        let mut nsa_load = crate::gpu::rdna2::encode(
+            "IMAGE_LOAD",
+            "ENC_MIMG",
+            &[("VDATA", 24), ("VADDR", 1), ("SRSRC", 4), ("DMASK", 0x3), ("DIM", 1), ("UNORM", 1), ("NSA", 1)],
+            None,
+        )
+        .unwrap();
+        nsa_load.extend(5u32.to_le_bytes());
+        bytes.extend(nsa_load);
+        bytes.extend(crate::gpu::rdna2::encode("S_ENDPGM", "ENC_SOPP", &[], None).unwrap());
+
+        let mut insts = Vec::new();
+        let mut off = 0usize;
+        while off + 4 <= bytes.len() {
+            let d = crate::gpu::rdna2::decode(&bytes[off..], off as u64).unwrap();
+            off += d.len;
+            insts.push(d);
+        }
+        let (dxil, _) = super::kernel(&insts, false).expect("per-lane MIMG lowering");
+        crate::gpu::dxil::validate::validate(&dxil).expect("valid MIMG DXIL");
+    }
+
+    /// Bridged float DPP ops (`v_min_f32_dpp`, `v_max_f32_dpp`, `v_add_f32_dpp`) receive the
+    /// per-lane EXEC mask instead of reading s126 and match the HLSL path on the GPU.
+    #[test]
+    fn per_lane_bridged_float_dpp_matches_hlsl_on_the_gpu() {
+        let mut bytes: Vec<u8> = Vec::new();
+        // DPP16 row_xmask:1 (0x161), bound_ctrl:1, row_mask:0xf, bank_mask:0xf, vsrc0 = v1
+        let dpp_word: u32 = 1 | (0x161 << 8) | (1 << 19) | (0xF << 24) | (0xF << 28);
+        for &(op, vdst) in &[("V_MIN_F32", 2u64), ("V_MAX_F32", 3), ("V_ADD_F32", 4)] {
+            bytes.extend(crate::gpu::rdna2::encode(op, "ENC_VOP2", &[("VDST", vdst), ("SRC0", 250), ("VSRC1", 1)], None).unwrap());
+            bytes.extend(dpp_word.to_le_bytes());
+        }
+        bytes.extend(crate::gpu::rdna2::encode("S_ENDPGM", "ENC_SOPP", &[], None).unwrap());
+        let mut insts = Vec::new();
+        let mut off = 0usize;
+        while off + 4 <= bytes.len() {
+            let d = crate::gpu::rdna2::decode(&bytes[off..], off as u64).unwrap();
+            off += d.len;
+            insts.push(d);
+        }
+        let (direct, _) = super::kernel(&insts, false).expect("per-lane float DPP lowering");
+        crate::gpu::dxil::validate::validate(&direct).expect("valid float DPP DXIL");
+        if !gpu() {
+            return;
+        }
+        if dxc::location().is_err() {
+            runner::skip_test("no DXC");
+            return;
+        }
+        let mut st = runner::KernelState::default();
+        st.sgpr[126] = 0xFFFF_FFFE; // lane 0 inactive to test EXEC mask check
+        for l in 0..32 {
+            st.vgpr[l][1] = ((l as f32) + 1.5).to_bits();
+        }
+        let t = translate(&bytes, &Options { wave64: false, ..Default::default() }).unwrap();
+        assert!(t.complete(), "{:?}", t.unsupported_why);
+        let reference = dxc::compile(&t.hlsl, "main", "cs_6_6", &[]).unwrap();
+        let reference = runner::run(&reference, &st, &[]).unwrap();
+        let actual = runner::run(&direct, &st, &[]).unwrap();
+        for l in 1..32 {
+            for r in [2, 3, 4] {
+                assert_eq!(actual.vgpr[l][r], reference.vgpr[l][r], "lane {l} v{r}");
+            }
         }
     }
 

@@ -129,7 +129,7 @@ impl<I: Ir> Lower<'_, I> {
     }
 
     /// The lanes in EXEC, as numbers; with `half`, only this lane's half is right.
-    fn exec_words(&mut self, b: usize, half: bool) -> R<[I::V; 2]> {
+    pub(super) fn exec_words(&mut self, b: usize, half: bool) -> R<[I::V; 2]> {
         // split: the other half's word comes through an exchange, which both halves must reach
         if !half && self.ir.whole_needs_exchange() {
             self.all_lanes(b, "EXEC as a number in the split form")?;

@@ -1590,7 +1590,8 @@ impl Lw {
                 if wide64 {
                     return self.mimg_atomic64(d, opn, &ic, tw0, lkind, vdata, glc, run);
                 }
-                let (v, cmpv) = (self.vreg(vdata), self.vreg(vdata + 1));
+                let v = self.vreg(vdata);
+                let cmpv = if is_cmpswap { self.vreg(vdata + 1) } else { self.c(0) };
                 let ui = self.addc(tw0, 1);
                 let signed = opn == "smin" || opn == "smax";
                 let ct = if signed { CompType::I32 } else { CompType::U32 };

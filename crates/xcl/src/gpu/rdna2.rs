@@ -574,6 +574,39 @@ pub fn vgpr_uses(d: &Decoded) -> (Vec<u64>, Vec<u64>) {
             n = field_value(d.enc, &d.words, "IDXEN").unwrap_or(0) + field_value(d.enc, &d.words, "OFFEN").unwrap_or(0);
         }
         let dst = if o.output { &mut w } else { &mut r };
+        if d.enc.name == "ENC_MIMG" {
+            let fv = |name: &str| field_value(d.enc, &d.words, name).unwrap_or(0);
+            if f == "VADDR" {
+                let addr = mimg_address_dwords(d.inst.name, fv("DIM") as usize, fv("A16") == 1);
+                if fv("NSA") == 0 {
+                    dst.extend(v..v + addr);
+                } else {
+                    dst.push(v);
+                    dst.extend(
+                        d.words[2..]
+                            .iter()
+                            .flat_map(|w| w.to_le_bytes())
+                            .take((addr as usize).saturating_sub(1))
+                            .map(|x| x as u64),
+                    );
+                }
+                continue;
+            }
+            if f == "VDATA" {
+                let data = if d.inst.name.contains("BVH") {
+                    4
+                } else {
+                    let least = if d.inst.name.contains("CMPSWAP") { 2 } else { 1 };
+                    let comps = if d.inst.name.starts_with("IMAGE_GATHER") {
+                        4
+                    } else {
+                        (fv("DMASK").count_ones() as u64).max(least)
+                    };
+                    (if fv("D16") == 1 { comps.div_ceil(2) } else { comps }) + ((fv("TFE") | fv("LWE")) & 1)
+                };
+                n = n.max(data);
+            }
+        }
         dst.extend(v..v + n);
     }
     // read-modify-write accumulators

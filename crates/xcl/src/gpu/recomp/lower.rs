@@ -104,9 +104,10 @@ pub trait Ir: Sink {
     fn count_bits(&mut self, v: Self::V) -> Self::V;
     /// `d` lowered with another lowering's instruction semantics (#1426's `Lw::inst_guarded`):
     /// `inputs` are the registers it reads, `guard` (i1) decides this lane's register writes and
-    /// memory effects, and the values of `outputs` after it come back in order. Err when there
+    /// memory effects, `mask` (if any) is the wave-wide active mask cross-lane ops read instead of
+    /// SSA EXEC, and the values of `outputs` after it come back in order. Err when there
     /// is no such lowering or it refuses `d`.
-    fn foreign(&mut self, _d: &Decoded, _guard: Self::V, _inputs: &[(Var, Self::V)], _outputs: &[Var]) -> R<Vec<Self::V>> {
+    fn foreign(&mut self, _d: &Decoded, _guard: Self::V, _mask: Option<[Self::V; 2]>, _inputs: &[(Var, Self::V)], _outputs: &[Var]) -> R<Vec<Self::V>> {
         Err("no foreign lowering".into())
     }
     fn io_load(&mut self, dword: Self::V) -> Self::V;
@@ -233,6 +234,7 @@ fn is_cross_lane(d: &Decoded) -> bool {
         || n.starts_with("V_READLANE")
         || n.starts_with("V_READFIRSTLANE")
         || n.starts_with("V_WRITELANE")
+        || n == "DS_BPERMUTE_B32"
         || n.starts_with("DS_SWIZZLE")
         || n.starts_with("DS_BPERMUTE")
         || n.starts_with("DS_PERMUTE")
@@ -1752,8 +1754,6 @@ impl<I: Ir> Lower<'_, I> {
         // instructions whose #1426 semantics are known to differ from the HLSL path and the
         // console (each reported on #1426): left to the fallback until fixed there
         const DIFFERS_ON_1426: &[&str] = &[
-            // f32 → f16 of a value below the smallest f16 denormal: 0 instead of rounding to it
-            "V_CVT_F16_F32",
             // f16 products round toward zero (`LegacyF32ToF16`) where the console rounds to
             // nearest even (vladbondarenko97's f16 programs; itsSio is fixing it on `main`)
             "V_MUL_F16",
@@ -1831,7 +1831,14 @@ impl<I: Ir> Lower<'_, I> {
         }
         let old_exec = if cmpx { Some(self.read_bit(b, EXEC)?) } else { None };
         let guard = if cmpx || in_guarded_run || !self.guarded.contains(&d.pc) { self.ir.boolean(true) } else { self.read_bit(b, EXEC)? };
-        let vals = self.ir.foreign(d, guard, &inputs, &outputs)?;
+        let mask = if matches!(d.variant, Variant::Dpp16 | Variant::Dpp8) {
+            Some(self.exec_words(b, true)?)
+        } else if name == "DS_BPERMUTE_B32" {
+            Some(self.exec_words(b, false)?)
+        } else {
+            None
+        };
+        let vals = self.ir.foreign(d, guard, mask, &inputs, &outputs)?;
         for (&var, &v) in outputs.iter().zip(&vals) {
             match var {
                 Var::V(_) => self.ssa.write(b, var, v),
