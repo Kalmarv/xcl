@@ -94,14 +94,18 @@ pub enum Backend {
 }
 
 /// Decided once: the real backend unless disabled or the driver refuses.
-pub fn backend() -> Backend {
-    static B: OnceLock<Backend> = OnceLock::new();
-    *B.get_or_init(|| {
+static BACKEND: OnceLock<Backend> = OnceLock::new();
+
+fn backend_with_remap(allow_driver_remap: bool) -> Backend {
+    *BACKEND.get_or_init(|| {
         let cfg = crate::state::config();
         if cfg.graphics.eq_ignore_ascii_case("null") {
             crate::xlog_info!("D3D12.X: backend 'null' (from the config)");
             return Backend::Null;
         }
+        // (main-best: the measured stack decides the driver remap in `uma_driver::wanted`, at any
+        // first device; main's before-the-guest gate is not applied)
+        let _ = allow_driver_remap;
         match real::init() {
             Ok(desc) => {
                 crate::xlog_info!("D3D12.X: backend 'real' – {desc}");
@@ -113,6 +117,14 @@ pub fn backend() -> Backend {
             }
         }
     })
+}
+
+pub fn backend() -> Backend {
+    backend_with_remap(false)
+}
+
+pub(crate) fn backend_before_guest() -> Backend {
+    backend_with_remap(true)
 }
 
 /// Call a function of the system d3d12.dll by name.
