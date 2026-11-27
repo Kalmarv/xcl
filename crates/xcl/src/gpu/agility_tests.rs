@@ -208,6 +208,22 @@ fn create_device_sets_dred_first() {
     }
 }
 
+/// `XCL_DEVICE_LOG=1`: one line per device, with what tells two devices of a run apart.
+#[test]
+fn device_created_line_names_process_thread_adapter_and_site() {
+    let at = std::panic::Location::caller();
+    let line = device_created_line(2, 4100, 7, (0, 0x1_2f3a), 0x1f0_0000_1000, 0xc000, true, "set before it", at);
+    assert_eq!(
+        line,
+        format!(
+            "D3D12: device #2 of pid 4100 (tid 7): adapter LUID 00000000:00012f3a, device 0x1f000001000, feature level 0xc000, Agility SDK factory, DRED set before it, from {}:{}",
+            at.file(),
+            at.line()
+        )
+    );
+    assert!(device_created_line(1, 1, 1, (0, 0), 0, 0xb000, false, "not requested", at).contains("inbox D3D12CreateDevice, DRED not requested"));
+}
+
 #[test]
 fn env_trimming_trailing_slash_and_no_sm66_messages() {
     use std::ffi::OsString;
