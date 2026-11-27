@@ -2691,27 +2691,49 @@ fn chunk_state(sent: Option<&[u64; CHUNKS]>, k: usize, chunk: &[u8]) -> &'static
     }
 }
 
+/// Who else uses the window tile at `t`, which is on pool tile `pool`: the placed buffers over
+/// `t` (`buffers`: each one's tiles as its placement mapped them) and how many of those are on
+/// another pool tile, and the other addresses (`others`: the windows' tiles, mapped or still
+/// mapped after a decommit) on `pool` too. A buffer on another pool tile reads other memory than
+/// the window shows; another address on the same one writes into this one's.
+fn tile_users(t: usize, pool: (u32, u32), buffers: impl Iterator<Item = (usize, (u32, u32))>, others: impl Iterator<Item = (usize, (u32, u32))>) -> (usize, usize, usize) {
+    let (over, elsewhere) = buffers.filter(|b| b.0 == t).fold((0, 0), |(n, m), b| (n + 1, m + (b.1 != pool) as usize));
+    (over, elsewhere, others.filter(|&(a, p)| a != t && p == pool).count())
+}
+
 /// What the windows' state says of the 64-byte chunk at window address `va`, for a diagnostic
 /// line (`indirect_guard`: counts the GPU read that the CPU's range does not hold). None: no
 /// sparse window's address, or the state is in use now.
-pub(super) fn chunk_note(va: usize) -> Option<&'static str> {
+pub(super) fn chunk_note(va: usize) -> Option<String> {
     let g = STATE.try_lock().ok()?;
     let s = g.as_ref()?;
     s.window_index(va)?;
     let pg = va & !(PAGE - 1);
     let t = pg & !(TILE - 1);
     let idx = (pg - t) / PAGE;
-    let Some(entry) = s.mapped.get(&t) else { return Some("its tile has no video memory") };
+    let Some(entry) = s.mapped.get(&t) else {
+        let still = match (s.parked.get(&t), s.kept.get(&t)) {
+            (Some(p), _) => format!(": decommitted, still mapped on pool tile {}:{} until a submit unmaps it", p.0, p.1),
+            (_, Some(p)) => format!(": decommitted, kept mapped on pool tile {}:{} for a placed buffer", p.0, p.1),
+            _ => String::new(),
+        };
+        return Some(format!("its tile has no video memory{still}"));
+    };
     if entry.pool == LAZY {
-        return Some("its tile's video memory is still owed");
+        return Some("its tile's video memory is still owed".to_string());
     }
+    let others = s.mapped.iter().map(|(&a, e)| (a, e.pool)).chain(s.parked.iter().chain(s.kept.iter()).map(|(&a, &p)| (a, p)));
+    let (over, elsewhere, shared) = tile_users(t, entry.pool, s.buffers.values().flatten().copied(), others);
+    let unsent = if s.pending.contains(&t) { ", its mapping is not sent yet" } else { "" };
+    let owed = if s.to_zero.range((t, 0)..(t + TILE, 0)).next().is_some() { ", a clear in it is owed" } else { "" };
+    let tile = format!("its tile is on pool tile {}:{}, with {over} placed buffer(s) over it ({elsewhere} on another pool tile) and {shared} other address(es) on the same pool tile{unsent}{owed}", entry.pool.0, entry.pool.1);
     if entry.holes & (1u16 << idx) != 0 {
-        return Some("its page is not committed");
+        return Some(format!("its page is not committed; {tile}"));
     }
     // (committed by the tile's holes, under the state's lock: read as `chunk_clean` reads it)
     let k = (va - pg) / CHUNK;
     let chunk = unsafe { std::slice::from_raw_parts((entry.cpu(t) + (pg - t) + k * CHUNK) as *const u8, CHUNK) };
-    Some(chunk_state(entry.sent[idx].as_deref(), k, chunk))
+    Some(format!("{}; {tile}", chunk_state(entry.sent[idx].as_deref(), k, chunk)))
 }
 
 /// Synchronize `[va, va + len)` in a sparse window for a CPU read (`ID3D12Resource::Map` with
@@ -5514,6 +5536,17 @@ mod tests {
         page[256] = 5; // next to the chunk at 192: one run
         page[200] = 9;
         assert_eq!(changed_chunks(&page, &mut sent), vec![(192, 128)]);
+    }
+
+    /// What a diagnostic line says of a tile: the buffers over it by their pool tile, and the
+    /// other addresses on its pool tile.
+    #[test]
+    fn tile_users_counts_buffers_on_another_pool_tile_and_addresses_sharing_this_one() {
+        let (t, pool) = (0x10_0000_0000usize, (2u32, 7u32));
+        let buffers = [(t, pool), (t, (2, 9)), (t + TILE, pool), (t, pool)];
+        let others = [(t, pool), (t + TILE, (2, 8)), (t + 2 * TILE, pool)];
+        assert_eq!(tile_users(t, pool, buffers.into_iter(), others.into_iter()), (3, 1, 1));
+        assert_eq!(tile_users(t, pool, std::iter::empty(), [(t, pool)].into_iter()), (0, 0, 0), "its own entry is no other address");
     }
 
     /// What a diagnostic line says of a chunk: whether the CPU's bytes there are what was sent.
