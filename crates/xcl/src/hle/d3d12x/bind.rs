@@ -1498,6 +1498,11 @@ pub(super) unsafe fn flush_two_pass(this: *mut c_void, why: RunEnd) {
     }
     unmark_deferring(this);
     let (items, records, open) = with(this, |s| (std::mem::take(&mut s.deferred), s.batch_buf.as_ref().map(|b| b.res.clone()), s.batch_open));
+    let records = match records {
+        Some(r) => Some(r),
+        None if two_pass_shared() => shared_batch_buf(this).ok().map(|(r, _)| r),
+        None => None,
+    };
     let draws: Vec<&DeferredDraw> = items.iter().filter_map(|i| if let RunItem::Draw(d) = i { Some(d) } else { None }).collect();
     if draws.is_empty() {
         // (pipeline sets only: as they would have gone)
@@ -1533,9 +1538,50 @@ pub(super) unsafe fn flush_two_pass(this: *mut c_void, why: RunEnd) {
     }
 }
 
+static SHARED_BATCH: Mutex<Option<HashMap<usize, TwoPassBuf>>> = Mutex::new(None);
+
+unsafe fn shared_batch_buf(this: *mut c_void) -> Result<(ID3D12Resource, u64), String> {
+    let dev = super::real::list_device(this).ok_or("no device for two-pass buffer")?;
+    let dev_key = dev.as_raw() as usize;
+    if let Some(r) = SHARED_BATCH.lock().unwrap().as_ref().and_then(|m| m.get(&dev_key).map(|b| (b.res.clone(), b.bytes))) {
+        return Ok(r);
+    }
+    let entry = TwoPassBuf::make(&dev, batch_records_bytes(), "two-pass shared batch records")?;
+    let r = (entry.res.clone(), entry.bytes);
+    let mut g = SHARED_BATCH.lock().unwrap();
+    let m = g.get_or_insert_with(HashMap::new);
+    if let Some(cur) = m.get(&dev_key) {
+        let out = (cur.res.clone(), cur.bytes);
+        drop(g);
+        drop(entry);
+        return Ok(out);
+    }
+    m.insert(dev_key, entry);
+    Ok(r)
+}
+
 /// A region of `region` bytes in the batch record buffer of `this` for the next deferred draw
 /// (the run so far is recorded first when it does not fit): its GPU address.
 unsafe fn batch_region(this: *mut c_void, region: u64) -> Result<u64, String> {
+    if two_pass_shared() {
+        let (res, cap) = shared_batch_buf(this)?;
+        let used = with(this, |s| {
+            s.batch_open = true;
+            s.batch_used
+        });
+        let at = match batch_place(used, region, cap) {
+            Some(at) => at,
+            None => {
+                flush_two_pass(this, RunEnd::Full);
+                0
+            }
+        };
+        if at + region > cap {
+            return Err("its records are more than the batch record buffer".into());
+        }
+        with(this, |s| s.batch_used = at + region);
+        return Ok(res.GetGPUVirtualAddress() + at);
+    }
     let bytes = batch_records_bytes();
     if with(this, |s| s.batch_buf.is_none()) {
         let dev = super::real::list_device(this).ok_or("no device for two-pass buffer")?;
@@ -1675,9 +1721,45 @@ fn indirect_record_need(record_bytes: u64, split: u32) -> u64 {
     INDIRECT_RECORDS.min(record_bytes.saturating_mul(65_535 / split.max(1) as u64))
 }
 
+/// `XCL_TWO_PASS_SHARED=1`: share one device-wide two-pass record buffer across all direct command
+/// lists instead of allocating one per open/unreset command list (safe when direct lists execute on
+/// one direct queue; each list's first two-pass draw begins with a UAV barrier on the shared buffer).
+fn two_pass_shared() -> bool {
+    static ON: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
+    *ON.get_or_init(|| std::env::var("XCL_TWO_PASS_SHARED").is_ok_and(|v| v.trim() == "1"))
+}
+
+static SHARED_RES: Mutex<Option<HashMap<usize, TwoPassBuf>>> = Mutex::new(None);
+
 /// The record buffer of this list for `need_bytes` (at most `RECORD_MAX`): buffer, address, bytes.
 unsafe fn ensure_res_buffer(this: *mut c_void, need_bytes: u64) -> Result<(ID3D12Resource, u64, u64), String> {
     let need = record_buffer_bytes(need_bytes);
+    if two_pass_shared() {
+        let dev = super::real::list_device(this).ok_or("no device for two-pass buffer")?;
+        let dev_key = dev.as_raw() as usize;
+        if let Some((buf, va, cap)) = SHARED_RES.lock().unwrap().as_ref().and_then(|m| {
+            m.get(&dev_key).filter(|b| b.bytes >= need).map(|b| (b.res.clone(), b.res.GetGPUVirtualAddress(), b.bytes))
+        }) {
+            return Ok((buf, va, cap));
+        }
+        let alloc = need.max(INDIRECT_RECORDS).min(RECORD_MAX);
+        let entry = TwoPassBuf::make(&dev, alloc, "two-pass shared res buffer")?;
+        let (buf, cap, va) = (entry.res.clone(), entry.bytes, entry.res.GetGPUVirtualAddress());
+        let mut g = SHARED_RES.lock().unwrap();
+        let m = g.get_or_insert_with(HashMap::new);
+        if let Some(cur) = m.get(&dev_key).filter(|b| b.bytes >= need) {
+            let r = (cur.res.clone(), cur.res.GetGPUVirtualAddress(), cur.bytes);
+            drop(g);
+            drop(entry);
+            return Ok(r);
+        }
+        let old = m.insert(dev_key, entry);
+        drop(g);
+        if let Some(old) = old {
+            with(this, |s| s.res_retired.push(old));
+        }
+        return Ok((buf, va, cap));
+    }
     if let Some((buf, cap)) = with(this, |s| s.res_buf.as_ref().filter(|b| b.bytes >= need).map(|b| (b.res.clone(), b.bytes))) {
         let va = buf.GetGPUVirtualAddress();
         return Ok((buf, va, cap));
@@ -2075,7 +2157,8 @@ pub(super) unsafe extern "system" fn dispatch_mesh(this: *mut c_void, x: u32, y:
                     crate::xlog_warn!("D3D12.X: two-pass DispatchMesh of {groups} groups: {} past the record buffer dropped", groups - n);
                 }
             }
-            let plan = two_pass_plan(1, records, with(this, |s| s.record_open));
+            let open = with(this, |s| s.record_open).or_else(|| two_pass_shared().then_some(WHOLE));
+            let plan = two_pass_plan(1, records, open);
             run_two_pass_plan(this, list, &plan, &res_buf, res_va, cap, |_, compute, va| {
                 bind_two_pass_stage(this, list, pso, &tp, va, compute)?;
                 if compute {
@@ -2234,7 +2317,8 @@ pub(super) unsafe extern "system" fn execute_indirect(this: *mut c_void, sig: us
                 // the groups past the record buffer, and the commands past the count, are dropped
                 // on the GPU (`SCALE_ARGS_HLSL`)
                 let (scaled, at) = make_scaled_args_buffer(this, list, src, count, max, msig.byte_stride, msig.mesh_offset, tp.mesh_groups_per_record, cap, batch)?;
-                let plan = two_pass_plan(max, records, with(this, |s| s.record_open));
+                let open = with(this, |s| s.record_open).or_else(|| two_pass_shared().then_some(WHOLE));
+                let plan = two_pass_plan(max, records, open);
                 let passes = run_two_pass_plan(this, list, &plan, &res_buf, res_va, region, |k, compute, va| {
                     bind_two_pass_stage(this, list, pso, &tp, va, compute)?;
                     let (s, first) = if compute { (msig.companion_dispatch, at) } else { (sig, at + commands as u64) };
