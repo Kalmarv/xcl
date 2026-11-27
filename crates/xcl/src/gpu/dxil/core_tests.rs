@@ -25,7 +25,7 @@ fn a_single_split_wave_of_a_compute_group_exchanges_without_a_group_barrier() {
     let code = prog(&[("V_READLANE_B32", "ENC_VOP3", &[("VDST", 1), ("SRC0", 256), ("SRC1", 160)], None)]);
     let o = KernelOptions { wave64: true, split: true, mem_windows: 1, sampler_base: 0 };
     let dis = |threads: u32, code: &[u8]| {
-        let cs = CsInterface { threads: [threads, 1, 1], user_sgprs: 0, tgid: [false; 3], tg_size: false, tid_components: 1 };
+        let cs = CsInterface { threads: [threads, 1, 1], user_sgprs: 0, tgid: [false; 3], tg_size: false, tid_components: 1, ..Default::default() };
         super::validate::disassemble(&super::kernel::translate_compute(code, o, &cs).unwrap_or_else(|e| panic!("{threads} threads: {e}")).dxil)
     };
     // (barrier mode 9: the thread group's sync with its memory fence, `ops::barrier::GROUP_SYNC`)
@@ -150,7 +150,7 @@ fn split_lds_reads_meet_after_writes() {
     assert!(looped(&[read, write]) >= looped(&[read]) + 2, "the loop's read and write meet when the bits are set");
     // compute groups: the counters' meet (two more atomics), none without a partner half
     let atomics = |threads: u32, list: &[Inst]| {
-        let cs = CsInterface { threads: [threads, 1, 1], user_sgprs: 0, tgid: [false; 3], tg_size: false, tid_components: 1 };
+        let cs = CsInterface { threads: [threads, 1, 1], user_sgprs: 0, tgid: [false; 3], tg_size: false, tid_components: 1, ..Default::default() };
         let o = KernelOptions { wave64: true, split: true, mem_windows: 1, sampler_base: 0 };
         let d = super::validate::disassemble(&super::kernel::translate_compute(&prog(list), o, &cs).unwrap_or_else(|e| panic!("{threads} threads: {e}")).dxil).unwrap();
         d.matches("atomicrmw").count()
@@ -866,7 +866,7 @@ fn count_phis(dis: &str, cap: &str, b: &str) -> Vec<String> {
 #[test]
 fn direct_compute_loops_count_each_entry() {
     use crate::gpu::recomp::CsInterface;
-    let cs = CsInterface { threads: [8, 4, 2], user_sgprs: 2, tgid: [false; 3], tg_size: false, tid_components: 1 };
+    let cs = CsInterface { threads: [8, 4, 2], user_sgprs: 2, tgid: [false; 3], tg_size: false, tid_components: 1, ..Default::default() };
     let straight = prog(&[
         ("V_MOV_B32", "ENC_VOP1", &[("VDST", 4), ("SRC0", 2)], None),
         ("V_LSHLREV_B32", "ENC_VOP2", &[("VDST", 6), ("SRC0", 130), ("VSRC1", 0)], None),
@@ -939,7 +939,7 @@ fn the_compute_entry_lets_only_the_lanes_below_the_thread_limits_in() {
     let load = format!("i32 {}, i32 undef, i8 7, i32 4)", IO_THREAD_LIMIT[0] * 4);
     for (wave64, split, threads) in [(false, false, 32), (true, false, 64), (true, true, 64), (true, true, 32)] {
         let o = KernelOptions { wave64, split, mem_windows: 1, sampler_base: 0 };
-        let cs = CsInterface { threads: [threads, 1, 1], user_sgprs: 2, tgid: [true, false, false], tg_size: false, tid_components: 1 };
+        let cs = CsInterface { threads: [threads, 1, 1], user_sgprs: 2, tgid: [true, false, false], tg_size: false, tid_components: 1, ..Default::default() };
         // (a split wave64 of 64 threads is two hardware waves: its barrier is the HLSL path's)
         for barrier in [false, true].into_iter().filter(|&b| !(b && split && threads == 64)) {
             let what = format!("wave64 {wave64}, split {split}, {threads} threads, barrier {barrier}");
@@ -1015,7 +1015,7 @@ fn gpu_direct_compute_loop_passes_follow_the_dispatch() {
         Err(e) => return runner::skip_test(&e),
     }
     let threads = 64u32;
-    let cs = CsInterface { threads: [threads, 1, 1], user_sgprs: 2, tgid: [false; 3], tg_size: false, tid_components: 1 };
+    let cs = CsInterface { threads: [threads, 1, 1], user_sgprs: 2, tgid: [false; 3], tg_size: false, tid_components: 1, ..Default::default() };
     for wave64 in [false, true] {
         let o = KernelOptions { wave64, split: wave64, mem_windows: 1, sampler_base: 0 };
         let run = |code: &[u8], slot: u32| -> u32 {
@@ -1347,5 +1347,43 @@ fn raw_loads_in_root_windows_respect_exec_and_bounds() {
             assert_eq!(r.vgpr[l][24], 0x3000_0000 | l as u32, "{label} lane {l}: buffer_load_dword from window 3");
             assert_eq!(r.vgpr[l][25], 0xF000 | (l as u32 + 1), "{label} lane {l}: buffer_load_format_x unaligned from window 2");
         }
+    }
+}
+
+#[test]
+fn compute_lds_reservation_matches_descriptor_and_lane_storage() {
+    // Exercise both cache modes on ordinary CI without changing the test process environment.
+    if std::env::var_os("XCL_TEST_LDS_CHILD").is_none() {
+        for mode in ["0", "1"] {
+            let status = std::process::Command::new(std::env::current_exe().unwrap())
+                .args(["--exact", "gpu::dxil::core_tests::compute_lds_reservation_matches_descriptor_and_lane_storage"])
+                .env("XCL_DECLARED_LDS", mode)
+                .env("XCL_TEST_LDS_CHILD", "1")
+                .status().unwrap();
+            assert!(status.success(), "declared LDS mode {mode}");
+        }
+        return;
+    }
+    use crate::gpu::recomp::CsInterface;
+    let code = prog(&[("DS_WRITE_B32", "ENC_DS", &[("ADDR", 0), ("DATA0", 1)], None)]);
+    for (threads, blocks, split, expected) in [
+        ([64, 1, 1], 2u32, false, 256),
+        ([8, 8, 1], 1, false, 129),
+        ([8, 8, 1], 1, true, 135),
+        ([128, 1, 1], 2, true, 269),
+        ([8, 8, 1], 0, true, 8192),
+        ([8, 8, 1], 64, true, 8192),
+    ] {
+        let mut descriptor = [0u8; 0x48];
+        for (i, v) in [blocks << 15, threads[0], threads[1], threads[2]].into_iter().enumerate() {
+            descriptor[0x38 + 4*i..0x3c + 4*i].copy_from_slice(&v.to_le_bytes());
+        }
+        let cs = CsInterface::from_descriptor(&descriptor, 0).unwrap();
+        assert_eq!(cs.lds_dwords, blocks * 128);
+        let options = KernelOptions { wave64: split, split, mem_windows: 1, sampler_base: 0 };
+        let dxil = super::kernel::translate_compute(&code, options, &cs).unwrap().dxil;
+        let dis = super::validate::disassemble(&dxil).unwrap();
+        let words = if super::kernel::declared_lds_enabled() { expected } else { 8192 };
+        assert!(dis.contains(&format!("@xcl_lds = external addrspace(3) global [{words} x i32]")), "{threads:?}, {blocks}, split={split}");
     }
 }

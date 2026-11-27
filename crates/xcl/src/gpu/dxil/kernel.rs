@@ -40,6 +40,12 @@ pub struct KernelOptions {
 /// (the `gpu/dxil` sources are not in build.rs's translator source hash).
 pub const TRANSLATOR_VERSION: u32 = 12;
 
+/// Opt in for dispatches whose guest LDS contract is fixed by the pipeline header.
+pub fn declared_lds_enabled() -> bool {
+    static ENABLED: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
+    *ENABLED.get_or_init(|| std::env::var("XCL_DECLARED_LDS").is_ok_and(|value| value == "1"))
+}
+
 /// `XCL_DIRECT_DXIL=1`: console compute shaders (and the kernel tests) go through this
 /// translator, with the HLSL path as the fallback for what it cannot translate yet.
 pub fn enabled() -> bool {
@@ -700,7 +706,14 @@ impl Lw {
                 _ => Partner::Spin,
             };
         }
-        lw.setup_storage(uses_lds, if split { slot } else { 1 });
+        let (declared, native_counter) = match entry {
+            Entry::Compute(cs) => {
+                let declared = if declared_lds_enabled() { cs.lds_dwords } else { 0 };
+                (declared, !split && (cs.threads[1] > 1 || cs.threads[2] > 1))
+            }
+            _ => (0, false),
+        };
+        lw.setup_storage(uses_lds, if split { slot } else { 1 }, declared, native_counter);
         lw
     }
 
@@ -846,7 +859,7 @@ fn a_split_wave64_compute_program_stays_whole() {
 fn a_dispatch_chain_leaves_the_lanes_past_a_thread_limit_out() {
     use crate::gpu::recomp::{runner, IO_THREAD_LIMIT};
     let threads = [32, 1, 1];
-    let cs = CsInterface { threads, user_sgprs: 2, tgid: [true, false, false], tg_size: false, tid_components: 1 };
+    let cs = CsInterface { threads, user_sgprs: 2, tgid: [true, false, false], tg_size: false, tid_components: 1, ..Default::default() };
     let options = KernelOptions { wave64: false, split: false, mem_windows: 1, sampler_base: 0 };
     let mut lw = Lw::new(&[], &Default::default(), options, &Entry::Compute(cs.clone()));
     let (tid, gtid) = lw.setup_lanes_compute(threads, false);
