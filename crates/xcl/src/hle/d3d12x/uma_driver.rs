@@ -268,9 +268,10 @@ pub(super) struct Remade {
     pub watched_regions: Option<Vec<(usize, usize)>>,
 }
 
-/// `remake`, or `remake_mixed` with `XCL_UMA_DRIVER=mixed:...`.
-pub(super) unsafe fn remake_window(device: &ID3D12Device, base: usize, size: usize) -> Result<Remade, String> {
-    if let Some(ranges) = mixed_ranges() {
+/// `remake`, or `remake_mixed` with `XCL_UMA_DRIVER=mixed:...` when `first` (the ranges are those
+/// of the first coherent window; a 16-window layout's further ones are one CUSTOM heap each).
+pub(super) unsafe fn remake_window(device: &ID3D12Device, base: usize, size: usize, first: bool) -> Result<Remade, String> {
+    if let Some(ranges) = mixed_ranges().filter(|_| first) {
         return remake_mixed(device, base, size, &ranges);
     }
     let (heap, buf) = remake(device, base, size)?;

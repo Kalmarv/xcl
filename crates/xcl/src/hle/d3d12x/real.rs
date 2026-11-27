@@ -420,7 +420,7 @@ unsafe fn open_uma(device: &ID3D12Device) {
         // GPU's loads and atomics on imported pages are an order of magnitude slower (`uma_driver`)
         if shadow_choice() != Some(true) && super::uma_driver::wanted(device) {
             let (base, size) = u.window(k);
-            match super::uma_driver::remake_window(device, base, size) {
+            match super::uma_driver::remake_window(device, base, size, u.committed_window() == Some(k)) {
                 Ok(remade) => {
                     u.set_driver_window(k);
                     if let Some(segs) = remade.watched_regions {
