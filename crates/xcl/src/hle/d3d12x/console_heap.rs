@@ -805,9 +805,12 @@ pub unsafe fn publish(s: &Slot, uav: bool, res: usize) {
     }
     let Some((dev, inc)) = GLOBAL.lock().unwrap().as_ref().map(|g| (g.dev.clone(), g.inc)) else { return };
     let (dst, src) = if uav { (s.shared_srv + inc as u64, s.pc_uav) } else { (s.shared_srv, s.pc_srv) };
-    let _w = SLOT_WRITES.lock().unwrap();
-    copy_views(&dev, 1, dst, src);
-    names().note(s.index + uav as u32, res);
+    {
+        let _w = SLOT_WRITES.lock().unwrap();
+        copy_views(&dev, 1, dst, src);
+        names().note(s.index + uav as u32, res);
+    }
+    super::vram::note_viewed(res);
 }
 
 /// The PC resources the SRV and the UAV of view slot `s` name in the shared heap (0: not known,
@@ -855,17 +858,27 @@ pub unsafe fn publish_range(first: &Slot, n: u32, names: &[(usize, usize)]) {
                     );
                 }
             } else if let Some(dev) = &dev {
-                let _w = SLOT_WRITES.lock().unwrap();
-                copy_views(dev, 2 * run, s.shared_srv, s.pc_srv);
-                let m = self::names();
-                for j in 0..run {
-                    let (srv, uav) = names.get((done + j) as usize).copied().unwrap_or((0, 0));
-                    for (i, res) in [(s.index + 2 * j, srv), (s.index + 2 * j + 1, uav)] {
-                        if let Some((ndev, cpu, inc, at)) = nulls.as_ref().filter(|_| res == GONE) {
-                            fill_nulls(ndev, *cpu, *inc, i, i + 1, *at);
+                let check_evicted = super::vram::has_evicted_unviewed();
+                let mut viewed: Vec<usize> = Vec::new();
+                {
+                    let _w = SLOT_WRITES.lock().unwrap();
+                    copy_views(dev, 2 * run, s.shared_srv, s.pc_srv);
+                    let m = self::names();
+                    for j in 0..run {
+                        let (srv, uav) = names.get((done + j) as usize).copied().unwrap_or((0, 0));
+                        for (i, res) in [(s.index + 2 * j, srv), (s.index + 2 * j + 1, uav)] {
+                            if let Some((ndev, cpu, inc, at)) = nulls.as_ref().filter(|_| res == GONE) {
+                                fill_nulls(ndev, *cpu, *inc, i, i + 1, *at);
+                            }
+                            m.note(i, res);
+                            if check_evicted && res != 0 && res != GONE {
+                                viewed.push(res);
+                            }
                         }
-                        m.note(i, res);
                     }
+                }
+                for res in viewed {
+                    super::vram::note_viewed(res);
                 }
             }
         }

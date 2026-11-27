@@ -239,6 +239,8 @@ struct Target {
     used_extra: Vec<(usize, usize)>,
     /// its levels get their pages one by one (`map_levels`); None: all of it has pages
     levels: Option<Levels>,
+    /// when a level-paged sampled texture was first seen with no live shared-heap view
+    unviewed_since: Option<std::time::Instant>,
 }
 
 /// The tiles of a texture whose levels get video memory when an upload first has texels for
@@ -1093,10 +1095,10 @@ unsafe fn place_on_pages(
                 // nothing mapped yet: a level gets its pages with its first texels (`map_levels`)
                 LEVEL_STATS[0].fetch_add(1, std::sync::atomic::Ordering::Relaxed);
                 LEVEL_STATS[1].fetch_add(total as u64, std::sync::atomic::Ordering::Relaxed);
-                pages.targets.insert(raw as usize, Target { va, console_bytes, total, mapped: true, used: Vec::new(), used_extra: Vec::new(), levels });
+                pages.targets.insert(raw as usize, Target { va, console_bytes, total, mapped: true, used: Vec::new(), used_extra: Vec::new(), levels, unviewed_since: None });
                 true
             } else if let Some((used, used_extra)) = pages.bind(dev, res, va, console_bytes, total) {
-                pages.targets.insert(raw as usize, Target { va, console_bytes, total, mapped: true, used, used_extra, levels: None });
+                pages.targets.insert(raw as usize, Target { va, console_bytes, total, mapped: true, used, used_extra, levels: None, unviewed_since: None });
                 true
             } else {
                 false
@@ -1188,8 +1190,42 @@ pub(super) unsafe fn remap_if_unmapped(res: &ID3D12Resource) -> bool {
     true
 }
 
+/// Opt-in (`XCL_EVICT_UNVIEWED=1`): evict level-paged sampled textures that have had no live
+/// shared-heap view for 2 s, remapping and re-uploading on demand if viewed again.
+fn evict_unviewed_enabled() -> bool {
+    static ON: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
+    *ON.get_or_init(|| std::env::var("XCL_EVICT_UNVIEWED").is_ok_and(|v| v.trim() == "1"))
+}
+
+const EVICT_UNVIEWED_AGE: std::time::Duration = std::time::Duration::from_secs(2);
+const EVICT_UNVIEWED_BATCH: usize = 1024;
+static EVICTED_UNVIEWED: super::sharded::Sharded<u8> = super::sharded::Sharded::new();
+static EVICTED_COUNT: std::sync::atomic::AtomicUsize = std::sync::atomic::AtomicUsize::new(0);
+static EVICTED_TOTAL: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
+static REVIVED_TOTAL: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
+
+pub(super) fn has_evicted_unviewed() -> bool {
+    EVICTED_COUNT.load(std::sync::atomic::Ordering::Relaxed) != 0
+}
+
+/// Called when a shared-heap descriptor is written for `res` (outside `SLOT_WRITES`): if `res`
+/// was evicted while unviewed, re-enable its lazy levels and mark it pending for re-upload.
+pub(super) unsafe fn note_viewed(res: usize) {
+    if res == 0 || res == super::console_heap::GONE || EVICTED_COUNT.load(std::sync::atomic::Ordering::Relaxed) == 0 {
+        return;
+    }
+    if EVICTED_UNVIEWED.remove(res).is_some() {
+        EVICTED_COUNT.fetch_sub(1, std::sync::atomic::Ordering::Relaxed);
+        REVIVED_TOTAL.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+        super::title_textures::revive_evicted(res);
+    }
+}
+
 /// A resource released: its pages are no longer its.
 fn forget_pages(resource: usize) {
+    if EVICTED_COUNT.load(std::sync::atomic::Ordering::Relaxed) != 0 && EVICTED_UNVIEWED.remove(resource).is_some() {
+        EVICTED_COUNT.fetch_sub(1, std::sync::atomic::Ordering::Relaxed);
+    }
     let mut g = PAGES.lock().unwrap();
     let now = std::time::Instant::now();
     for pages in g.values_mut().flatten() {
@@ -1310,6 +1346,7 @@ pub(super) unsafe fn before_execute(queue: &ID3D12CommandQueue) {
     let mut newly_reclaimed = Vec::new();
     let mut do_reclaim = false;
     let mut unmap_mark: Option<(ID3D12Fence, u64)> = None;
+    let mut evict_candidates: Vec<usize> = Vec::new();
     {
         let mut g = PAGES.lock().unwrap();
         if let Some(Some(pages)) = g.get_mut(&dev_key) {
@@ -1322,11 +1359,47 @@ pub(super) unsafe fn before_execute(queue: &ID3D12CommandQueue) {
             if now.duration_since(pages.last_reclaim) >= std::time::Duration::from_secs(1) {
                 pages.last_reclaim = now;
                 do_reclaim = true;
+                if evict_unviewed_enabled() {
+                    for (&res, t) in pages.targets.iter_mut() {
+                        if t.levels.is_none() || !t.mapped || (t.used.is_empty() && t.used_extra.is_empty()) {
+                            continue;
+                        }
+                        if super::console_heap::has_live_view(res) {
+                            t.unviewed_since = None;
+                        } else {
+                            let since = *t.unviewed_since.get_or_insert(now);
+                            if evict_candidates.len() < EVICT_UNVIEWED_BATCH && now.duration_since(since) >= EVICT_UNVIEWED_AGE {
+                                evict_candidates.push(res);
+                            }
+                        }
+                    }
+                }
                 newly_reclaimed = pages.sweep_and_reclaim(now);
                 if !newly_reclaimed.is_empty() {
                     unmap_mark = Some((pages.fence.clone(), pages.value));
                 }
             }
+        }
+    }
+    if !evict_candidates.is_empty() {
+        let evictable = super::title_textures::evictable_resources(&evict_candidates);
+        let mut evicted_now = 0usize;
+        for (res, r) in evictable {
+            if super::console_heap::has_live_view(res) {
+                continue;
+            }
+            unmap_placed(&r, true);
+            if EVICTED_UNVIEWED.insert(res, 1).is_none() {
+                EVICTED_COUNT.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+            }
+            EVICTED_TOTAL.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+            evicted_now += 1;
+        }
+        if evicted_now > 0 {
+            let cur = EVICTED_COUNT.load(std::sync::atomic::Ordering::Relaxed);
+            let tot = EVICTED_TOTAL.load(std::sync::atomic::Ordering::Relaxed);
+            let rev = REVIVED_TOTAL.load(std::sync::atomic::Ordering::Relaxed);
+            crate::xlog_info!("D3D12.X: evict unviewed: -{evicted_now} sampled textures ({cur} evicted now, {tot} total, {rev} revived)");
         }
     }
     if do_reclaim {

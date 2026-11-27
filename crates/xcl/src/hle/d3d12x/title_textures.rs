@@ -769,6 +769,7 @@ pub fn note_gpu_write(list: usize, res: usize) {
         // (a texture whose levels get their pages one by one: all of them before the GPU's write)
         let p = res as *mut c_void;
         unsafe {
+            super::vram::note_viewed(res);
             if let Some(r) = ID3D12Resource::from_raw_borrowed(&p) {
                 super::vram::map_levels(r, None);
             }
@@ -878,6 +879,44 @@ pub fn forget(res: usize) {
 pub fn address(res: usize) -> Option<usize> {
     let t = TEXTURES.lock().unwrap();
     t.by_res.get(&res).or_else(|| t.shadowed.get(&res)).map(|e| e.va)
+}
+
+/// Active CPU-backed placed sampled textures from `candidates` that can be safely evicted while
+/// unviewed (not GPU-written, not a render target/UAV, not pending upload).
+pub(super) unsafe fn evictable_resources(candidates: &[usize]) -> Vec<(usize, ID3D12Resource)> {
+    let t = TEXTURES.lock().unwrap();
+    let mut out = Vec::new();
+    for &res in candidates {
+        let Some(e) = t.by_res.get(&res) else { continue };
+        if e.gpu_written || e.target || e.pending || !e.placed || e.unmapped {
+            continue;
+        }
+        let p = res as *mut c_void;
+        if let Some(r) = ID3D12Resource::from_raw_borrowed(&p) {
+            out.push((res, r.clone()));
+        }
+    }
+    out
+}
+
+/// Revive a previously evicted unviewed texture when a shared-heap view is written for it again:
+/// re-enable lazy level mapping and mark it pending so the next submit uploads its non-zero levels.
+pub(super) unsafe fn revive_evicted(res: usize) {
+    let held = {
+        let mut t = TEXTURES.lock().unwrap();
+        let Some(e) = t.by_res.get_mut(&res) else { return };
+        e.known = texture_upload::Known::default();
+        if !e.pending {
+            e.pending = true;
+            t.pending_res.insert(res);
+            adjust_pending(1);
+        }
+        let p = res as *mut c_void;
+        ID3D12Resource::from_raw_borrowed(&p).cloned()
+    };
+    if let Some(r) = held {
+        super::vram::remap_if_unmapped(&r);
+    }
 }
 
 /// (texture, subresource or ALL_SUBRESOURCES, state after) of a transition the title recorded
