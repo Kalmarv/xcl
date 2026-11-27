@@ -992,6 +992,9 @@ fn page_home(page: usize) -> Option<usize> {
 
 /// Whether every page of `pages` (at least one) is a physical page allocated now.
 pub fn physical_pages_live(pages: &[usize]) -> bool {
+    if alias::enabled() {
+        return alias::pages_live(pages);
+    }
     !pages.is_empty() && pages.iter().all(|&p| page_home(p).is_some())
 }
 

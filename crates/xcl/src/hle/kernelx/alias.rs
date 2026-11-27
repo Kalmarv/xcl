@@ -37,9 +37,17 @@ struct Block {
     home: usize,
     /// pages not freed yet
     live: usize,
+    /// Individual IDs may be freed before their backing block and surviving views.
+    freed: Vec<u64>,
     /// one bit a page: committed (asking Windows walked the rest of a block's uncommitted run –
     /// a retail title mapping 100 000 fresh pages one at a time waited 20 s for its first frame)
     committed: Arc<Vec<AtomicU64>>,
+}
+
+impl Block {
+    fn has_page(&self, index: usize) -> bool {
+        index < self.section.pages() && self.freed[index / 64] & (1 << (index % 64)) == 0
+    }
 }
 
 #[derive(Default)]
@@ -68,14 +76,14 @@ impl State {
         let index = page_index(page)?;
         let (&first, b) = self.blocks.range(..=index).next_back()?;
         let i = index - first;
-        (i < b.section.pages()).then(|| (b.section.clone(), i, b.home + i * PAGE))
+        b.has_page(i).then(|| (b.section.clone(), i, b.home + i * PAGE))
     }
 
     /// The commit bits of page number `page`'s block and its index there.
     fn bits(&self, page: usize) -> Option<(Arc<Vec<AtomicU64>>, usize)> {
         let index = page_index(page)?;
         let (&first, b) = self.blocks.range(..=index).next_back()?;
-        (index - first < b.section.pages()).then(|| (b.committed.clone(), index - first))
+        b.has_page(index - first).then(|| (b.committed.clone(), index - first))
     }
 
     fn in_space(&self, at: usize) -> bool {
@@ -168,7 +176,8 @@ pub unsafe fn allocate(n: usize, arr: *mut usize) -> bool {
         *arr.add(i) = page_number(first + i);
     }
     let committed = Arc::new((0..n.div_ceil(64)).map(|_| AtomicU64::new(0)).collect());
-    with(|s| s.blocks.insert(first, Block { section: Arc::new(section), home, live: n, committed }));
+    let freed = vec![0; n.div_ceil(64)];
+    with(|s| s.blocks.insert(first, Block { section: Arc::new(section), home, live: n, freed, committed }));
     true
 }
 
@@ -183,10 +192,12 @@ pub unsafe fn free(pages: &[usize]) {
             }
             let Some(index) = page_index(page) else { continue };
             let Some((&first, b)) = s.blocks.range_mut(..=index).next_back() else { continue };
-            if index >= first + b.section.pages() {
+            let i = index - first;
+            if !b.has_page(i) {
                 continue;
             }
-            b.live = b.live.saturating_sub(1);
+            b.freed[i / 64] |= 1 << (i % 64);
+            b.live -= 1;
             if b.live == 0 {
                 homes.push(b.home);
                 s.blocks.remove(&first);
@@ -298,6 +309,14 @@ unsafe fn unmap_away(at: usize) {
 pub fn physical_page_at(va: usize) -> bool {
     let at = va & !(PAGE - 1);
     with(|s| s.views.contains_key(&at) || s.away_at.contains_key(&at))
+}
+
+/// Whether a nonempty request list names allocated section-backed page IDs.
+pub(super) fn pages_live(pages: &[usize]) -> bool {
+    !pages.is_empty() && with(|s| pages.iter().all(|&page| {
+        let Some(index) = page_index(page) else { return false };
+        s.blocks.range(..=index).next_back().is_some_and(|(&first, block)| block.has_page(index - first))
+    }))
 }
 
 /// Where page `page`'s bytes are now (committing its home if `write`), or None.
@@ -521,6 +540,30 @@ mod tests {
             free_space(s, 0, mem::MEM_RELEASE);
             mem::VirtualFree(out as *mut c_void, 0, mem::MEM_RELEASE);
             free(&p);
+        }
+    }
+
+    #[test]
+    fn a_freed_page_id_is_rejected_while_its_neighbor_and_existing_view_survive() {
+        let _g = SERIAL.lock().unwrap_or_else(|e| e.into_inner());
+        let p = pages(2);
+        let at = reserve_space(2 * PAGE).unwrap();
+        unsafe {
+            assert!(pages_live(&p));
+            assert!(map(at, &p));
+            write64(at, 17);
+            write64(at + PAGE, 23);
+            free(&[p[0], p[0]]);
+
+            assert!(!pages_live(&[p[0]]) && pages_live(&[p[1]]));
+            assert!(!read(&[p[0]], 0, &mut [0; 8]));
+            assert!(!write(&[p[0]], 0, &[0; 8]));
+            assert!(!map(at + PAGE, &[p[0]]));
+            assert_eq!((read64(at), read64(at + PAGE)), (17, 23));
+
+            assert_eq!(free_space(at, 0, mem::MEM_RELEASE), Some(true));
+            free(&[p[1]]);
+            assert!(!pages_live(&p));
         }
     }
 
