@@ -32,8 +32,11 @@ use windows_sys::Win32::System::Memory::{
 };
 
 const TILE: usize = 0x1_0000;
-/// tiles of a video-memory pool heap (64 MiB)
-const POOL_TILES: u32 = 1024;
+/// tiles of a video-memory pool heap (4 MiB). A heap goes back only when every tile of it is
+/// free (`State::retire_free_pools`), and a title frees its tiles in runs spread over all its
+/// heaps: with heaps of 64 MiB a retail title's world load unmapped 1.5 GB of its 4.6 GB of
+/// tiles and 3 of 78 heaps went back (0.2 GB); with heaps of 4 MiB 1.25 GB went back.
+const POOL_TILES: u32 = 64;
 /// tiles decommitted while no title work was submitted that stay mapped (`State::parked`) before
 /// they are unmapped together: 256 MB of video memory
 const PARKED_MAX: usize = 4096;
@@ -1253,7 +1256,7 @@ impl State {
             return Some((t, true));
         }
         // a pool retired a moment ago (its last tile came free) is taken back before a new
-        // 64 MB heap is made: freeing and allocating a tile in turn made a new pool each time,
+        // heap is made: freeing and allocating a tile in turn made a new pool each time,
         // up to 18 GB of retired heaps in 2 s (#913). Its tiles are reused as freed tiles are
         // (zeroed), and they all cooled before it was retired.
         if let Some((heap, _, _)) = self.retired.pop() {
@@ -1331,9 +1334,9 @@ impl State {
         h
     }
 
-    /// Pools whose every tile is free again (cooled, `COOL`) go (64 MB of video memory each –
-    /// and as much of the system's commit: a retail game's homes of physical pages left 0.75 GB
-    /// of pools for 0.29 GB of tiles in use). Call after their tiles are unmapped and signalled.
+    /// Pools whose every tile is free again go (their video memory – and as much of the
+    /// system's commit: a retail game's homes of physical pages left 0.75 GB of pools for
+    /// 0.29 GB of tiles in use). Call after their tiles are unmapped and signalled.
     fn retire_free_pools(&mut self) {
         let now = std::time::Instant::now();
         self.retire_tried = now;
@@ -2470,6 +2473,7 @@ fn uav_to_copy(r: &ID3D12Resource) -> D3D12_RESOURCE_BARRIER {
 /// 4 GiB window boundary when `size <= 4 GiB`). Commits the CPU pages and maps VRAM tiles
 /// (or queues them until the D3D12 device exists). Returns `(address, rounded_size)`.
 pub unsafe fn alloc(size: usize, align: usize) -> Option<(usize, usize)> {
+    reclaim_released_blocks();
     let u = crate::gpu::uma::get()?;
     let (addr, rounded) = u.sparse_alloc(size, align)?;
     if VirtualAlloc(addr as *const c_void, rounded, MEM_COMMIT, PAGE_READWRITE).is_null() {
@@ -2483,6 +2487,7 @@ pub unsafe fn alloc(size: usize, align: usize) -> Option<(usize, usize)> {
 /// Allocate a zeroed, write-watched block strictly inside sparse window `window` (e.g.
 /// window 0 for 32-bit-addressed descriptor heaps). Returns `(address, rounded_size)`.
 pub unsafe fn alloc_in(window: usize, size: usize, align: usize) -> Option<(usize, usize)> {
+    reclaim_released_blocks();
     let u = crate::gpu::uma::get()?;
     let (addr, rounded) = u.sparse_alloc_in(window, size, align)?;
     if VirtualAlloc(addr as *const c_void, rounded, MEM_COMMIT, PAGE_READWRITE).is_null() {
@@ -2505,6 +2510,38 @@ pub unsafe fn free(p: usize) -> bool {
     decommitted(start, len);
     VirtualFree(p as *mut c_void, len, MEM_DECOMMIT);
     u.sparse_release(p).is_some()
+}
+
+/// Blocks from `alloc` / `alloc_in` whose resource or heap had its last Release, decommitted
+/// and given back by the next `reclaim_released_blocks`. Held only to push or take, never across
+/// a call out.
+static RELEASED_BLOCKS: Mutex<Vec<usize>> = Mutex::new(Vec::new());
+
+/// Held while `reclaim_released_blocks` gives blocks back: a caller that finds the queue empty
+/// because another thread took the blocks waits until they are back, so its allocation can use
+/// their addresses.
+static RECLAIMING: Mutex<()> = Mutex::new(());
+
+/// The last Release of a resource or heap whose memory is block `p` from `alloc` / `alloc_in`.
+/// D3D12 can make that Release inside a call of its own on another thread, and `before_execute`
+/// calls D3D12 with `STATE` held: `free` waits for `STATE` (`decommitted`), so the two threads
+/// would wait for each other. The block is queued instead. It stays reserved and committed until
+/// `reclaim_released_blocks` decommits it and gives it back, so its address is not handed out
+/// again before then.
+pub fn release_owned_block(p: usize) {
+    RELEASED_BLOCKS.lock().unwrap().push(p);
+}
+
+/// The blocks `release_owned_block` queued, decommitted and given back (`free`). Called by
+/// `alloc`, `alloc_in` and `before_execute`, without `STATE` held and outside any D3D12 callback.
+unsafe fn reclaim_released_blocks() {
+    let _one = RECLAIMING.lock().unwrap();
+    let blocks = std::mem::take(&mut *RELEASED_BLOCKS.lock().unwrap());
+    for p in blocks {
+        if !free(p) {
+            crate::xlog_warn!("sparse windows: released block at {p:#x} is not a sparse allocation");
+        }
+    }
 }
 
 /// After `queue.ExecuteCommandLists`: copy GPU-written sparse ranges (e.g. `Write32/64`,
@@ -4254,6 +4291,7 @@ unsafe fn run_copies(jobs: &mut Vec<(usize, usize, usize)>, staging: *mut u8) {
 /// pages from the write-watch, sorted) and the reused tiles are copied asynchronously into video
 /// memory, and `queue` GPU-waits for that and for new tile mappings.
 pub unsafe fn before_execute(queue: &ID3D12CommandQueue, dirty: &[usize], page: usize) {
+    reclaim_released_blocks();
     let t0 = std::time::Instant::now();
     // (who had the lock when this began to wait for it: `XCL_LOOK_STATS=2`)
     let behind = (HOLDER.load(Ordering::Relaxed) as usize).min(HOLDERS - 1);
@@ -5400,9 +5438,72 @@ mod tests {
         assert!(!FORGOTTEN.lock().unwrap().contains(&RES));
     }
 
+    /// The last Release of a resource or heap over a block from `alloc`, while another thread
+    /// holds the sparse state: the release does not wait for the state, and the block keeps its
+    /// address and its memory until `reclaim_released_blocks` decommits it and gives it back.
+    #[test]
+    fn an_owned_block_released_while_the_state_is_held_does_not_wait_for_it() {
+        let Some(u) = crate::gpu::uma::get().filter(|u| u.has_sparse()) else { return };
+        // 7 tiles: a size no other test asks for, so a reservation of it at `p` is this block
+        let Some((p, n)) = (unsafe { alloc(7 * TILE, TILE) }) else { return };
+        unsafe { std::ptr::write_volatile(p as *mut u64, 0x5eed) };
+        {
+            // no other thread gives the block back meanwhile (their allocations wait here)
+            let _no_reclaim = RECLAIMING.lock().unwrap();
+            assert!(returns_while_the_state_is_held(move || release_owned_block(p)), "release_owned_block waited for the sparse state's lock");
+            assert!(RELEASED_BLOCKS.lock().unwrap().contains(&p));
+            assert_eq!(u.sparse_reservation(p), Some((p, n)), "a released block's address went back before it was decommitted");
+            assert_eq!(unsafe { query_tile_holes(p) }, 0, "a released block was decommitted outside reclaim_released_blocks");
+            assert_eq!(unsafe { std::ptr::read_volatile(p as *const u64) }, 0x5eed);
+        }
+        unsafe { reclaim_released_blocks() };
+        assert!(!RELEASED_BLOCKS.lock().unwrap().contains(&p));
+        assert_ne!(u.sparse_reservation(p), Some((p, n)), "the released block was not given back");
+    }
+
+    /// A buffer's and a heap's last Release (`res_release`, `mem_heap_release`; D3D12 can make
+    /// them inside a call of its own) while another thread holds the sparse state: neither waits
+    /// for the state to free its block from `alloc`, and the next reclaim gives both blocks back.
+    #[test]
+    fn a_buffer_or_heap_released_while_the_state_is_held_does_not_wait_to_free_its_block() {
+        use super::super::real;
+        use windows::Win32::Graphics::Direct3D::D3D_FEATURE_LEVEL_11_0;
+
+        let Some(u) = crate::gpu::uma::get().filter(|u| u.has_sparse()) else { return };
+        unsafe {
+            let Ok(dev) = crate::gpu::agility::create_device(None, D3D_FEATURE_LEVEL_11_0) else {
+                return crate::gpu::recomp::runner::skip_test("no GPU");
+            };
+            let props = D3D12_HEAP_PROPERTIES { Type: D3D12_HEAP_TYPE_DEFAULT, ..Default::default() };
+            let mut buffer: Option<ID3D12Resource> = None;
+            dev.CreateCommittedResource(&props, D3D12_HEAP_FLAG_NONE, &buffer_desc(TILE as u64), D3D12_RESOURCE_STATE_COMMON, None, &mut buffer).expect("buffer");
+            let buffer = buffer.expect("buffer");
+            let mut heap: Option<ID3D12Heap> = None;
+            let heap_desc = D3D12_HEAP_DESC { SizeInBytes: TILE as u64, Properties: props, Flags: D3D12_HEAP_FLAG_ALLOW_ONLY_BUFFERS, ..Default::default() };
+            dev.CreateHeap(&heap_desc, &mut heap).expect("heap");
+            let heap = heap.expect("heap");
+            real::adopt(buffer.as_raw(), real::Kind::Resource);
+            real::adopt(heap.as_raw(), real::Kind::Heap);
+            // 9 and 11 tiles: sizes no other test asks for, so a reservation of one at its
+            // address is that block
+            let (b, bn) = alloc(9 * TILE, TILE).expect("a block for the buffer");
+            let (h, hn) = alloc(11 * TILE, TILE).expect("a block for the heap");
+            real::note_owned_buffer_for_test(buffer.as_raw() as usize, b, bn);
+            real::note_heap_block_for_test(heap.as_raw() as usize, h, hn);
+            let released = returns_while_the_state_is_held(move || {
+                drop(buffer);
+                drop(heap);
+            });
+            assert!(released, "a last Release waited for the sparse state's lock to free its block");
+            reclaim_released_blocks();
+            assert_ne!(u.sparse_reservation(b), Some((b, bn)), "the buffer's block was not given back");
+            assert_ne!(u.sparse_reservation(h), Some((h, hn)), "the heap's block was not given back");
+        }
+    }
+
 
     /// Freeing the last tile in use of a pool and taking a tile again takes the retired pool
-    /// back, not a new 64 MB heap each time (#913: 288 pools, 18 GB asked of a 12 GB card).
+    /// back, not a new heap each time (#913: 288 pools of 64 MB, 18 GB asked of a 12 GB card).
     #[test]
     fn a_pool_retired_a_moment_ago_is_taken_back() {
         use windows::Win32::Graphics::Direct3D::D3D_FEATURE_LEVEL_11_0;
@@ -5502,6 +5603,38 @@ mod tests {
                 assert_eq!(s.retired.len(), 1, "round {round}: the retired pool was taken back, not a new one made");
                 assert_eq!(s.pools.iter().filter(|p| p.is_some()).count(), 0, "round {round}");
             }
+        }
+    }
+
+    /// A title frees its tiles in runs spread over all its pools: the pools of the freed runs go
+    /// back. With pools of 64 MiB none of these did (every pool kept the tiles still in use).
+    #[test]
+    fn pools_of_freed_runs_go_back() {
+        use windows_sys::Win32::System::Memory::MEM_RELEASE;
+
+        unsafe {
+            let (base, mut s) = test_state_with_reserved(1);
+            // 192 MiB of tiles, taken in order as a title's first commits take them
+            const TILES: usize = 3072;
+            let tiles: Vec<(u32, u32)> = (0..TILES).map(|_| s.take_tile(false).expect("a tile").0).collect();
+            let made = s.pools.iter().filter(|p| p.is_some()).count();
+            assert_eq!(made * POOL_TILES as usize, TILES, "the tiles fill whole pools");
+            // of every 64 MiB the title keeps the first 4 MiB and frees the rest
+            let (mut kept, mut freed) = (0, 0);
+            for (i, &t) in tiles.iter().enumerate() {
+                if i % 1024 < 64 {
+                    kept += 1;
+                } else {
+                    s.free.push(t);
+                    freed += 1;
+                }
+            }
+            s.retire_free_pools();
+            let left = s.pools.iter().filter(|p| p.is_some()).count() * POOL_TILES as usize;
+            assert_eq!(s.free.len() + s.retired.len() * POOL_TILES as usize, freed, "every freed tile is free or its pool retired");
+            assert!(left <= kept * 2, "{left} tiles of video memory stay in pools for {kept} tiles in use ({} MiB for {} MiB)", left * TILE >> 20, kept * TILE >> 20);
+            drop(s);
+            assert_ne!(VirtualFree(base as *mut c_void, 0, MEM_RELEASE), 0);
         }
     }
 

@@ -812,6 +812,11 @@ pub(super) unsafe fn read_vram_batch(ranges: &[(usize, usize)]) -> Vec<Option<Ve
 mod tests {
     use super::{build_segments, decide, parse_mixed};
 
+    /// The tests that remake a mixed window run one at a time: a remake reserves the process's other
+    /// free stretches so that the driver maps each segment at its place, and another remake releasing
+    /// its reservations meanwhile lets a segment land elsewhere, which stops the process.
+    static MIXED_REMAKE: std::sync::Mutex<()> = std::sync::Mutex::new(());
+
     /// On by default for NVIDIA outside Wine only; the switch overrides either way.
     #[test]
     fn driver_windows_by_default_on_nvidia_outside_wine() {
@@ -849,6 +854,7 @@ mod tests {
     fn mixed_window_keeps_its_bytes_and_the_gpu_sees_every_segment() {
         use super::*;
         use windows::Win32::Graphics::Direct3D::D3D_FEATURE_LEVEL_12_0;
+        let _alone = MIXED_REMAKE.lock().unwrap_or_else(|e| e.into_inner());
         let mut dev: Option<ID3D12Device> = None;
         if unsafe { D3D12CreateDevice(None, D3D_FEATURE_LEVEL_12_0, &mut dev) }.is_err() {
             return crate::gpu::recomp::runner::skip_test("no D3D12 device");
@@ -905,6 +911,7 @@ mod tests {
     fn a_refused_gpu_upload_segment_becomes_custom() {
         use super::*;
         use windows::Win32::Graphics::Direct3D::D3D_FEATURE_LEVEL_12_0;
+        let _alone = MIXED_REMAKE.lock().unwrap_or_else(|e| e.into_inner());
         let mut dev: Option<ID3D12Device> = None;
         if unsafe { D3D12CreateDevice(None, D3D_FEATURE_LEVEL_12_0, &mut dev) }.is_err() {
             return crate::gpu::recomp::runner::skip_test("no D3D12 device");
@@ -950,6 +957,7 @@ mod tests {
     fn failed_write_watch_does_not_release_the_original_window() {
         use super::*;
         use windows::Win32::Graphics::Direct3D::D3D_FEATURE_LEVEL_11_0;
+        let _alone = MIXED_REMAKE.lock().unwrap_or_else(|e| e.into_inner());
         const SIZE: usize = 1 << 16;
         unsafe {
             let base = VirtualAlloc(std::ptr::null(), SIZE, MEM_RESERVE | MEM_COMMIT, PAGE_READWRITE) as usize;
