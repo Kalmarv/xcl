@@ -1733,6 +1733,10 @@ fn two_pass_shared() -> bool {
 }
 
 static SHARED_RES: Mutex<Option<HashMap<usize, TwoPassBuf>>> = Mutex::new(None);
+/// Grown-out shared two-pass record buffers kept alive for the process: another direct list may
+/// still reference an older shared VA after this list's allocator resets (growth is bounded to a
+/// few power-of-two sizes up to `RECORD_MAX`).
+static RETIRED_SHARED_RES: Mutex<Vec<TwoPassBuf>> = Mutex::new(Vec::new());
 
 /// The record buffer of this list for `need_bytes` (at most `RECORD_MAX`): buffer, address, bytes.
 unsafe fn ensure_res_buffer(this: *mut c_void, need_bytes: u64) -> Result<(ID3D12Resource, u64, u64), String> {
@@ -1762,7 +1766,7 @@ unsafe fn ensure_res_buffer(this: *mut c_void, need_bytes: u64) -> Result<(ID3D1
         let old = m.insert(dev_key, entry);
         drop(g);
         if let Some(old) = old {
-            with(this, |s| s.res_retired.push(old));
+            RETIRED_SHARED_RES.lock().unwrap().push(old);
         }
         return Ok((buf, va, cap));
     }
