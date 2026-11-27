@@ -2660,7 +2660,13 @@ impl Lw {
     pub fn export(&mut self, d: &Decoded) -> LResult<()> {
         let f = |n: &str| rdna2::field_value(d.enc, &d.words, n).unwrap_or(0);
         let (en, tgt, compr) = (f("EN"), f("TGT"), f("COMPR") != 0);
-        let srcs: Vec<Value> = (0..4).map(|i| self.vreg(f(&format!("VSRC{i}")))).collect();
+        let srcs: Vec<Value> = (0..4)
+            .map(|i| {
+                let used = (tgt == 20 && i == 0)
+                    || if compr { i < 2 && ((en >> (i * 2)) & 3 != 0) } else { (en >> i) & 1 != 0 };
+                if used { self.vreg(f(&format!("VSRC{i}"))) } else { self.c(0) }
+            })
+            .collect();
         if self.mesh.is_some() {
             return self.mesh_export(d, en, tgt, compr, &srcs);
         }

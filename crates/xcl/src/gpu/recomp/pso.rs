@@ -1288,7 +1288,7 @@ fn compile_console_mesh(
                     dump_direct(blob, &k.dxil);
                     return Ok(Compiled { dispatch_chain: None, dxil: k.dxil, samplers: k.static_samplers });
                 }
-                Err(_) => {}
+                Err(e) => direct_fallback("MS-perlane", &e),
             }
         }
         match crate::gpu::dxil::kernel::translate_entry_rodata(code, o, crate::gpu::dxil::kernel::Entry::Mesh(ms.clone()), &rodata) {

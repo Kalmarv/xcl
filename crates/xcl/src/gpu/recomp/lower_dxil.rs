@@ -1428,4 +1428,30 @@ mod tests {
             }
         }
     }
+
+    #[test]
+    fn per_lane_mesh_with_barrier_and_exp_validates() {
+        use crate::gpu::dxil::kernel::KernelOptions;
+        use crate::gpu::recomp::MsInterface;
+        let lines: &[I] = &[
+            ("V_MOV_B32", "ENC_VOP1", &[("VDST", 0), ("SRC0", 128)]),
+            ("S_BARRIER", "ENC_SOPP", &[]),
+            ("EXP", "ENC_EXP", &[("TGT", 12), ("EN", 0xF), ("VSRC0", 0), ("VSRC1", 0), ("VSRC2", 0), ("VSRC3", 0)]),
+            ("EXP", "ENC_EXP", &[("TGT", 20), ("EN", 0x1), ("VSRC0", 0), ("VSRC1", 0), ("VSRC2", 0), ("VSRC3", 0), ("DONE", 1)]),
+            ENDPGM,
+        ];
+        let mut bytes = Vec::new();
+        for &(name, enc, fields) in lines {
+            bytes.extend(crate::gpu::rdna2::encode(name, enc, fields, None).unwrap());
+        }
+        let ms = MsInterface {
+            threads: 128,
+            max_vertices: 64,
+            max_primitives: 64,
+            outputs: vec![],
+        };
+        let o = KernelOptions { wave64: true, split: true, mem_windows: 1, sampler_base: 0 };
+        let k = super::mesh_with(&bytes, &ms, o).unwrap_or_else(|e| panic!("mesh_with failed: {e}"));
+        crate::gpu::dxil::validate::validate(&k.dxil).expect("valid Mesh DXIL");
+    }
 }

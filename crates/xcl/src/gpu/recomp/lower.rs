@@ -1260,7 +1260,7 @@ pub fn survey_compute<I: Ir>(insts: &[Decoded], cs: &super::CsInterface, wave64:
 fn lower_with<I: Ir>(insts: &[Decoded], stage: Stage, wave64: bool, mut ir: I, survey: bool) -> R<(I, Vec<u8>, Vec<String>)> {
     // the lanes past a dispatch's thread limit leave at the start (`IO_THREAD_LIMIT`): a group
     // barrier would wait for them (#1426's form keeps them, out of EXEC, in such a program)
-    if matches!(stage, Stage::Compute(_) | Stage::Mesh(_)) && insts.iter().any(|d| d.inst.name == "S_BARRIER") {
+    if matches!(stage, Stage::Compute(_)) && insts.iter().any(|d| d.inst.name == "S_BARRIER") {
         return Err("s_barrier: the lanes past a dispatch's thread limit leave at the start".into());
     }
     if let Stage::Mesh(ms) = stage {
@@ -1798,7 +1798,7 @@ impl<I: Ir> Lower<'_, I> {
         let operand = |input: bool, ty: &str| d.ienc.operands.iter().any(|o| o.input == input && o.output != input && o.ty == ty);
         let mut inputs: Vec<(Var, I::V)> = Vec::new();
         // SGPRs read whole: numbers (EXEC included, which holds a mask here: refused)
-        for r in (0..128u8).filter(|&r| whole >> r & 1 != 0 && r != 125 && !(cmpx && r >= EXEC)) {
+        for r in (0..128u8).filter(|&r| whole >> r & 1 != 0 && r != 125 && !((cmpx || name == "EXP") && r >= EXEC)) {
             let v = self.read_num(b, r)?;
             inputs.push((Var::S(r), v));
         }
@@ -1841,6 +1841,17 @@ impl<I: Ir> Lower<'_, I> {
         // VGPRs read, and the ones written (a write keeps the old value where the guard is off)
         let (vr, vw) = rdna2::vgpr_uses(d);
         let mut vregs: Vec<u16> = vr.iter().chain(&vw).map(|&v| v as u16).collect();
+        if name == "EXP" {
+            let fv = |n: &str| rdna2::field_value(d.enc, &d.words, n).unwrap_or(0);
+            let (en, tgt, compr) = (fv("EN"), fv("TGT"), fv("COMPR") != 0);
+            for i in 0..4u64 {
+                let used = (tgt == 20 && i == 0)
+                    || if compr { i < 2 && ((en >> (i * 2)) & 3 != 0) } else { (en >> i) & 1 != 0 };
+                if used {
+                    vregs.push(fv(&format!("VSRC{i}")) as u16);
+                }
+            }
+        }
         vregs.sort_unstable();
         vregs.dedup();
         for &v in &vregs {

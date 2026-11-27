@@ -470,6 +470,10 @@ impl RecompAgg {
             let lane = recomp::lower_dxil::survey_compute_code(code, &cs, wave64);
             let o = crate::gpu::dxil::kernel::KernelOptions { wave64, split: false, mem_windows: 1, sampler_base: 0 };
             let inst = match &mode {
+                recomp::Mode::Mesh(ms) if recomp::lower_dxil::mesh_enabled() => {
+                    let mo = crate::gpu::dxil::kernel::KernelOptions { wave64, split: wave64, mem_windows: 16 | recomp::HEAP_WINDOWS, sampler_base: 0 };
+                    recomp::lower_dxil::mesh_with(code, ms, mo).map(|_| ())
+                }
                 recomp::Mode::Mesh(ms) => crate::gpu::dxil::kernel::translate_mesh(code, o, ms).map(|_| ()),
                 _ => crate::gpu::dxil::kernel::translate_compute(code, o, &cs).map(|_| ()),
             };
