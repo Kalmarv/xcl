@@ -645,28 +645,8 @@ pub fn init() -> Result<String, String> {
                 }
             }
         }
-        // `XCL_DRED=1`: on a device removal the faulting address and the last GPU operations
-        // (logged by `log_device_removed`); no debug layer needed. Opt-in: with it XDefiant
-        // stalled in its first seconds twice.
-        if let Some(dred) = std::env::var_os("XCL_DRED") {
-            match crate::gpu::agility::configuration_interface::<ID3D12DeviceRemovedExtendedDataSettings>(
-                &CLSID_D3D12DeviceRemovedExtendedData,
-            ) {
-                Ok(d) => {
-                    // (`XCL_DRED=pagefault`: the faulting address and what was there only; the
-                    // breadcrumbs put a marker around every operation of every list, which is
-                    // what made a title stall)
-                    if dred != "pagefault" {
-                        d.SetAutoBreadcrumbsEnablement(D3D12_DRED_ENABLEMENT_FORCED_ON);
-                    }
-                    d.SetPageFaultEnablement(D3D12_DRED_ENABLEMENT_FORCED_ON);
-                    crate::xlog_info!("D3D12: DRED on ({})", if dred == "pagefault" { "page faults" } else { "page faults and the lists' last operations" });
-                }
-                Err(e) => {
-                    crate::xlog_warn!("D3D12: DRED requested but unavailable: {e}");
-                }
-            }
-        }
+        // `XCL_DRED=1` (`create_device` does it too; this call only puts the log line before the device)
+        crate::gpu::agility::enable_dred_once();
         let factory: IDXGIFactory6 = CreateDXGIFactory2(DXGI_CREATE_FACTORY_FLAGS(0)).map_err(|e| format!("DXGI: {e}"))?;
         let mut device: Option<ID3D12Device> = None;
         let mut name = String::new();
