@@ -403,6 +403,19 @@ pub(super) fn counts_of(nth: u32) -> Option<[u32; 3]> {
     counts(nth % SLOTS)
 }
 
+/// The first three counts at the title's address `at` as the CPU's range of that memory holds
+/// them now, or None where it cannot be read. The outer None: `at` is not in unified memory
+/// (a buffer of the GPU's own, logged by its GPU address).
+fn cpu_copy(at: usize) -> Option<Option<[u32; 3]>> {
+    use windows_sys::Win32::System::Diagnostics::Debug::ReadProcessMemory;
+    use windows_sys::Win32::System::Threading::GetCurrentProcess;
+    real::uma_window_buffer_gpu(at, COUNT_BYTES)?;
+    let (mut b, mut read) = ([0u8; 12], 0usize);
+    // (a read that fails instead of faulting: the title may decommit the page meanwhile)
+    let ok = unsafe { ReadProcessMemory(GetCurrentProcess(), super::view_want::cpu(at as u64) as usize as *const c_void, b.as_mut_ptr() as *mut c_void, b.len(), &mut read) } != 0 && read == b.len();
+    Some(ok.then(|| std::array::from_fn(|k| u32::from_le_bytes([b[4 * k], b[4 * k + 1], b[4 * k + 2], b[4 * k + 3]]))))
+}
+
 /// Counts out of range so far.
 fn bad_so_far(g: &Guard) -> u32 {
     g.word(0).load(Ordering::Acquire)
@@ -447,7 +460,14 @@ fn report(g: &Guard) {
         };
         let shown = if w[13] & 1 != 0 { format!(" (the title's buffer shows {:#x}, {:#x}, {:#x})", w[8], w[9], w[10]) } else { String::new() };
         let verdict = if w[13] & 2 != 0 { "out of range, not run" } else { "run" };
-        crate::xlog_warn!("D3D12.X: ExecuteIndirect of {what}, arguments at {title:#x}{shown} – {verdict} ({bad} out of range so far)");
+        // (the same words there: the title's memory holds them, whoever wrote them; other ones:
+        // the CPU has written since, or the GPU's copy of that memory is not the CPU's)
+        let cpu = match cpu_copy(title as usize) {
+            Some(Some(c)) => format!("; the CPU's range shows {:#x}, {:#x}, {:#x} there now", c[0], c[1], c[2]),
+            Some(None) => "; the CPU's range cannot be read there now".to_string(),
+            None => String::new(),
+        };
+        crate::xlog_warn!("D3D12.X: ExecuteIndirect of {what}, arguments at {title:#x}{shown} – {verdict} ({bad} out of range so far){cpu}");
     }
     drop(records);
     for (counter, now, what) in [(&BAD, bad, "counts out of range so far, not run"), (&DIFFERED, d, "time(s) the title's buffer did not show the counts the memory window holds")] {
