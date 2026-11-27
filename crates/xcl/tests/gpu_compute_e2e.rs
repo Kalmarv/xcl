@@ -583,8 +583,13 @@ fn async_compute_pso_registers_real_pso_and_not_standin() {
     assert!(!real::is_translated_compute(standin_raw), "stand-in must remain unregistered after background build");
     assert!(real::pso_root_signature(real_raw).is_some(), "real compute PSO must have an ABI root signature");
 
-    // Releasing the stand-in must release and forget the background-built real PSO too.
+    // Releasing the stand-in must release and forget the background-built real PSO too: once the
+    // queues are past it (late release since eb49926b; `XCL_LATE_RELEASE=0`: in the call).
     drop(pso);
+    let deadline = std::time::Instant::now() + std::time::Duration::from_secs(5);
+    while real::is_translated_compute(real_raw) && std::time::Instant::now() < deadline {
+        std::thread::sleep(std::time::Duration::from_millis(2));
+    }
     assert!(!real::is_translated_compute(real_raw), "forgetting released async compute PSO must clean up TRANSLATED_COMPUTE");
 }
 
