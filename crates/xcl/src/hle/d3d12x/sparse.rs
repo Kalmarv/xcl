@@ -5558,7 +5558,7 @@ mod tests {
             let (base, mut s) = test_state_with_reserved(1);
             // 192 MiB of tiles, taken in order as a title's first commits take them
             const TILES: usize = 3072;
-            let tiles: Vec<(u32, u32)> = (0..TILES).map(|_| s.take_tile().expect("a tile").0).collect();
+            let tiles: Vec<(u32, u32)> = (0..TILES).map(|_| s.take_tile(false).expect("a tile").0).collect();
             let made = s.pools.iter().filter(|p| p.is_some()).count();
             assert_eq!(made * POOL_TILES as usize, TILES, "the tiles fill whole pools");
             // of every 64 MiB the title keeps the first 4 MiB and frees the rest
