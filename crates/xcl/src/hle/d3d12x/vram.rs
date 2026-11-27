@@ -1368,7 +1368,7 @@ pub(super) unsafe fn before_execute(queue: &ID3D12CommandQueue) {
                             t.unviewed_since = None;
                         } else {
                             let since = *t.unviewed_since.get_or_insert(now);
-                            if evict_candidates.len() < EVICT_UNVIEWED_BATCH && now.duration_since(since) >= EVICT_UNVIEWED_AGE {
+                            if now.duration_since(since) >= EVICT_UNVIEWED_AGE {
                                 evict_candidates.push(res);
                             }
                         }
@@ -1382,7 +1382,7 @@ pub(super) unsafe fn before_execute(queue: &ID3D12CommandQueue) {
         }
     }
     if !evict_candidates.is_empty() {
-        let evictable = super::title_textures::evictable_resources(&evict_candidates);
+        let (evictable, skip) = super::title_textures::evictable_resources(&evict_candidates, EVICT_UNVIEWED_BATCH);
         let mut evicted_now = 0usize;
         for (res, r) in evictable {
             if super::console_heap::has_live_view(res) {
@@ -1395,11 +1395,16 @@ pub(super) unsafe fn before_execute(queue: &ID3D12CommandQueue) {
             EVICTED_TOTAL.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
             evicted_now += 1;
         }
-        if evicted_now > 0 {
+        static SKIP_LOG: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
+        let tick = SKIP_LOG.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+        if evicted_now > 0 || tick % 30 == 0 {
             let cur = EVICTED_COUNT.load(std::sync::atomic::Ordering::Relaxed);
             let tot = EVICTED_TOTAL.load(std::sync::atomic::Ordering::Relaxed);
             let rev = REVIVED_TOTAL.load(std::sync::atomic::Ordering::Relaxed);
-            crate::xlog_info!("D3D12.X: evict unviewed: -{evicted_now} sampled textures ({cur} evicted now, {tot} total, {rev} revived)");
+            crate::xlog_info!(
+                "D3D12.X: evict unviewed: -{evicted_now} sampled textures ({cur} evicted now, {tot} total, {rev} revived; skipped: missing={}, shadowed={}, gpu_written={}, target={}, pending={}, unmapped={})",
+                skip[0], skip[1], skip[2], skip[3], skip[4], skip[5]
+            );
         }
     }
     if do_reclaim {

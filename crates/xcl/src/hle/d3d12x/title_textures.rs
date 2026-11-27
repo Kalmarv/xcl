@@ -882,21 +882,45 @@ pub fn address(res: usize) -> Option<usize> {
 }
 
 /// Active CPU-backed placed sampled textures from `candidates` that can be safely evicted while
-/// unviewed (not GPU-written, not a render target/UAV, not pending upload).
-pub(super) unsafe fn evictable_resources(candidates: &[usize]) -> Vec<(usize, ID3D12Resource)> {
+/// unviewed (not GPU-written, not a render target/UAV, not pending upload), up to `limit`.
+/// Also returns skip counts: `[missing, shadowed, gpu_written, target, pending, unmapped]`.
+pub(super) unsafe fn evictable_resources(candidates: &[usize], limit: usize) -> (Vec<(usize, ID3D12Resource)>, [usize; 6]) {
     let t = TEXTURES.lock().unwrap();
     let mut out = Vec::new();
+    let mut skip = [0usize; 6];
     for &res in candidates {
-        let Some(e) = t.by_res.get(&res) else { continue };
-        if e.gpu_written || e.target || e.pending || !e.placed || e.unmapped {
+        let Some(e) = t.by_res.get(&res) else {
+            if t.shadowed.contains_key(&res) {
+                skip[1] += 1;
+            } else {
+                skip[0] += 1;
+            }
+            continue;
+        };
+        if e.gpu_written {
+            skip[2] += 1;
             continue;
         }
-        let p = res as *mut c_void;
-        if let Some(r) = ID3D12Resource::from_raw_borrowed(&p) {
-            out.push((res, r.clone()));
+        if e.target {
+            skip[3] += 1;
+            continue;
+        }
+        if e.pending {
+            skip[4] += 1;
+            continue;
+        }
+        if !e.placed || e.unmapped {
+            skip[5] += 1;
+            continue;
+        }
+        if out.len() < limit {
+            let p = res as *mut c_void;
+            if let Some(r) = ID3D12Resource::from_raw_borrowed(&p) {
+                out.push((res, r.clone()));
+            }
         }
     }
-    out
+    (out, skip)
 }
 
 /// Revive a previously evicted unviewed texture when a shared-heap view is written for it again:
