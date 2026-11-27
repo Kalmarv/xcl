@@ -649,6 +649,8 @@ impl Lw {
             xs: None,
             xw: None,
             xc: None,
+            bar: None,
+            bar_alive_slot: None,
             barrier_waves: None,
             waves: 1,
             cw: z,
@@ -737,7 +739,12 @@ impl Lw {
             }
             _ => (0, false),
         };
-        lw.setup_storage(uses_lds, if split { slot } else { 1 }, declared, native_counter);
+        let safe_barrier = matches!(entry, Entry::Mesh(_))
+            && crate::gpu::recomp::lower_dxil::mesh_enabled()
+            && lw.barrier_waves.is_some_and(|w| w > 1)
+            && crate::gpu::recomp::emit::safe_barrier_wanted()
+            && insts.iter().any(|d| d.inst.name == "S_BARRIER");
+        lw.setup_storage(uses_lds, if split { slot } else { 1 }, declared, native_counter, safe_barrier);
         lw
     }
 

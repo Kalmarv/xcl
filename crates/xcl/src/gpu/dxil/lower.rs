@@ -251,6 +251,9 @@ pub struct Lw {
     pub xw: Option<(super::ops::GroupShared, u32)>,
     /// arrival counters of the spin exchange (two per console wave)
     pub xc: Option<(super::ops::GroupShared, u32)>,
+    /// early-exit-safe `s_barrier` storage (`[BAR_ALIVE, BAR_STATE]`) and per-wave alive flag alloca
+    pub bar: Option<(super::ops::GroupShared, u32)>,
+    pub bar_alive_slot: Option<Value>,
     /// hardware waves of a compute or mesh thread group (None: another kind of entry), as the
     /// HLSL emitter's `compute_or_mesh_hw_waves`
     pub barrier_waves: Option<u32>,
@@ -1060,6 +1063,11 @@ impl Lw {
                 // one they all run. The HLSL path counts the waves still there
                 // (`xcl_s_barrier`): such a program is left to it.
                 if self.barrier_waves.is_some_and(|w| w > 1) && crate::gpu::recomp::emit::safe_barrier_wanted() {
+                    if self.bar.is_some() && self.bar_alive_slot.is_some() {
+                        self.safe_barrier();
+                        self.lds_met();
+                        return Ok(());
+                    }
                     return err(d, "s_barrier in a group of several hardware waves");
                 }
                 self.s.barrier(super::ops::barrier::GROUP_SYNC);

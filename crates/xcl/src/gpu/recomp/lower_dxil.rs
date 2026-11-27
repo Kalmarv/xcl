@@ -93,6 +93,7 @@ impl DxilIr {
             Entry::Mesh(ms) => {
                 let lds = lw.lds.is_some();
                 let (tid, gtid) = lw.setup_lanes_compute([ms.threads, 1, 1], lds);
+                lw.safe_barrier_init();
                 ids = Some((tid, gtid));
                 let io = lw.init.io.expect("the I/O buffer");
                 crate::gpu::dxil::kernel::mesh_init(&mut lw, ms, tid, io);
@@ -355,6 +356,10 @@ impl Ir for DxilIr {
         self.lw.cond_br(c, t, f);
     }
     fn ret(&mut self) {
+        if self.lw.bar.is_some() && self.lw.bar_alive_slot.is_some() {
+            self.lw.safe_barrier_exit();
+            self.tails[self.cur] = self.lw.cur();
+        }
         self.lw.s.m.ret();
     }
     fn mesh_start(&mut self) -> Option<(Value, Value)> {

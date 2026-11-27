@@ -19,12 +19,13 @@ use super::ops::barrier;
 impl Lw {
     /// Put private lane-exchange words after the guest LDS. D3D12 permits
     /// 8192 dwords in total, including any arrival counter for a native 2-D group.
-    pub fn setup_storage(&mut self, lds: bool, slot: u32, declared: u32, native_counter: bool) {
+    pub fn setup_storage(&mut self, lds: bool, slot: u32, declared: u32, native_counter: bool, safe_barrier: bool) {
         let i32 = self.s.m.i32();
         self.xslot = slot.max(1);
+        let bar_words = if safe_barrier { 2 } else { 0 };
         if lds {
             let slots = 4 * self.xslot * self.waves;
-            let control = if self.split { slots + 2 * self.waves + 1 } else { u32::from(native_counter) };
+            let control = if self.split { slots + 2 * self.waves + 1 + bar_words } else { u32::from(native_counter) + bar_words };
             // Unspecified or oversized reservations retain the existing 32 KiB layout.
             let fits = declared != 0 && declared <= 8192 - control;
             let words = if fits { declared + control } else { 8192 };
@@ -35,23 +36,161 @@ impl Lw {
                 self.lds_top = base - 1;
                 self.xs = Some((g, base));
                 self.xc = Some((g, base + slots));
+                if safe_barrier {
+                    self.bar = Some((g, base + slots + 2 * self.waves));
+                }
                 self.xw = Some((g, words - 1));
             } else {
-                self.lds_top = if fits { declared - 1 } else { 8191 };
+                let base = words - control;
+                self.lds_top = if fits { declared - 1 } else if control > 0 { base - 1 } else { 8191 };
+                if safe_barrier {
+                    self.bar = Some((g, base));
+                }
                 if native_counter {
                     self.xw = Some((g, words - 1));
                 }
             }
-        } else if self.split {
-            let w = self.s.groupshared("xcl_xw", i32, 1);
-            self.xw = Some((w, 0));
-            if self.waves > 1 || self.partner == Partner::Spin {
-                let x = self.s.groupshared("xcl_xs", i32, (4 * self.xslot * self.waves) as u64);
-                self.xs = Some((x, 0));
-                let c = self.s.groupshared("xcl_xc", i32, 2 * self.waves as u64);
-                self.xc = Some((c, 0));
+        } else {
+            if self.split {
+                let w = self.s.groupshared("xcl_xw", i32, 1);
+                self.xw = Some((w, 0));
+                if self.waves > 1 || self.partner == Partner::Spin {
+                    let x = self.s.groupshared("xcl_xs", i32, (4 * self.xslot * self.waves) as u64);
+                    self.xs = Some((x, 0));
+                    let c = self.s.groupshared("xcl_xc", i32, 2 * self.waves as u64);
+                    self.xc = Some((c, 0));
+                }
+            }
+            if safe_barrier {
+                let b = self.s.groupshared("xcl_bar", i32, 2);
+                self.bar = Some((b, 0));
             }
         }
+    }
+
+    /// Initialize early-exit-safe `s_barrier` (`xcl_s_barrier_init`) in the entry block with no
+    /// control-flow branches, so `Block(0)` remains unterminated.
+    pub fn safe_barrier_init(&mut self) {
+        let Some((bg, bb)) = self.bar else { return };
+        let i32 = self.s.m.i32();
+        let one = self.c(1);
+        let z = self.c(0);
+        let slot = self.s.m.alloca(i32, 4);
+        self.s.m.store(slot, one, 4);
+        self.bar_alive_slot = Some(slot);
+        let alive_idx = self.c(bb);
+        let state_idx = self.c(bb + 1);
+        let pa = self.s.gs_ptr(bg, alive_idx);
+        let ps = self.s.gs_ptr(bg, state_idx);
+        self.s.m.store(pa, z, 4);
+        self.s.m.store(ps, z, 4);
+        self.s.barrier(barrier::GROUP_SYNC);
+        let first = self.s.wave_is_first_lane();
+        let inc = self.selc(first, 1, z);
+        self.s.gs_atomic(RmwOp::Add, bg, alive_idx, inc);
+        self.s.barrier(barrier::GROUP_SYNC);
+    }
+
+    /// Decrement `BAR_ALIVE` when a wave exits (`xcl_s_barrier_exit`).
+    pub fn safe_barrier_exit(&mut self) {
+        let (Some((bg, bb)), Some(slot)) = (self.bar, self.bar_alive_slot) else { return };
+        let alive = self.s.m.load(slot, 4);
+        let is_alive = self.cmpc(Pred::Ne, alive, 0);
+        let _ = self.guarded(is_alive, &mut |lw| {
+            let z = lw.c(0);
+            lw.s.m.store(slot, z, 4);
+            let t = lw.s.m.i1c(true);
+            let act = lw.s.wave_all_bit_count(t);
+            let first = lw.s.wave_is_first_lane();
+            let has = lw.cmpc(Pred::Ne, act, 0);
+            let do_dec = lw.land(first, has);
+            let bi = lw.c(bb);
+            let neg1 = lw.c(0xFFFF_FFFF);
+            let delta = lw.sel(do_dec, neg1, z);
+            lw.s.gs_atomic(RmwOp::Add, bg, bi, delta);
+            Ok(())
+        });
+    }
+
+    /// Early-exit-safe bounded `s_barrier` (`xcl_s_barrier` from `recomp::emit::PRELUDE_SAFE_BARRIER`).
+    pub fn safe_barrier(&mut self) {
+        let (Some((bg, bb)), Some(slot)) = (self.bar, self.bar_alive_slot) else { return };
+        self.s.barrier(barrier::TGSM_FENCE);
+        let alive = self.s.m.load(slot, 4);
+        let is_alive = self.cmpc(Pred::Ne, alive, 0);
+        let _ = self.guarded(is_alive, &mut |lw| {
+            let t = lw.s.m.i1c(true);
+            let lanes = lw.s.wave_all_bit_count(t);
+            let ok = lw.tmp_var();
+            let one = lw.c(1);
+            lw.wr(ok, one);
+            let first = lw.s.wave_is_first_lane();
+            let has = lw.cmpc(Pred::Ne, lanes, 0);
+            let do_wait = lw.land(first, has);
+            let alive_idx = lw.c(bb);
+            let state_idx = lw.c(bb + 1);
+            lw.guarded(do_wait, &mut |lw| {
+                let one = lw.c(1);
+                let old = lw.s.gs_atomic(RmwOp::Add, bg, state_idx, one);
+                let gen = lw.lshrc(old, 12);
+                let next = lw.addc(gen, 1);
+                let next = lw.andc(next, 0xF_FFFF);
+                let next = lw.shlc(next, 12);
+                let pre = lw.cur();
+                let lp = lw.block(Some(2));
+                let chk_alive = lw.block(Some(1));
+                let do_cas = lw.block(Some(1));
+                let chk_to = lw.block(Some(2));
+                let on_to = lw.block(Some(1));
+                let step = lw.block(Some(1));
+                let ex = lw.block(Some(3));
+                lw.br(lp);
+                lw.s.m.set_block(lp);
+                let i32 = lw.s.m.i32();
+                let n = lw.s.m.phi(i32);
+                let z = lw.c(0);
+                lw.s.m.add_incoming(n, z, pre);
+                let s = lw.s.gs_atomic(RmwOp::Add, bg, state_idx, z);
+                let s_gen = lw.lshrc(s, 12);
+                let done_gen = lw.cmp(Pred::Ne, s_gen, gen);
+                lw.cond_br(done_gen, ex, chk_alive);
+                lw.s.m.set_block(chk_alive);
+                let al = lw.s.gs_atomic(RmwOp::Add, bg, alive_idx, z);
+                let dead_al = lw.cmp(Pred::SLe, al, z);
+                let arr = lw.andc(s, 0xFFF);
+                let all_arr = lw.cmp(Pred::UGe, arr, al);
+                let ready = lw.lor(dead_al, all_arr);
+                lw.cond_br(ready, do_cas, chk_to);
+                lw.s.m.set_block(do_cas);
+                let orig = lw.s.gs_cmpxchg(bg, state_idx, s, next);
+                let won = lw.cmp(Pred::Eq, orig, s);
+                lw.cond_br(won, ex, chk_to);
+                lw.s.m.set_block(chk_to);
+                let timed_out = lw.cmpc(Pred::UGe, n, 1 << 20);
+                lw.cond_br(timed_out, on_to, step);
+                lw.s.m.set_block(on_to);
+                lw.wr(ok, z);
+                let neg1 = lw.c(0xFFFF_FFFF);
+                lw.s.gs_atomic(RmwOp::Add, bg, alive_idx, neg1);
+                lw.s.gs_cmpxchg(bg, state_idx, s, next);
+                lw.br(ex);
+                lw.s.m.set_block(step);
+                let n1 = lw.addc(n, 1);
+                lw.s.m.add_incoming(n, n1, step);
+                lw.br(lp);
+                lw.s.m.set_block(ex);
+                Ok(())
+            })?;
+            let okv = lw.rd(ok);
+            let okf = lw.s.wave_read_lane_first(okv);
+            let fail = lw.cmpc(Pred::Eq, okf, 0);
+            let z = lw.c(0);
+            let cur_al = lw.s.m.load(slot, 4);
+            let new_al = lw.sel(fail, z, cur_al);
+            lw.s.m.store(slot, new_al, 4);
+            lw.s.barrier(barrier::TGSM_FENCE);
+            Ok(())
+        });
     }
 
     /// Lane setup at the start of the entry block (after [`Lw::setup_storage`]).
