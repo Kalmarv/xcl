@@ -326,6 +326,14 @@ fn buffer_desc(size: usize) -> D3D12_RESOURCE_DESC {
     }
 }
 
+/// `XCL_UMA_UPLOAD_PRIORITY=1` (read once): the `GPU_UPLOAD` segments of a mixed window get
+/// `D3D12_RESIDENCY_PRIORITY_MAXIMUM`, so Windows demotes other heaps first when the process is
+/// over its video memory budget.
+fn upload_priority_wanted() -> bool {
+    static ON: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
+    *ON.get_or_init(|| std::env::var("XCL_UMA_UPLOAD_PRIORITY").is_ok_and(|v| v.trim() == "1"))
+}
+
 /// One segment of a mixed window: a heap of `size` bytes (write-watched when `watch`), a buffer
 /// over all of it and where the driver mapped it for the CPU.
 unsafe fn mapped_segment(device: &ID3D12Device, size: usize, upload: bool, watch: bool) -> Result<(ID3D12Heap, ID3D12Resource, usize), String> {
@@ -338,6 +346,18 @@ unsafe fn mapped_segment(device: &ID3D12Device, size: usize, upload: bool, watch
     let mut heap: Option<ID3D12Heap> = None;
     device.CreateHeap(&desc, &mut heap).map_err(|e| format!("CreateHeap{}: {e}", if watch { " (write-watched)" } else { "" }))?;
     let heap = heap.ok_or("CreateHeap")?;
+    if upload && upload_priority_wanted() {
+        // (a process over its video memory budget has heaps demoted to system memory: not this one,
+        // which every console program reads its buffers from)
+        let set = device.cast::<ID3D12Device1>().and_then(|d| {
+            let obj: ID3D12Pageable = heap.cast()?;
+            d.SetResidencyPriority(1, &Some(obj), &D3D12_RESIDENCY_PRIORITY_MAXIMUM)
+        });
+        match set {
+            Ok(()) => crate::xlog_info!("D3D12.X: XCL_UMA_UPLOAD_PRIORITY: the {} MB GPU_UPLOAD segment has the highest residency priority", size >> 20),
+            Err(e) => crate::xlog_warn!("D3D12.X: XCL_UMA_UPLOAD_PRIORITY: SetResidencyPriority: {e}"),
+        }
+    }
     let mut buf: Option<ID3D12Resource> = None;
     device.CreatePlacedResource(&heap, 0, &buffer_desc(size), D3D12_RESOURCE_STATE_COMMON, None, &mut buf).map_err(|e| format!("CreatePlacedResource: {e}"))?;
     let buf = buf.ok_or("CreatePlacedResource")?;
