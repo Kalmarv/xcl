@@ -347,6 +347,13 @@ pub(super) unsafe fn set_hot_priority(device: &ID3D12Device, obj: &ID3D12Pageabl
     set_residency_priority(device, obj, D3D12_RESIDENCY_PRIORITY_HIGH, "HIGH", what);
 }
 
+/// Above `NORMAL` (and the driver's `0x78100000` band) and `LOW`, but below `HIGH` (RT/DS/UAV,
+/// arenas, two-pass), so if over-budget demotion ever exhausts `LOW` cold texture pools it hits
+/// sparse pools before render targets or depth buffers.
+pub(super) unsafe fn set_sparse_priority(device: &ID3D12Device, obj: &ID3D12Pageable, what: &str) {
+    set_residency_priority(device, obj, D3D12_RESIDENCY_PRIORITY(0x7900_0000), "NORMAL+", what);
+}
+
 pub(super) unsafe fn set_low_priority(device: &ID3D12Device, obj: &ID3D12Pageable, what: &str) {
     set_residency_priority(device, obj, D3D12_RESIDENCY_PRIORITY_LOW, "LOW", what);
 }

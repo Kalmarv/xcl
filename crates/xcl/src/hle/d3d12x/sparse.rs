@@ -1256,7 +1256,7 @@ impl State {
         let heap = heap?;
         let _ = heap.SetName(windows::core::w!("xcl sparse tile pool"));
         if let Ok(p) = heap.cast::<ID3D12Pageable>() {
-            super::uma_driver::set_hot_priority(&self.dev, &p, "sparse tile pool");
+            super::uma_driver::set_sparse_priority(&self.dev, &p, "sparse tile pool");
         }
         let h = self.add_pool(heap);
         Some(((h, 0), false))
