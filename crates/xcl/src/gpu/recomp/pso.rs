@@ -335,6 +335,12 @@ mod translated {
             } else {
                 id
             };
+            // `XCL_HALF_BRANCH=1`: half-local `s_cbranch_execz`/`execnz` in split wave64
+            let id = if Backend::current() != Backend::Hlsl && crate::gpu::recomp::lower::half_branch_enabled() {
+                identity_for(&id.to_string(), "xcl-half-branch-1")
+            } else {
+                id
+            };
             // `XCL_PER_LANE=1` (direct compute only): its entries under their own identity
             if Backend::current() != Backend::Hlsl && crate::gpu::recomp::lower_dxil::enabled() {
                 identity_for(&id.to_string(), concat!("xcl-per-lane-", env!("XCL_PER_LANE_SOURCE_ID")))

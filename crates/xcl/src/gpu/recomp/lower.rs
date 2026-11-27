@@ -175,6 +175,9 @@ struct Lower<'a, I: Ir> {
     sum: &'a Summary,
     guarded: HashSet<u64>,
     wave_branches: bool,
+    /// Analysis block indices where `S_CBRANCH_EXECZ`/`S_CBRANCH_EXECNZ` can safely use
+    /// `ballot_half` (32-lane hardware ballot, zero `Partner::Spin` exchange) in split wave64.
+    half_branches: HashSet<usize>,
     /// Whether SCC is live after instruction `i` (used to skip dead whole-wave SCC ballots).
     scc_live_after: Vec<bool>,
     cur_inst: usize,
@@ -561,8 +564,17 @@ impl<'a, I: Ir> Lower<'a, I> {
     /// A mask-producing scalar operation sets SCC from its full result. In the native
     /// wave CFG every lane reaches scalar instructions, including lanes outside EXEC.
     fn mask_nonzero(&mut self, bit: I::V) -> I::V {
+        self.mask_nonzero_in(bit, false)
+    }
+
+    fn mask_nonzero_in(&mut self, bit: I::V, half: bool) -> I::V {
         if !self.wave_branches {
             return bit;
+        }
+        if half {
+            let [lo, _] = self.ir.ballot_half(bit);
+            let zero = self.ir.int(0);
+            return self.ir.icmp(Cmp::Ne, lo, zero);
         }
         let [lo, hi] = self.ir.ballot(bit);
         let word = if self.wave64 { self.ir.bin(Bin::Or, lo, hi) } else { lo };
@@ -1044,7 +1056,7 @@ impl<'a, I: Ir> Lower<'a, I> {
     }
 
     /// The condition under which a lane takes the branch ending block b.
-    fn cond(&mut self, b: usize, d: &Decoded) -> R<I::V> {
+    fn cond(&mut self, b: usize, cfg_b: usize, d: &Decoded) -> R<I::V> {
         Ok(match d.inst.name {
             "S_CBRANCH_SCC1" => self.read_scc(b),
             "S_CBRANCH_SCC0" => {
@@ -1062,11 +1074,11 @@ impl<'a, I: Ir> Lower<'a, I> {
             }
             "S_CBRANCH_EXECNZ" => {
                 let e = self.read_bit(b, EXEC)?;
-                self.mask_nonzero(e)
+                self.mask_nonzero_in(e, self.half_branches.contains(&cfg_b))
             }
             "S_CBRANCH_EXECZ" => {
                 let e = self.read_bit(b, EXEC)?;
-                let c = self.mask_nonzero(e);
+                let c = self.mask_nonzero_in(e, self.half_branches.contains(&cfg_b));
                 self.not(c)
             }
             n => return Err(format!("unsupported branch {n}")),
@@ -1205,6 +1217,229 @@ fn lower<I: Ir>(insts: &[Decoded], stage: Stage, wave64: bool, ir: I) -> R<(I, V
 
 /// Backward liveness of SCC over `sum.blocks`: `live_after[i]` is true when some path
 /// from instruction `i` can read SCC before an unconditional scalar instruction overwrites it.
+/// `XCL_HALF_BRANCH=1`: allow split wave64 `S_CBRANCH_EXECZ`/`S_CBRANCH_EXECNZ` diamonds whose
+/// skipped body has no cross-half exchanges, no EXEC resurrection, and no live-out SGPR/SCC writes
+/// to branch on `ballot_half` (32-lane hardware ballot, zero `Partner::Spin` exchange).
+pub fn half_branch_enabled() -> bool {
+    static ON: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
+    *ON.get_or_init(|| std::env::var("XCL_HALF_BRANCH").is_ok_and(|v| v.trim() == "1"))
+}
+
+fn compute_half_branches(insts: &[Decoded], sum: &Summary, scc_live_after: &[bool], writes_lds: bool) -> HashSet<usize> {
+    let nb = sum.blocks.len();
+    // Backward liveness for SGPRs 0..=125 and SCC.
+    let reads_scc = |d: &Decoded| -> bool {
+        matches!(d.inst.name, "S_CBRANCH_SCC0" | "S_CBRANCH_SCC1")
+            || d.ienc.operands.iter().any(|o| o.input && o.ty == "OPR_SSRC_SPECIAL_SCC")
+            || ["SSRC0", "SSRC1", "SRC0", "SRC1", "SRC2", "SOFFSET"]
+                .iter()
+                .any(|f| rdna2::field_value(d.enc, &d.words, f) == Some(253))
+    };
+    let writes_scc = |d: &Decoded| -> bool {
+        d.inst.name.starts_with("S_") && d.ienc.operands.iter().any(|o| o.output && o.ty == "OPR_SSRC_SPECIAL_SCC")
+    };
+    let mask_lo126: u128 = (1u128 << 126) - 1;
+    let mut sgpr_live_in = vec![0u128; nb];
+    let mut scc_live_in = vec![false; nb];
+    loop {
+        let mut changed = false;
+        for &b in sum.order.iter().rev() {
+            let block = &sum.blocks[b];
+            let mut slive = block.succ.iter().fold(0u128, |m, &(s, _)| m | sgpr_live_in[s]);
+            let mut clive = block.succ.iter().any(|&(s, _)| scc_live_in[s]);
+            for i in block.insts.clone().rev() {
+                let d = &insts[i];
+                let (sr, sw) = rdna2::sgpr_uses(d);
+                let (whole, xw) = super::x64_masks::uses(d);
+                let w = sw.iter().fold(xw, |m, &r| m | (1u128 << r)) & mask_lo126;
+                let r = sr.iter().fold(whole, |m, &r| m | (1u128 << r)) & mask_lo126;
+                slive = (slive & !w) | r;
+                if writes_scc(d) {
+                    clive = false;
+                }
+                if reads_scc(d) {
+                    clive = true;
+                }
+            }
+            if sgpr_live_in[b] != slive || scc_live_in[b] != clive {
+                sgpr_live_in[b] = slive;
+                scc_live_in[b] = clive;
+                changed = true;
+            }
+        }
+        if !changed {
+            break;
+        }
+    }
+
+    let is_cross_half_op = |d: &Decoded, i: usize| -> bool {
+        let n = d.inst.name;
+        if matches!(
+            n,
+            "S_BARRIER"
+                | "V_READFIRSTLANE_B32"
+                | "V_READLANE_B32"
+                | "V_WRITELANE_B32"
+                | "DS_BPERMUTE_B32"
+                | "V_MBCNT_LO_U32_B32"
+                | "S_CBRANCH_VCCZ"
+                | "S_CBRANCH_VCCNZ"
+        ) {
+            return true;
+        }
+        if n.starts_with("S_BCNT1_") || n.starts_with("S_FF1_") || n.starts_with("S_FLBIT_") || n.starts_with("S_BITCMP") {
+            return true;
+        }
+        if writes_lds && n.starts_with("DS_") && n != "DS_NOP" && n != "DS_SWIZZLE_B32" {
+            return true;
+        }
+        if scc_live_after[i]
+            && matches!(
+                n,
+                "S_AND_B64"
+                    | "S_OR_B64"
+                    | "S_XOR_B64"
+                    | "S_ANDN2_B64"
+                    | "S_ORN2_B64"
+                    | "S_NAND_B64"
+                    | "S_NOR_B64"
+                    | "S_XNOR_B64"
+                    | "S_AND_SAVEEXEC_B64"
+                    | "S_OR_SAVEEXEC_B64"
+                    | "S_XOR_SAVEEXEC_B64"
+                    | "S_ANDN2_SAVEEXEC_B64"
+                    | "S_ORN2_SAVEEXEC_B64"
+                    | "S_NAND_SAVEEXEC_B64"
+                    | "S_NOR_SAVEEXEC_B64"
+                    | "S_XNOR_SAVEEXEC_B64"
+                    | "S_NOT_B64"
+                    | "S_WQM_B64"
+                    | "S_CMP_EQ_U64"
+                    | "S_CMP_LG_U64"
+            )
+        {
+            return true;
+        }
+        false
+    };
+
+    // Collect candidate S_CBRANCH_EXECZ / S_CBRANCH_EXECNZ diamonds: (b, body_blk, skip_blk, region).
+    let mut cands: Vec<(usize, usize, Vec<usize>)> = Vec::new();
+    for &b in &sum.order {
+        let block = &sum.blocks[b];
+        if block.insts.is_empty() {
+            continue;
+        }
+        let last = &insts[block.insts.end - 1];
+        let (body_blk, skip_blk) = match (last.inst.name, block.succ.as_slice()) {
+            ("S_CBRANCH_EXECZ", [(t, Edge::Taken), (f, Edge::NotTaken)]) if t != f => (*f, *t),
+            ("S_CBRANCH_EXECNZ", [(t, Edge::Taken), (f, Edge::NotTaken)]) if t != f => (*t, *f),
+            _ => continue,
+        };
+        let mut region = Vec::new();
+        let mut seen = vec![false; nb];
+        let mut stack = vec![body_blk];
+        let mut ok = true;
+        while let Some(u) = stack.pop() {
+            if u == skip_blk {
+                continue;
+            }
+            if u == b {
+                ok = false;
+                break;
+            }
+            if std::mem::replace(&mut seen[u], true) {
+                continue;
+            }
+            if sum.blocks[u].succ.is_empty() {
+                ok = false;
+                break;
+            }
+            region.push(u);
+            for &(s, _) in &sum.blocks[u].succ {
+                stack.push(s);
+            }
+        }
+        if ok && !region.is_empty() {
+            cands.push((b, skip_blk, region));
+        }
+    }
+
+    let mut half = HashSet::new();
+    loop {
+        let mut added = false;
+        for (b, skip_blk, region) in &cands {
+            if half.contains(b) {
+                continue;
+            }
+            let live_out_s = sgpr_live_in[*skip_blk];
+            let live_out_c = scc_live_in[*skip_blk];
+            let mut region_exec_sub_s: u128 = 0;
+            let mut ok = true;
+            for &u in region {
+                for i in sum.blocks[u].insts.clone() {
+                    let d = &insts[i];
+                    let n = d.inst.name;
+                    let (_, sw) = rdna2::sgpr_uses(d);
+                    let (_, xw) = super::x64_masks::uses(d);
+                    let w = sw.iter().fold(xw, |m, &r| m | (1u128 << r)) & mask_lo126;
+                    // Only track SGPRs guaranteed to be 0 whenever EXEC == 0 (saved EXEC masks).
+                    if matches!(n, "S_AND_SAVEEXEC_B64" | "S_ANDN2_SAVEEXEC_B64")
+                        || (n == "S_MOV_B64" && rdna2::field_value(d.enc, &d.words, "SSRC0") == Some(EXEC as u64))
+                    {
+                        region_exec_sub_s |= w;
+                    } else {
+                        region_exec_sub_s &= !w;
+                    }
+                }
+            }
+            'blocks: for &u in region {
+                for i in sum.blocks[u].insts.clone() {
+                    let d = &insts[i];
+                    let n = d.inst.name;
+                    if is_cross_half_op(d, i) {
+                        ok = false;
+                        break 'blocks;
+                    }
+                    if matches!(n, "S_CBRANCH_EXECZ" | "S_CBRANCH_EXECNZ") && !half.contains(&u) {
+                        ok = false;
+                        break 'blocks;
+                    }
+                    let (_, sw) = rdna2::sgpr_uses(d);
+                    let (_, xw) = super::x64_masks::uses(d);
+                    let w = sw.iter().fold(xw, |m, &r| m | (1u128 << r));
+                    if (w & live_out_s) != 0 || (live_out_c && writes_scc(d)) {
+                        ok = false;
+                        break 'blocks;
+                    }
+                    // Forbid EXEC resurrection (turning 0 -> 1 in the skipped half).
+                    if (w >> EXEC) & 3 != 0 {
+                        let safe_exec = n.starts_with("V_CMPX")
+                            || n.starts_with("S_AND_")
+                            || n.starts_with("S_ANDN2_")
+                            || (matches!(n, "S_OR_B64" | "S_XOR_B64") && {
+                                let (sr, _) = rdna2::sgpr_uses(d);
+                                sr.iter().all(|&r| r >= EXEC as u64 || (region_exec_sub_s >> r) & 1 != 0)
+                            });
+                        if !safe_exec {
+                            ok = false;
+                            break 'blocks;
+                        }
+                    }
+                }
+            }
+            if ok {
+                half.insert(*b);
+                added = true;
+            }
+        }
+        if !added {
+            break;
+        }
+    }
+    half
+}
+
 fn compute_scc_liveness(insts: &[Decoded], sum: &Summary) -> Vec<bool> {
     let reads_scc = |d: &Decoded| -> bool {
         matches!(d.inst.name, "S_CBRANCH_SCC0" | "S_CBRANCH_SCC1")
@@ -1284,6 +1519,12 @@ fn lower_with<I: Ir>(insts: &[Decoded], stage: Stage, wave64: bool, mut ir: I, s
     } else {
         vec![true; insts.len()]
     };
+    let half_branches = if wave_branches && ir.whole_needs_exchange() && half_branch_enabled() {
+        let writes_lds = super::emit::lds_order_wanted() && super::emit::writes_lds(insts);
+        compute_half_branches(insts, &sum, &scc_live_after, writes_lds)
+    } else {
+        HashSet::new()
+    };
     let n = sum.blocks.len();
     if n == 0 {
         return Err("empty program".into());
@@ -1360,6 +1601,7 @@ fn lower_with<I: Ir>(insts: &[Decoded], stage: Stage, wave64: bool, mut ir: I, s
         sum: &sum,
         guarded,
         wave_branches,
+        half_branches,
         scc_live_after,
         cur_inst: 0,
         wave64,
@@ -1623,7 +1865,7 @@ fn lower_with<I: Ir>(insts: &[Decoded], stage: Stage, wave64: bool, mut ir: I, s
             [] => l.ir.br(exit),
             [(t, Edge::Always)] => l.ir.br(blk(*t)),
             [(t, _), (f, _)] if t == f => l.ir.br(blk(*t)),
-            [(t, Edge::Taken), (f, Edge::NotTaken)] => match l.cond(cur, &insts[last]) {
+            [(t, Edge::Taken), (f, Edge::NotTaken)] => match l.cond(cur, b, &insts[last]) {
                 Ok(c) => l.ir.br_if(c, blk(*t), blk(*f)),
                 Err(e) => {
                     l.note(Err(e))?;

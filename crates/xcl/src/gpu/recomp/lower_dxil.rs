@@ -1454,4 +1454,28 @@ mod tests {
         let k = super::mesh_with(&bytes, &ms, o).unwrap_or_else(|e| panic!("mesh_with failed: {e}"));
         crate::gpu::dxil::validate::validate(&k.dxil).expect("valid Mesh DXIL");
     }
+
+    #[test]
+    fn half_branch_elides_spin_exchange_on_pure_execz_diamond() {
+        // Pure s_and_saveexec_b64 + s_cbranch_execz diamond (no cross-half ops, no live-out SGPR).
+        let lines: &[I] = &[
+            ("V_CMP_GT_U32", "ENC_VOPC", &[("SRC0", 144), ("VSRC1", 0)]),
+            ("S_AND_SAVEEXEC_B64", "ENC_SOP1", &[("SDST", 8), ("SSRC0", 106)]),
+            ("S_CBRANCH_EXECZ", "ENC_SOPP", &[("SIMM16", 1)]),
+            ("V_MOV_B32", "ENC_VOP1", &[("VDST", 7), ("SRC0", 133)]),
+            ("S_OR_B64", "ENC_SOP2", &[("SDST", 126), ("SSRC0", 126), ("SSRC1", 8)]),
+            ("V_LSHLREV_B32", "ENC_VOP2", &[("VDST", 8), ("SRC0", 130), ("VSRC1", 0)]),
+            ("V_MOV_B32", "ENC_VOP1", &[("VDST", 9), ("SRC0", 128)]),
+            ("GLOBAL_STORE_DWORD", "ENC_FLAT_GLBL", &[("ADDR", 8), ("DATA", 7), ("SADDR", 125), ("OFFSET", 0)]),
+            ENDPGM,
+        ];
+        let cs = compute_cs();
+        let dxil = super::compute_split(&decode(lines), &cs).unwrap_or_else(|e| panic!("{e}"));
+        crate::gpu::dxil::validate::validate(&dxil).expect("valid DXIL");
+        if super::super::lower::half_branch_enabled() && dxc::location().is_ok() {
+            let text = crate::gpu::dxil::validate::disassemble(&dxil).unwrap();
+            let fences = text.lines().filter(|l| l.contains("call void @dx.op.barrier(i32 80, i32 8)")).count();
+            assert_eq!(fences, 0, "expected 0 spin fences under XCL_HALF_BRANCH=1:\n{text}");
+        }
+    }
 }
