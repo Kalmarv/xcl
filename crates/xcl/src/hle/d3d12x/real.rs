@@ -1609,6 +1609,27 @@ const COHERENT_CUSTOM_WB_MAX: usize = 16 << 20;
 /// arena pool)
 const COHERENT_FLOOR: usize = 16 << 20;
 
+/// A block of `size` bytes from `u` that one heap holds (`heap_of(p)`). A block across two
+/// segments of a mixed window has none: it is held while the next fit is tried (which then starts
+/// past it), and given back either way.
+fn alloc_in_one_heap<T>(u: &crate::gpu::uma::Uma, size: usize, heap_of: impl Fn(usize) -> Option<T>) -> Option<(usize, T)> {
+    let mut held = Vec::new();
+    let found = loop {
+        let Some(p) = u.alloc(size, 0x1_0000).map(|a| a as usize) else { break None };
+        if let Some(h) = heap_of(p) {
+            break Some((p, h));
+        }
+        held.push(p);
+        if held.len() == 4 {
+            break None;
+        }
+    };
+    for p in held {
+        u.free(p);
+    }
+    found
+}
+
 /// Whether a readback heap / buffer of `rounded` bytes may take coherent memory. The room
 /// committed textures leave (`COHERENT_KEPT`) is kept for these: with the textures at that
 /// limit (Unicorn Overlord's), a second 128 MB of headroom sent every readback buffer to the
@@ -1707,16 +1728,15 @@ unsafe fn place_console_buffer(this: *mut c_void, props: usize, desc: usize, sta
             return Some(hr);
         }
     }
-    let Some(p) = u.alloc(rounded, 0x1_0000).map(|a| a as usize) else {
+    let heap_of = |p: usize| u.window_of(p).and_then(|k| uma_heap_for(k, p - u.window(k).0, rounded).map(|h| (k, h)));
+    let Some((p, (k, (heap, heap_off)))) = alloc_in_one_heap(u, rounded, heap_of) else {
         if prefer_coherent && u.has_sparse() {
             return place_console_buffer_sparse(this, &d, bytes, st, readback_on_null_map, riid, ppv);
         }
         return None;
     };
     // the heap from OpenExistingHeapFromAddress is cross-adapter: row-major + sanitized flags & state
-    let k = u.window_of(p)?;
     let (d, st) = sanitize_coherent_buffer(&d, state, !u.is_driver_window(k));
-    let (heap, heap_off) = uma_heap_for(k, p - u.window(k).0, d.Width as usize)?;
     let hr = dev_create_placed_resource(this, heap, heap_off, &d as *const _ as usize, st as usize, clear, riid, ppv);
     if hr < 0 || (*ppv).is_null() {
         u.free(p);
@@ -11620,5 +11640,29 @@ mod depth_uav_twin_tests {
             rb.Unmap(0, None);
             assert!(rows.iter().all(|r| r.iter().all(|&v| v == 0x5A)), "the twin was not cleared: {:x?}", &rows[0]);
         }
+    }
+}
+
+#[cfg(test)]
+mod uma_heap_tests {
+    use super::*;
+
+    /// A console buffer whose first fit crosses two segments of a mixed window goes to the next
+    /// fit, and the crossing block is given back (it stayed charged to the window).
+    #[test]
+    fn a_block_across_two_segments_is_given_back_and_the_next_fit_used() {
+        let u = crate::gpu::uma::Uma::with_windows(1, 4 << 20).expect("one UMA window");
+        let (w0, _) = u.window(0);
+        let first = u.alloc(960 << 10, 0x1_0000).expect("first block") as usize;
+        assert_eq!(first, w0);
+        let used = u.used();
+        let boundary = w0 + (1 << 20);
+        let heap_of = |p: usize| (p + (128 << 10) <= boundary || p >= boundary).then_some(());
+        let (p, ()) = alloc_in_one_heap(&u, 128 << 10, heap_of).expect("a block in one segment");
+        assert_eq!(p, w0 + (1088 << 10));
+        assert_eq!(u.used(), used + (128 << 10));
+        assert_eq!(u.alloc(64 << 10, 0x1_0000).map(|a| a as usize), Some(w0 + (960 << 10)));
+        assert!(alloc_in_one_heap(&u, 64 << 10, |_| None::<()>).is_none());
+        assert_eq!(u.used(), used + (192 << 10));
     }
 }
