@@ -2678,6 +2678,42 @@ impl State {
     }
 }
 
+/// What `sent` (a page's hashes of what went to the GPU; None: nothing but zeros ever) says of
+/// the page's chunk `k`, whose bytes are `chunk` now (`chunk_note`).
+fn chunk_state(sent: Option<&[u64; CHUNKS]>, k: usize, chunk: &[u8]) -> &'static str {
+    let h = chunk_hash(chunk);
+    match sent {
+        None if h == ZERO_HASH => "nothing of its page was ever sent, and the CPU's range holds zeros there (taken as what the GPU has)",
+        None => "nothing of its page was ever sent, and the CPU's range holds words there that go up at the next look",
+        Some(s) if s[k] == h && h == ZERO_HASH => "of its page's chunks this one was never sent (or zeros were), and the CPU's range holds zeros there",
+        Some(s) if s[k] == h => "its chunk was sent as the CPU's range holds it now",
+        Some(_) => "the CPU's range has changed since its chunk was sent: it goes up at the next look",
+    }
+}
+
+/// What the windows' state says of the 64-byte chunk at window address `va`, for a diagnostic
+/// line (`indirect_guard`: counts the GPU read that the CPU's range does not hold). None: no
+/// sparse window's address, or the state is in use now.
+pub(super) fn chunk_note(va: usize) -> Option<&'static str> {
+    let g = STATE.try_lock().ok()?;
+    let s = g.as_ref()?;
+    s.window_index(va)?;
+    let pg = va & !(PAGE - 1);
+    let t = pg & !(TILE - 1);
+    let idx = (pg - t) / PAGE;
+    let Some(entry) = s.mapped.get(&t) else { return Some("its tile has no video memory") };
+    if entry.pool == LAZY {
+        return Some("its tile's video memory is still owed");
+    }
+    if entry.holes & (1u16 << idx) != 0 {
+        return Some("its page is not committed");
+    }
+    // (committed by the tile's holes, under the state's lock: read as `chunk_clean` reads it)
+    let k = (va - pg) / CHUNK;
+    let chunk = unsafe { std::slice::from_raw_parts((entry.cpu(t) + (pg - t) + k * CHUNK) as *const u8, CHUNK) };
+    Some(chunk_state(entry.sent[idx].as_deref(), k, chunk))
+}
+
 /// Synchronize `[va, va + len)` in a sparse window for a CPU read (`ID3D12Resource::Map` with
 /// a non-empty read range, or `Map(0, NULL)` on a sparse readback resource): flushes pending
 /// tile clears and unsubmitted CPU-changed chunks first so CPU writes are preserved, then
@@ -5478,6 +5514,21 @@ mod tests {
         page[256] = 5; // next to the chunk at 192: one run
         page[200] = 9;
         assert_eq!(changed_chunks(&page, &mut sent), vec![(192, 128)]);
+    }
+
+    /// What a diagnostic line says of a chunk: whether the CPU's bytes there are what was sent.
+    #[test]
+    fn chunk_state_tells_sent_from_changed_and_never_sent() {
+        let mut page = [0u8; PAGE];
+        assert!(chunk_state(None, 3, &page[3 * CHUNK..4 * CHUNK]).contains("nothing of its page was ever sent, and the CPU's range holds zeros"));
+        page[3 * CHUNK + 5] = 9;
+        assert!(chunk_state(None, 3, &page[3 * CHUNK..4 * CHUNK]).contains("go up at the next look"));
+        let mut sent = Box::new(ZERO_HASHES);
+        assert!(!changed_chunks(&page, &mut sent).is_empty());
+        assert_eq!(chunk_state(Some(&sent), 3, &page[3 * CHUNK..4 * CHUNK]), "its chunk was sent as the CPU's range holds it now");
+        assert!(chunk_state(Some(&sent), 4, &page[4 * CHUNK..5 * CHUNK]).contains("this one was never sent (or zeros were)"));
+        page[3 * CHUNK + 5] = 0;
+        assert!(chunk_state(Some(&sent), 3, &page[3 * CHUNK..4 * CHUNK]).contains("has changed since its chunk was sent"));
     }
 
     /// `scan_page` skips allocating a hash box on all-zero pages, allocates on the first write,
