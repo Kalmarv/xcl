@@ -2043,6 +2043,7 @@ unsafe extern "system" fn res_release(this: *mut c_void) -> u32 {
         // (a held one is gone when `late_release` lets it go)
         if !held {
             super::placements::gone(this as usize);
+            super::small_tex::gone(this as usize);
         }
         super::depth_uav::forget(this as usize);
         super::title_textures::forget(this as usize);

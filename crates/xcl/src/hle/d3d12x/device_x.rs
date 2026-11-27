@@ -1148,7 +1148,9 @@ pub(super) unsafe extern "system" fn create_placed_resource_x(this: *mut c_void,
             placed_hr = super::vram::place_pages(this, va as usize, &pc, state, clear, console_bytes, riid, ppv);
         }
     }
-    let hr = match placed_hr {
+    // (a small one the shared pages do not take: on a 4 KiB placement, `XCL_SMALL_TEXTURES=1`)
+    let small_hr = if placed_hr.is_none() && !buffer { super::small_tex::place(this, &std::ptr::read_unaligned(d.as_ptr() as *const D3D12_RESOURCE_DESC), state, clear, riid, ppv) } else { None };
+    let hr = match placed_hr.or(small_hr) {
         Some(hr) => hr,
         None => {
             let heap = D3D12_HEAP_PROPERTIES { Type: D3D12_HEAP_TYPE_DEFAULT, ..Default::default() };
@@ -1161,7 +1163,7 @@ pub(super) unsafe extern "system" fn create_placed_resource_x(this: *mut c_void,
             Ok(()) => {
                 real::note_title_address(*ppv as usize, va as usize);
                 super::depth_uav::note_created(*ppv, &x, Some(va as usize), state);
-                super::lut3d::created(if placed_hr.is_some() { "CreatePlacedResourceX (sampled: on shared pages)" } else { "CreatePlacedResourceX (sampled: committed)" }, *ppv, Some(&x), Some(va as usize), true, state);
+                super::lut3d::created(if placed_hr.is_some() { "CreatePlacedResourceX (sampled: on shared pages)" } else if small_hr.is_some() { "CreatePlacedResourceX (sampled: 4 KiB placement)" } else { "CreatePlacedResourceX (sampled: committed)" }, *ppv, Some(&x), Some(va as usize), true, state);
                 return hr;
             }
             Err(e) if once(&M, 4) => {

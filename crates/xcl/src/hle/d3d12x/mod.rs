@@ -42,6 +42,7 @@ pub mod real;
 mod scatter;
 mod shader_cache_session;
 mod sharded;
+mod small_tex;
 pub mod sparse;
 mod standin;
 mod targets;
