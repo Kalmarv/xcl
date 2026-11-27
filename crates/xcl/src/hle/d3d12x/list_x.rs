@@ -6404,11 +6404,11 @@ mod tests {
 
         unsafe {
             ia_set_index_buffer_x(list_ptr, &ib);
-            let before = LISTS.lock().unwrap().as_ref().and_then(|m| m.get(&(list_ptr as usize)).and_then(|s| s.bindings.index_title));
+            let before = recording(list_ptr as usize).lock().unwrap().as_ref().and_then(|m| m.get(&(list_ptr as usize)).and_then(|s| s.bindings.index_title));
             assert_eq!(before, Some((reserved, 64, DXGI_FORMAT_R16_UINT.0)));
 
             ia_set_index_buffer_x(list_ptr, std::ptr::null());
-            let after = LISTS.lock().unwrap().as_ref().and_then(|m| m.get(&(list_ptr as usize)).and_then(|s| s.bindings.index_title));
+            let after = recording(list_ptr as usize).lock().unwrap().as_ref().and_then(|m| m.get(&(list_ptr as usize)).and_then(|s| s.bindings.index_title));
             assert_eq!(after, None, "IASetIndexBuffer(NULL) must clear bindings.index_title");
         }
         on_release(list_ptr as usize);
