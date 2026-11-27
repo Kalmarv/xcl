@@ -304,6 +304,21 @@ pub(super) fn level_pages() -> bool {
     })
 }
 
+/// `XCL_TEXTURE_LEVEL_MAX_TILES=<n>` (read once; a debug switch): an upload gives a level of a
+/// texture with lazy levels its pages only when the level has at most `n` 64 KiB tiles. Larger
+/// levels stay without video memory and read zeros, so the picture is wrong where they are
+/// sampled: it is for measuring a run whose textures fit the video memory budget.
+fn level_tiles_cap() -> u32 {
+    static CAP: std::sync::OnceLock<u32> = std::sync::OnceLock::new();
+    *CAP.get_or_init(|| {
+        let cap = std::env::var("XCL_TEXTURE_LEVEL_MAX_TILES").ok().and_then(|v| v.trim().parse::<u32>().ok()).filter(|&n| n > 0).unwrap_or(u32::MAX);
+        if cap != u32::MAX {
+            crate::xlog_info!("D3D12.X: XCL_TEXTURE_LEVEL_MAX_TILES={cap} - uploads give no pages to a texture level of more than {cap} tiles (it reads zeros)");
+        }
+        cap
+    })
+}
+
 /// `level_pages` for a test (under `VRAM_TEST_LOCK`)
 #[cfg(test)]
 pub(super) static LEVEL_PAGES_FOR_TEST: std::sync::atomic::AtomicBool = std::sync::atomic::AtomicBool::new(false);
@@ -1447,8 +1462,10 @@ pub(super) unsafe fn map_levels(res: &ID3D12Resource, levels: Option<&[u32]>) ->
         };
         wanted.sort_unstable();
         wanted.dedup();
+        // (an upload's levels only: one the GPU writes gets all its pages)
+        let cap = if levels.is_some() { level_tiles_cap() } else { u32::MAX };
         let todo: Vec<(usize, u32, u32, u32, std::ops::Range<u32>)> =
-            wanted.into_iter().filter(|&k| !lv.groups[k].3).map(|k| (k, lv.groups[k].0, lv.groups[k].1, lv.groups[k].2, lv.levels_of(k))).collect();
+            wanted.into_iter().filter(|&k| !lv.groups[k].3 && lv.groups[k].2 <= cap).map(|k| (k, lv.groups[k].0, lv.groups[k].1, lv.groups[k].2, lv.levels_of(k))).collect();
         if todo.is_empty() {
             return Vec::new();
         }
