@@ -657,6 +657,37 @@ fn queue_name(ty: i32) -> &'static str {
     }
 }
 
+/// The measured time of `frames`' calls by kind and, for direct dispatches, by their groups:
+/// (bucket, calls, ns).
+fn by_size(frames: &[FrameRead]) -> Vec<(&'static str, u64, u64)> {
+    const BUCKETS: [&str; 9] = ["compute 1 group", "compute 2-8", "compute 9-69", "compute 70-279", "compute 280+", "mesh <70 groups", "mesh 70+", "indirect", "draws and two-pass batches"];
+    let mut v = [(0u64, 0u64); BUCKETS.len()];
+    for sub in frames.iter().flat_map(|f| &f.submits) {
+        for &(op, start, end) in &sub.calls {
+            let Stamps::Span(t) = stamps(start, end) else { continue };
+            if sub.hz == 0 {
+                continue;
+            }
+            let g = op.size.iter().map(|&x| x as u64).product::<u64>();
+            let k = match (op.program.kind, op.indirect) {
+                (_, true) | (Kind::Pc, _) => 7,
+                (Kind::Compute, false) => match g {
+                    0..=1 => 0,
+                    2..=8 => 1,
+                    9..=69 => 2,
+                    70..=279 => 3,
+                    _ => 4,
+                },
+                (Kind::Mesh(_), false) => if g < 70 { 5 } else { 6 },
+                _ => 8,
+            };
+            v[k].0 += 1;
+            v[k].1 += ticks_ns(t, sub.hz);
+        }
+    }
+    BUCKETS.iter().zip(v).map(|(&k, (c, ns))| (k, c, ns)).collect()
+}
+
 /// The report's lines (each logged after `D3D12.X: GPU times: `).
 fn lines(frames: &[FrameRead], c: &Config, full: bool, heap_count: u32, wave: &dyn Fn(u64) -> Option<&'static str>) -> Vec<String> {
     let (totals, sums) = summarize(frames);
@@ -692,6 +723,7 @@ fn lines(frames: &[FrameRead], c: &Config, full: bool, heap_count: u32, wave: &d
         let subs: Vec<String> = s.submits.iter().enumerate().map(|(k, &(ty, lists, calls, ns))| format!("#{k} {} {lists} lists {calls} calls {:.3} ms", queue_name(ty), ms(ns))).collect();
         out.push(format!("frame ending at present {}: {} submit(s): {}", s.present, subs.len(), subs.join(" | ")));
     }
+    out.push(format!("GPU time by size, ms per frame (calls per frame): {}", by_size(frames).iter().map(|(k, calls, ns)| format!("{k} {:.3} ({:.1})", ms(*ns) / n, *calls as f64 / n)).collect::<Vec<_>>().join(" | ")));
     let top = ranked(&totals, TOP);
     out.push(format!("the {} of {} programs with the most GPU time, ms per frame averaged over {} frame(s):", top.len(), totals.len(), frames.len()));
     for (i, (p, t)) in top.iter().enumerate() {

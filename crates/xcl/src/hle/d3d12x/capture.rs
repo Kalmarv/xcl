@@ -257,6 +257,10 @@ pub(super) enum Op {
     /// their bits), the rectangles, whether it was not done
     Clear { kind: &'static str, view: u64, res: usize, values: [u32; 4], flags: u32, rects: u32, refused: bool },
     Resolve { dst: usize, dst_sub: u32, src: usize, src_sub: u32, format: i32, region: Option<(u32, u32, Option<[i32; 4]>, i32)> },
+    /// a console flush (`pipeline`: FlushPipelineX; `gpu_cache_range` / `shader_cache_range`:
+    /// FlushGpuCacheRangeX / FlushShaderCacheRangeX) with its flags, wait flags and range, and
+    /// whether XCL sent a UAV barrier for it
+    Flush { kind: &'static str, flags: u32, wait: u32, va: u64, bytes: u64, barrier: bool },
 }
 
 impl Op {
@@ -283,6 +287,7 @@ impl Op {
             Op::Copy { .. } => "copy",
             Op::Clear { .. } => "clear",
             Op::Resolve { .. } => "resolve",
+            Op::Flush { .. } => "flush",
         }
     }
 }
@@ -1195,6 +1200,14 @@ fn entry_json(i: usize, e: &Entry) -> Value {
                     if let Some((x, y, rect, mode)) = region {
                         m.insert("region".into(), json!({"x": x, "y": y, "rect": rect, "mode": mode}));
                     }
+                }
+                Op::Flush { kind, flags, wait, va, bytes, barrier } => {
+                    m.insert("kind".into(), json!(kind));
+                    m.insert("flags".into(), json!(format!("{flags:#x}")));
+                    m.insert("wait".into(), json!(format!("{wait:#x}")));
+                    m.insert("va".into(), json!(format!("{va:#x}")));
+                    m.insert("bytes".into(), json!(bytes));
+                    m.insert("barrier".into(), json!(barrier));
                 }
             }
         }

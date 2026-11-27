@@ -3628,14 +3628,17 @@ unsafe fn flush_barrier(list: *mut c_void) {
 /// behind the one that wrote what it reads – a retail title calls them thousands of times a minute,
 /// and answered with nothing its passes had no order there. The PC has no ranges of caches: a UAV
 /// barrier for everything.
-pub(super) unsafe extern "system" fn flush_cache_range_x(this: *mut c_void, flags: u32, wait: u32, _va: u64, bytes: u64) {
-    if (flags != 0 || wait != 0) && bytes != 0 {
+pub(super) unsafe extern "system" fn flush_cache_range_x(this: *mut c_void, flags: u32, wait: u32, va: u64, bytes: u64) {
+    let barrier = (flags != 0 || wait != 0) && bytes != 0;
+    let _c = super::capture::op(this, || Some(super::capture::Op::Flush { kind: "cache_range", flags, wait, va, bytes, barrier }));
+    if barrier {
         flush_barrier(this);
     }
 }
 
 /// command list #67 (newer layout: #69) FlushPipelineX(flags, address, bytes)
-pub(super) unsafe extern "system" fn flush_pipeline_x(this: *mut c_void, _flags: u32, _va: u64, _bytes: u64) {
+pub(super) unsafe extern "system" fn flush_pipeline_x(this: *mut c_void, flags: u32, va: u64, bytes: u64) {
+    let _c = super::capture::op(this, || Some(super::capture::Op::Flush { kind: "pipeline", flags, wait: 0, va, bytes, barrier: true }));
     flush_barrier(this);
 }
 
