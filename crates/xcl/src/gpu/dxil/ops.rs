@@ -765,18 +765,26 @@ impl Shader {
 
 // --------------------------------------------------------------- textures
 
+/// Opt-in (`XCL_UNIFORM_TEX=1`): emit uniform `createHandleFromHeap` for texture and sampler
+/// handles (GCN/RDNA `T#`/`S#` operands live in SGPRs and are wave-uniform within each hardware
+/// wave, avoiding NVIDIA `NonUniformResourceIndex` waterfall loops around every sample/load).
+pub fn uniform_tex_enabled() -> bool {
+    static ON: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
+    *ON.get_or_init(|| std::env::var("XCL_UNIFORM_TEX").is_ok_and(|v| v.trim() == "1"))
+}
+
 impl Shader {
     /// A texture from `ResourceDescriptorHeap[index]` with `ncomp`
     /// components of `comp` (`Texture2D<float4>` = `(D2, false, F32, 4)`).
     pub fn heap_texture(&mut self, index: Value, kind: TexKind, uav: bool, comp: CompType, ncomp: u32, nonuniform: bool) -> Texture {
         assert!(!(uav && matches!(kind, TexKind::D2MS | TexKind::D2MSArray)), "RWTexture2DMS needs SM 6.7");
-        let h = self.handle_from_heap(index, false, nonuniform);
+        let h = self.handle_from_heap(index, false, nonuniform && !uniform_tex_enabled());
         let handle = self.annotate(h, kind as u32 | if uav { 0x1000 } else { 0 }, typed_props(comp, ncomp));
         Texture { handle, kind, uav, comp }
     }
     /// A sampler from `SamplerDescriptorHeap[index]`.
     pub fn heap_sampler(&mut self, index: Value, comparison: bool, nonuniform: bool) -> Sampler {
-        let h = self.handle_from_heap(index, true, nonuniform);
+        let h = self.handle_from_heap(index, true, nonuniform && !uniform_tex_enabled());
         let handle = self.annotate(h, 14 | if comparison { 0x8000 } else { 0 }, 0);
         Sampler { handle, comparison }
     }

@@ -1190,14 +1190,17 @@ pub(super) unsafe fn remap_if_unmapped(res: &ID3D12Resource) -> bool {
     true
 }
 
-/// Opt-in (`XCL_EVICT_UNVIEWED=1`): evict level-paged sampled textures that have had no live
-/// shared-heap view for 2 s, remapping and re-uploading on demand if viewed again.
-fn evict_unviewed_enabled() -> bool {
-    static ON: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
-    *ON.get_or_init(|| std::env::var("XCL_EVICT_UNVIEWED").is_ok_and(|v| v.trim() == "1"))
+/// Opt-in (`XCL_EVICT_UNVIEWED=<secs>`, `1` = 10 s): evict level-paged sampled textures that have
+/// had no live shared-heap view for `<secs>` seconds, remapping and re-uploading on demand if viewed again.
+fn evict_unviewed_age() -> Option<std::time::Duration> {
+    static AGE: std::sync::OnceLock<Option<std::time::Duration>> = std::sync::OnceLock::new();
+    *AGE.get_or_init(|| {
+        let v = std::env::var("XCL_EVICT_UNVIEWED").ok()?;
+        let n = v.trim().parse::<u64>().ok()?;
+        if n == 0 { None } else { Some(std::time::Duration::from_secs(if n == 1 { 10 } else { n })) }
+    })
 }
 
-const EVICT_UNVIEWED_AGE: std::time::Duration = std::time::Duration::from_secs(2);
 const EVICT_UNVIEWED_BATCH: usize = 1024;
 static EVICTED_UNVIEWED: super::sharded::Sharded<u8> = super::sharded::Sharded::new();
 static EVICTED_COUNT: std::sync::atomic::AtomicUsize = std::sync::atomic::AtomicUsize::new(0);
@@ -1359,7 +1362,7 @@ pub(super) unsafe fn before_execute(queue: &ID3D12CommandQueue) {
             if now.duration_since(pages.last_reclaim) >= std::time::Duration::from_secs(1) {
                 pages.last_reclaim = now;
                 do_reclaim = true;
-                if evict_unviewed_enabled() {
+                if let Some(min_age) = evict_unviewed_age() {
                     for (&res, t) in pages.targets.iter_mut() {
                         if t.levels.is_none() || !t.mapped || (t.used.is_empty() && t.used_extra.is_empty()) {
                             continue;
@@ -1368,7 +1371,7 @@ pub(super) unsafe fn before_execute(queue: &ID3D12CommandQueue) {
                             t.unviewed_since = None;
                         } else {
                             let since = *t.unviewed_since.get_or_insert(now);
-                            if now.duration_since(since) >= EVICT_UNVIEWED_AGE {
+                            if now.duration_since(since) >= min_age {
                                 evict_candidates.push(res);
                             }
                         }

@@ -314,6 +314,12 @@ mod translated {
             } else { id };
             // `XCL_X_LDS_ORDER=0`: the split wave64 form without its LDS order, in both translators
             let id = if crate::gpu::recomp::emit::lds_order_wanted() { id } else { identity_for(&id.to_string(), "xcl-x-lds-order-0") };
+            // `XCL_UNIFORM_TEX=1`: uniform texture/sampler handles in direct DXIL
+            let id = if Backend::current() != Backend::Hlsl && crate::gpu::dxil::ops::uniform_tex_enabled() {
+                identity_for(&id.to_string(), "xcl-uniform-tex-1")
+            } else {
+                id
+            };
             // `XCL_PER_LANE=1` (direct compute only): its entries under their own identity
             if Backend::current() != Backend::Hlsl && crate::gpu::recomp::lower_dxil::enabled() {
                 identity_for(&id.to_string(), concat!("xcl-per-lane-", env!("XCL_PER_LANE_SOURCE_ID")))
