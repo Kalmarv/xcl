@@ -170,6 +170,13 @@ pub unsafe fn shared_heap(dev: &ID3D12Device) -> bool {
         };
         crate::xlog_info!("console descriptor heaps: one shader-visible PC heap of {cap} view descriptors for all of them");
         null_views(dev, heap.GetCPUDescriptorHandleForHeapStart().ptr as u64, dev.GetDescriptorHandleIncrementSize(D3D12_DESCRIPTOR_HEAP_TYPE_CBV_SRV_UAV));
+        let mut next = crate::gpu::recomp::BYTE_HEAP_BASE;
+        if crate::gpu::recomp::pso::byte_store_program().is_some() {
+            next += crate::gpu::uma::MAX_WINDOWS as u32 * crate::gpu::recomp::BYTE_SEGMENTS;
+            if next > cap {
+                return false;
+            }
+        }
         *g = Some(Global {
             dev: dev.clone(),
             cpu: heap.GetCPUDescriptorHandleForHeapStart().ptr as u64,
@@ -177,8 +184,7 @@ pub unsafe fn shared_heap(dev: &ID3D12Device) -> bool {
             inc: dev.GetDescriptorHandleIncrementSize(D3D12_DESCRIPTOR_HEAP_TYPE_CBV_SRV_UAV),
             heap,
             cap,
-            // the memory windows' raw UAVs (`set_window_views`) come first
-            next: crate::gpu::recomp::MEM_HEAP_BASE + crate::gpu::uma::MAX_HEAP_WINDOWS as u32,
+            next,
             free: Vec::new(),
         });
     }
@@ -210,6 +216,12 @@ unsafe fn null_views(dev: &ID3D12Device, cpu: u64, inc: u32) {
     }
 }
 
+static BYTE_VIEWS_UNAVAILABLE: std::sync::atomic::AtomicBool = std::sync::atomic::AtomicBool::new(false);
+
+pub(crate) fn byte_views_unavailable() -> bool {
+    BYTE_VIEWS_UNAVAILABLE.load(std::sync::atomic::Ordering::Relaxed)
+}
+
 static WINDOW_VIEWS_FAILED: std::sync::atomic::AtomicBool = std::sync::atomic::AtomicBool::new(false);
 
 /// Whether the memory windows could not be put in the shared heap (`set_window_views`):
@@ -231,6 +243,16 @@ pub unsafe fn set_window_views(dev: &ID3D12Device, windows: &[(usize, usize)]) -
             let s = g.as_ref().unwrap();
             (s.dev.clone(), s.cpu, s.inc)
         };
+        let mut bytes_enabled = count == 4 && crate::gpu::recomp::pso::byte_store_program().is_some();
+        if bytes_enabled {
+            use windows::Win32::Graphics::Dxgi::Common::DXGI_FORMAT_R8_UINT;
+            let mut support = D3D12_FEATURE_DATA_FORMAT_SUPPORT { Format: DXGI_FORMAT_R8_UINT, ..Default::default() };
+            bytes_enabled = device.CheckFeatureSupport(D3D12_FEATURE_FORMAT_SUPPORT, (&raw mut support).cast(), std::mem::size_of_val(&support) as u32).is_ok()
+                && support.Support1.contains(D3D12_FORMAT_SUPPORT1_BUFFER | D3D12_FORMAT_SUPPORT1_TYPED_UNORDERED_ACCESS_VIEW)
+                && support.Support2.contains(D3D12_FORMAT_SUPPORT2_UAV_TYPED_STORE);
+            BYTE_VIEWS_UNAVAILABLE.store(!bytes_enabled, std::sync::atomic::Ordering::Relaxed);
+            crate::xlog_info!("byte stores: R8_UINT buffer UAVs available={bytes_enabled}, first slot {}", crate::gpu::recomp::BYTE_HEAP_BASE);
+        }
         // The device may be adopted: its UAV hook re-enters descriptor bookkeeping.
         for k in 0..count {
             let (raw, bytes) = windows.get(k).copied().filter(|w| w.0 != 0).unwrap_or(windows[0]);
@@ -238,6 +260,9 @@ pub unsafe fn set_window_views(dev: &ID3D12Device, windows: &[(usize, usize)]) -
             let Some(r) = ID3D12Resource::from_raw_borrowed(&raw) else { continue };
             let at = D3D12_CPU_DESCRIPTOR_HANDLE { ptr: (cpu + (crate::gpu::recomp::MEM_HEAP_BASE as u64 + k as u64) * inc as u64) as usize };
             device.CreateUnorderedAccessView(r, None::<&ID3D12Resource>, Some(&crate::gpu::recomp::runner::raw_window_uav(bytes as u64)), at);
+            if bytes_enabled {
+                set_byte_window_views(&device, r, bytes, cpu, inc, k);
+            }
         }
         true
     };
@@ -246,6 +271,30 @@ pub unsafe fn set_window_views(dev: &ID3D12Device, windows: &[(usize, usize)]) -
         crate::xlog_warn!("memory windows: could not bind {count} window(s) in the shared descriptor heap");
     }
     ok
+}
+
+/// One typed UAV may address at most 2^27 elements. Empty segments use a null UAV
+/// so writes outside the valid bytes have the same bounds as the window's raw view.
+unsafe fn set_byte_window_views(dev: &ID3D12Device, resource: &ID3D12Resource, bytes: usize, cpu: u64, inc: u32, window: usize) {
+    use crate::gpu::recomp::{BYTE_HEAP_BASE, BYTE_SEGMENTS, BYTE_SEGMENT_SHIFT};
+    use windows::Win32::Graphics::Dxgi::Common::DXGI_FORMAT_R8_UINT;
+    let raw = crate::gpu::recomp::runner::raw_window_uav(bytes as u64);
+    let size = u64::from(raw.Anonymous.Buffer.NumElements) * 4;
+    let segment = 1u64 << BYTE_SEGMENT_SHIFT;
+    for part in 0..BYTE_SEGMENTS {
+        let offset = u64::from(part) * segment;
+        let len = size.saturating_sub(offset).min(segment);
+        let slot = BYTE_HEAP_BASE + window as u32 * BYTE_SEGMENTS + part;
+        let at = D3D12_CPU_DESCRIPTOR_HANDLE { ptr: (cpu + u64::from(slot) * u64::from(inc)) as usize };
+        let view = D3D12_UNORDERED_ACCESS_VIEW_DESC {
+            Format: DXGI_FORMAT_R8_UINT,
+            ViewDimension: D3D12_UAV_DIMENSION_BUFFER,
+            Anonymous: D3D12_UNORDERED_ACCESS_VIEW_DESC_0 { Buffer: D3D12_BUFFER_UAV {
+                FirstElement: if len > 0 { offset } else { 0 }, NumElements: len.max(1) as u32, ..Default::default()
+            } },
+        };
+        dev.CreateUnorderedAccessView((len > 0).then_some(resource), None::<&ID3D12Resource>, Some(&view), at);
+    }
 }
 
 /// `count` descriptors of the shared heap: the index of the first. None: no shared heap, or
