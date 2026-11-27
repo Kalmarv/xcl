@@ -572,6 +572,13 @@ pub(super) unsafe extern "system" fn ia_set_topology_x(this: *mut c_void, t: u32
             crate::xlog_warn!("D3D12.X: IASetPrimitiveTopology({t}) – a console topology the PC does not have{}", if t == RECT_LIST { ": rect lists are drawn as triangle lists, completed by a GS in rect list pipelines" } else { "" });
         }
     }
+    if super::bind::queue_topology(this, t) {
+        return;
+    }
+    apply_topology(this, t);
+}
+
+pub(super) unsafe fn apply_topology(this: *mut c_void, t: u32) {
     let rect = t == RECT_LIST;
     let t = if t == RECT_LIST { windows::Win32::Graphics::Direct3D::D3D_PRIMITIVE_TOPOLOGY_TRIANGLELIST.0 as u32 } else { t };
     with_bindings(this, |b| {
@@ -616,6 +623,13 @@ pub(super) unsafe extern "system" fn om_set_blend_factor_x(this: *mut c_void, f:
 
 /// console #24 OMSetStencilRef (PC #24)
 pub(super) unsafe extern "system" fn om_set_stencil_ref_x(this: *mut c_void, r: u32) {
+    if super::bind::queue_stencil_ref(this, r) {
+        return;
+    }
+    apply_stencil_ref(this, r);
+}
+
+pub(super) unsafe fn apply_stencil_ref(this: *mut c_void, r: u32) {
     with_bindings(this, |b| b.stencil = Some(r));
     pc::<unsafe extern "system" fn(*mut c_void, u32)>(this, PC_OM_SET_STENCIL_REF)(this, r)
 }

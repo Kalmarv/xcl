@@ -1137,6 +1137,8 @@ struct DrawSnap {
 enum RunItem {
     Draw(DeferredDraw),
     Bind { pso: usize, _held: Option<ID3D12PipelineState> },
+    StencilRef(u32),
+    Topology(u32),
 }
 
 /// A run item as `batch_commands` takes it.
@@ -1144,6 +1146,8 @@ enum RunItem {
 enum Step {
     Draw(DrawSnap),
     Bind(usize),
+    StencilRef(u32),
+    Topology(u32),
 }
 
 impl RunItem {
@@ -1151,6 +1155,8 @@ impl RunItem {
         match self {
             RunItem::Draw(d) => Step::Draw(d.snap),
             RunItem::Bind { pso, .. } => Step::Bind(*pso),
+            RunItem::StencilRef(r) => Step::StencilRef(*r),
+            RunItem::Topology(t) => Step::Topology(*t),
         }
     }
 }
@@ -1224,7 +1230,7 @@ fn batch_region_bytes(need: u64) -> u64 {
 /// the console's own methods – records the run first.
 fn keeps_two_pass_batch(slot: usize, newer_layout: bool) -> bool {
     let (ei, dm) = if newer_layout { (61, 129) } else { (59, 127) };
-    matches!(slot, 0..=8 | 25 | 33..=46) || slot == ei || slot == dm
+    matches!(slot, 0..=8 | 20 | 24 | 25 | 33..=46) || slot == ei || slot == dm
 }
 
 /// Whether a list call through `slot` records the list's deferred draws first.
@@ -1359,6 +1365,10 @@ enum Cmd {
     Indirect(usize, usize, u64),
     /// the title's SetPipelineState to the pipeline `p`, as without a run (`real::bind_pipeline`)
     Bind(usize),
+    /// the title's OMSetStencilRef between deferred draws, replayed before subsequent mesh passes
+    StencilRef(u32),
+    /// the title's IASetPrimitiveTopology between deferred draws, replayed before subsequent mesh passes
+    Topology(u32),
     /// an `XCL_GPU_TIMES` span: the rewrites and compute passes (None), the mesh pass of draw `d`
     TimesBegin(Option<usize>),
     TimesEnd,
@@ -1428,6 +1438,14 @@ fn batch_commands(steps: &[Step], records: usize, open: bool) -> Vec<Cmd> {
                 pso = 0;
                 continue;
             }
+            Step::StencilRef(r) => {
+                v.push(Cmd::StencilRef(*r));
+                continue;
+            }
+            Step::Topology(t) => {
+                v.push(Cmd::Topology(*t));
+                continue;
+            }
             Step::Draw(d) => d,
         };
         v.push(Cmd::TimesBegin(Some(i)));
@@ -1479,6 +1497,8 @@ unsafe fn emit_commands(this: *mut c_void, list: &ID3D12GraphicsCommandList, cmd
             Cmd::DispatchMesh(n) => pc_dm(this, *n, 1, 1),
             Cmd::Indirect(sig, buf, at) => pc_ei(this, *sig, 1, *buf, *at, 0, 0),
             Cmd::Bind(p) => super::real::bind_pipeline(this, *p as *mut c_void),
+            Cmd::StencilRef(r) => super::list_x::apply_stencil_ref(this, *r),
+            Cmd::Topology(t) => super::list_x::apply_topology(this, *t),
             Cmd::TimesBegin(None) => super::gpu_times::before(this, 0, super::gpu_times::Kind::MeshBatch, [draws.len() as u32, 0, 0], false),
             Cmd::TimesBegin(Some(d)) => {
                 let d = &draws[*d];
@@ -1505,10 +1525,13 @@ pub(super) unsafe fn flush_two_pass(this: *mut c_void, why: RunEnd) {
     };
     let draws: Vec<&DeferredDraw> = items.iter().filter_map(|i| if let RunItem::Draw(d) = i { Some(d) } else { None }).collect();
     if draws.is_empty() {
-        // (pipeline sets only: as they would have gone)
+        // (queued state sets only: as they would have gone)
         for i in &items {
-            if let RunItem::Bind { pso: p, .. } = i {
-                super::real::bind_pipeline(this, *p as *mut c_void);
+            match i {
+                RunItem::Bind { pso: p, .. } => super::real::bind_pipeline(this, *p as *mut c_void),
+                RunItem::StencilRef(r) => super::list_x::apply_stencil_ref(this, *r),
+                RunItem::Topology(t) => super::list_x::apply_topology(this, *t),
+                RunItem::Draw(_) => {}
             }
         }
         return;
@@ -1615,6 +1638,26 @@ unsafe fn batch_region(this: *mut c_void, region: u64) -> Result<u64, String> {
     va.map(|va| va + at).ok_or_else(|| "no batch record buffer".into())
 }
 
+/// Queue `OMSetStencilRef` into the list's deferred two-pass run when deferring, so it replays
+/// in title order between mesh passes instead of flushing the batch.
+pub(super) unsafe fn queue_stencil_ref(this: *mut c_void, r: u32) -> bool {
+    if DEFERRING_LISTS.load(Ordering::Relaxed) == 0 || !DEFERRING.contains(this as usize) {
+        return false;
+    }
+    with(this, |s| s.deferred.push(RunItem::StencilRef(r)));
+    true
+}
+
+/// Queue `IASetPrimitiveTopology` into the list's deferred two-pass run when deferring, so it
+/// replays in title order between mesh passes instead of flushing the batch.
+pub(super) unsafe fn queue_topology(this: *mut c_void, t: u32) -> bool {
+    if DEFERRING_LISTS.load(Ordering::Relaxed) == 0 || !DEFERRING.contains(this as usize) {
+        return false;
+    }
+    with(this, |s| s.deferred.push(RunItem::Topology(t)));
+    true
+}
+
 /// `draw` deferred on `this`; the run is recorded when it has `batch_most` draws.
 unsafe fn push_deferred(this: *mut c_void, draw: DeferredDraw) {
     let n = with(this, |s| {
@@ -1707,9 +1750,21 @@ unsafe fn held_pso(pso: usize) -> Option<ID3D12PipelineState> {
 /// (`SCRATCH_BLOCK`), so a freed one of either serves both.
 const RECORD_MIN: u64 = 1 << 20;
 const RECORD_MAX: u64 = 128 << 20;
-/// Record bytes an ExecuteIndirect of two-pass commands asks for: a command's groups are known on
-/// the GPU only (`SCALE_ARGS_HLSL` keeps them to what fits).
+/// Record bytes an ExecuteIndirect of two-pass commands asks for (`XCL_TWO_PASS_INDIRECT_MB`,
+/// 32 MiB by default): a command's groups are known on the GPU only (`SCALE_ARGS_HLSL` keeps them
+/// to what fits).
 const INDIRECT_RECORDS: u64 = 32 << 20;
+
+fn indirect_records_cap() -> u64 {
+    static BYTES: std::sync::OnceLock<u64> = std::sync::OnceLock::new();
+    *BYTES.get_or_init(|| {
+        std::env::var("XCL_TWO_PASS_INDIRECT_MB")
+            .ok()
+            .and_then(|v| v.trim().parse::<u64>().ok())
+            .map(|mb| mb.clamp(1, 128) << 20)
+            .unwrap_or(INDIRECT_RECORDS)
+    })
+}
 
 /// Bytes of a record buffer for `need` bytes of records: the power of two at or above it, from
 /// `RECORD_MIN` to `RECORD_MAX`. A few sizes go from recording to recording through `FREE_RES`; a
@@ -1718,10 +1773,10 @@ fn record_buffer_bytes(need: u64) -> u64 {
     need.clamp(RECORD_MIN, RECORD_MAX).next_power_of_two()
 }
 
-/// Record bytes a two-pass ExecuteIndirect asks for: `INDIRECT_RECORDS`, or less when a command's
-/// groups (at most 65 535 / `split` in X, `record_groups`) need less – the same groups fit.
+/// Record bytes a two-pass ExecuteIndirect asks for: `indirect_records_cap()`, or less when a
+/// command's groups (at most 65 535 / `split` in X, `record_groups`) need less – the same groups fit.
 fn indirect_record_need(record_bytes: u64, split: u32) -> u64 {
-    INDIRECT_RECORDS.min(record_bytes.saturating_mul(65_535 / split.max(1) as u64))
+    indirect_records_cap().min(record_bytes.saturating_mul(65_535 / split.max(1) as u64))
 }
 
 /// `XCL_TWO_PASS_SHARED=1`: share one device-wide two-pass record buffer across all direct command
@@ -5251,6 +5306,9 @@ void main(uint t : SV_GroupIndex) {
                     pso = p;
                     out.push(Call { call: c.clone(), pso, rs: 0, views: BTreeMap::new() });
                 }
+                Cmd::StencilRef(_) | Cmd::Topology(_) => {
+                    out.push(Call { call: c.clone(), pso, rs: 0, views: BTreeMap::new() });
+                }
                 Cmd::Barriers { .. } | Cmd::TimesBegin(_) | Cmd::TimesEnd => {}
             }
         }
@@ -5293,6 +5351,8 @@ void main(uint t : SV_GroupIndex) {
         for s in &run {
             match s {
                 Step::Bind(p) => alone.push(calls(&[Cmd::Bind(*p)])[0].clone()),
+                Step::StencilRef(r) => alone.push(calls(&[Cmd::StencilRef(*r)])[0].clone()),
+                Step::Topology(t) => alone.push(calls(&[Cmd::Topology(*t)])[0].clone()),
                 Step::Draw(d) => alone.extend(calls(&unbatched_commands(d))),
             }
         }
@@ -5462,11 +5522,11 @@ void main(uint t : SV_GroupIndex) {
         for newer in [false, true] {
             let kept: Vec<usize> = (0..600).filter(|&s| keeps_two_pass_batch(s, newer)).collect();
             let (ei, dm) = if newer { (61, 129) } else { (59, 127) };
-            let want: Vec<usize> = (0..=8).chain([25]).chain(33..=46).chain([ei, dm]).collect();
+            let want: Vec<usize> = (0..=8).chain([20, 24, 25]).chain(33..=46).chain([ei, dm]).collect();
             assert_eq!(kept, want, "newer layout: {newer}");
             // pipelines, barriers, draws, dispatches, copies, clears, IA / RS / OM state, heaps,
             // queries, predication, bundles, markers, Close, Reset, the console's own methods
-            for slot in [26, 12, 13, 14, 15, 16, 17, 18, 19, 20, 21, 22, 23, 24, 27, 28, 29, 30, 31, 32, 47, 48, 49, 50, 51, 52, 53, 54, 55, 56, 57, 58, 9, 10, 11, 60, 67, 78, 81, 85, 93, 104, 105, 106, 124, 125, 139, 146, 148] {
+            for slot in [26, 12, 13, 14, 15, 16, 17, 18, 19, 21, 22, 23, 27, 28, 29, 30, 31, 32, 47, 48, 49, 50, 51, 52, 53, 54, 55, 56, 57, 58, 9, 10, 11, 60, 67, 78, 81, 85, 93, 104, 105, 106, 124, 125, 139, 146, 148] {
                 assert!(flush_wanted(slot, newer, true, true), "slot {slot}, newer layout: {newer}");
             }
             // the other layout's DispatchMesh / ExecuteIndirect slots are other methods there
