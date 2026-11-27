@@ -3418,6 +3418,37 @@ pub(super) fn dispatch_loop_budget_wanted() -> bool {
     *ON.get_or_init(|| std::env::var("XCL_DISPATCH_LOOP_BUDGET").map_or(true, |v| v.trim() != "0"))
 }
 
+/// `recomp::dispatch_loop_budget` of a dispatch, times `n` under `XCL_DISPATCH_LOOP_SCALE=<n>`
+/// or `=<n>,<from s>,<to s>` (the log's clock; read once). A debug switch: a program whose GPU
+/// time grows with it runs a loop until the budget ends it, and one whose time stays does not.
+pub(super) fn scaled_loop_budget(groups: [u32; 3]) -> u32 {
+    static SCALE: std::sync::OnceLock<(u32, f64, f64)> = std::sync::OnceLock::new();
+    static SAID: std::sync::atomic::AtomicU8 = std::sync::atomic::AtomicU8::new(0);
+    let &(n, from, to) = SCALE.get_or_init(|| {
+        let v = std::env::var("XCL_DISPATCH_LOOP_SCALE").unwrap_or_default();
+        let mut it = v.split(',').map(|s| s.trim());
+        let n = it.next().and_then(|s| s.parse::<u32>().ok()).unwrap_or(1).max(1);
+        let from = it.next().and_then(|s| s.parse::<f64>().ok()).unwrap_or(0.0);
+        let to = it.next().and_then(|s| s.parse::<f64>().ok()).unwrap_or(f64::MAX);
+        (n, from, to)
+    });
+    let budget = crate::gpu::recomp::dispatch_loop_budget(groups);
+    if n == 1 {
+        return budget;
+    }
+    let now = crate::log::uptime();
+    let on = now >= from && now < to;
+    let state = if on { 1 } else if now >= to { 2 } else { 0 };
+    if state != 0 && SAID.swap(state, std::sync::atomic::Ordering::Relaxed) != state {
+        crate::xlog_info!("D3D12.X: XCL_DISPATCH_LOOP_SCALE: loop budgets are {} from here on", if on { format!("times {n}") } else { "as they were".into() });
+    }
+    if on {
+        budget.saturating_mul(n)
+    } else {
+        budget
+    }
+}
+
 /// A dispatch of `x` × `y` × `z` groups as D3D12 takes it: (the count for
 /// `recomp::IO_GROUP_LIMIT` – 0: not folded –, the groups to dispatch). More than 65 535 in X
 /// with 1 in Y is folded into Y; any other count past 65 535 is clamped (logged once).
@@ -3534,7 +3565,7 @@ unsafe fn bind_abi(this: *mut c_void, list: &ID3D12GraphicsCommandList, pso: usi
     io.resize(crate::gpu::recomp::KERNEL_SGPRS, 0);
     io[crate::gpu::recomp::IO_UMA_BASE_HI] = (u.base() >> 32) as u32;
     if let Some(groups) = groups.filter(|_| dispatch_loop_budget_wanted()) {
-        io[crate::gpu::recomp::IO_LOOP_BUDGET] = crate::gpu::recomp::dispatch_loop_budget(groups);
+        io[crate::gpu::recomp::IO_LOOP_BUDGET] = scaled_loop_budget(groups);
     }
     io[crate::gpu::recomp::IO_GROUP_LIMIT] = group_limit;
     if !gfx {

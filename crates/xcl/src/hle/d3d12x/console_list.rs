@@ -971,7 +971,7 @@ pub unsafe fn close(obj: *mut c_void) -> Result<Translation, String> {
                         io[crate::gpu::recomp::IO_UMA_BASE_HI] = (u.base() >> 32) as u32;
                         // (the console's counts: the groups that run, also when folded below)
                         if super::bind::dispatch_loop_budget_wanted() {
-                            io[crate::gpu::recomp::IO_LOOP_BUDGET] = crate::gpu::recomp::dispatch_loop_budget([x, y, z]);
+                            io[crate::gpu::recomp::IO_LOOP_BUDGET] = super::bind::scaled_loop_budget([x, y, z]);
                         }
                         // more groups in X than D3D12 takes: folded (`recomp::IO_GROUP_LIMIT`)
                         let (limit, folded) = super::bind::fold(x, y, z);
