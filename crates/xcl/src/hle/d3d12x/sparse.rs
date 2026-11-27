@@ -4833,12 +4833,13 @@ mod tests {
         dev.expect("D3D12 device")
     }
 
-    /// Whether `dev` is a software device (WARP).
+    /// Whether `dev` is a software device (WARP, or the Microsoft Basic Render Driver CI runs on,
+    /// which is the default adapter there and need not carry DXGI_ADAPTER_FLAG_SOFTWARE).
     unsafe fn software(dev: &ID3D12Device) -> bool {
         use windows::Win32::Graphics::Dxgi::*;
         let Ok(factory) = CreateDXGIFactory1::<IDXGIFactory4>() else { return false };
         let adapter: windows::core::Result<IDXGIAdapter1> = factory.EnumAdapterByLuid(dev.GetAdapterLuid());
-        adapter.and_then(|a| a.GetDesc1()).is_ok_and(|d| d.Flags & DXGI_ADAPTER_FLAG_SOFTWARE.0 as u32 != 0)
+        adapter.and_then(|a| a.GetDesc1()).is_ok_and(|d| d.Flags & DXGI_ADAPTER_FLAG_SOFTWARE.0 as u32 != 0 || (d.VendorId, d.DeviceId) == (0x1414, 0x8c))
     }
 
     /// The small ones of an upload's runs go up in dispatches: each lands where it belongs (far
