@@ -5434,6 +5434,40 @@ void main(uint t : SV_GroupIndex) {
         assert_eq!(cmds.iter().filter(|c| matches!(c, Cmd::Barriers { .. })).count(), 3, "still three ResourceBarrier calls");
     }
 
+    /// A run with the title's stencil reference, topology and scissor sets between its draws: the
+    /// sets come among the mesh passes where the title made them (each mesh pass draws with the
+    /// state of its draw, as the unbatched path gives it), none among the compute passes.
+    #[test]
+    fn state_sets_in_a_run_come_between_the_mesh_passes_in_the_titles_order() {
+        let run = vec![
+            Step::Draw(snap(0, None)),
+            Step::StencilRef(3),
+            Step::Draw(snap(1, Some(0xB1))),
+            Step::Scissors(vec![[0, 0, 640, 360]]),
+            Step::Topology(4),
+            Step::Draw(snap(2, None)),
+            Step::Scissors(Vec::new()),
+            Step::Draw(snap(3, None)),
+        ];
+        let cmds = batch_commands(&run, 0x900, false);
+        let mut alone = Vec::new();
+        for s in &run {
+            match s {
+                Step::StencilRef(r) => alone.push(Cmd::StencilRef(*r)),
+                Step::Topology(t) => alone.push(Cmd::Topology(*t)),
+                Step::Scissors(r) => alone.push(Cmd::Scissors(r.clone())),
+                Step::Draw(d) => alone.extend(unbatched_commands(d)),
+                Step::Bind(p) => alone.push(Cmd::Bind(*p)),
+            }
+        }
+        let mesh_side = |c: &[Cmd]| -> Vec<Cmd> {
+            c.iter().filter(|x| matches!(x, Cmd::StencilRef(_) | Cmd::Topology(_) | Cmd::Scissors(_) | Cmd::DispatchMesh(_) | Cmd::Indirect(0xD1, ..))).cloned().collect()
+        };
+        assert_eq!(mesh_side(&cmds), mesh_side(&alone));
+        let first_mesh = cmds.iter().position(|c| matches!(c, Cmd::TimesBegin(Some(_)))).unwrap();
+        assert!(!cmds[..first_mesh].iter().any(|c| matches!(c, Cmd::StencilRef(_) | Cmd::Topology(_) | Cmd::Scissors(_))), "no state set among the compute passes");
+    }
+
     /// SetPipelineState with no deferred draws binds as it always did; with them a two-pass
     /// pipeline goes into the run and any other pipeline records the run first. Into the run, it
     /// becomes the pipeline the next draws resolve, and nothing is recorded yet.
