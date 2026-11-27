@@ -64,6 +64,9 @@ struct State {
 }
 
 static STATE: Mutex<Option<State>> = Mutex::new(None);
+// Serialize map/copy-back with page and space release. Fault handlers use STATE while a
+// mapping is open, so STATE itself cannot be held across the native operations.
+static MAPPINGS: Mutex<()> = Mutex::new(());
 
 fn with<R>(f: impl FnOnce(&mut State) -> R) -> R {
     let mut g = STATE.lock().unwrap_or_else(|e| e.into_inner());
@@ -128,6 +131,11 @@ pub fn in_space(p: usize) -> bool {
 /// `VirtualFree` of an address in a space: release (the whole space) unmaps its pages and gives
 /// the address space back; decommit unmaps the pages of the range. None: not a space.
 pub unsafe fn free_space(addr: usize, size: usize, t: u32) -> Option<bool> {
+    // VirtualFree also reaches this for addresses outside alias spaces.
+    if !with(|s| s.in_space(addr)) {
+        return None;
+    }
+    let _mapping = MAPPINGS.lock().unwrap_or_else(|e| e.into_inner());
     let (base, len) = with(|s| s.spaces.range(..=addr).next_back().filter(|(&b, &n)| addr < b + n).map(|(&b, &n)| (b, n)))?;
     if t & mem::MEM_RELEASE != 0 {
         if addr != base || size != 0 {
@@ -184,6 +192,7 @@ pub unsafe fn allocate(n: usize, arr: *mut usize) -> bool {
 /// The title frees `pages`. Addresses that show one keep showing it (the title is meant to unmap
 /// first); a block whose pages are all freed loses its home.
 pub unsafe fn free(pages: &[usize]) {
+    let _mapping = MAPPINGS.lock().unwrap_or_else(|e| e.into_inner());
     let mut homes = Vec::new();
     with(|s| {
         for &page in pages {
@@ -214,36 +223,46 @@ pub unsafe fn free(pages: &[usize]) {
 /// them; elsewhere they are moved there. False with the last error set if a page is not one of
 /// the title's or Windows refuses.
 pub unsafe fn map(va: usize, pages: &[usize]) -> bool {
-    if !va.is_multiple_of(PAGE) || pages.iter().any(|&p| p != 0 && with(|s| s.page(p)).is_none()) {
+    if !va.is_multiple_of(PAGE) {
+        fnd::SetLastError(fnd::ERROR_INVALID_PARAMETER);
+        return false;
+    }
+    let mapping = MAPPINGS.lock().unwrap_or_else(|e| e.into_inner());
+    // Reject invalid IDs in a run before changing any of its views. A single page is
+    // validated by map_one.
+    if pages.len() > 1 && with(|s| pages.iter().any(|&p| p != 0 && s.page(p).is_none())) {
         fnd::SetLastError(fnd::ERROR_INVALID_PARAMETER);
         return false;
     }
     for (i, &page) in pages.iter().enumerate() {
         let at = va + i * PAGE;
-        if !map_one(at, page) {
-            fnd::SetLastError(fnd::ERROR_INVALID_ADDRESS);
+        if let Err(err) = map_one(at, page, &mapping) {
+            fnd::SetLastError(err);
             return false;
         }
     }
     true
 }
 
-unsafe fn map_one(at: usize, page: usize) -> bool {
-    // what was at `at` goes first
+/// Resolve the source before touching the destination. The mapping lock keeps the raw home
+/// address valid through any native mapping, move, or copy-back below.
+unsafe fn map_one(at: usize, page: usize, _mapping: &std::sync::MutexGuard<'_, ()>) -> Result<(), u32> {
+    let source = if page == 0 {
+        None
+    } else {
+        Some(with(|s| s.page(page)).ok_or(fnd::ERROR_INVALID_PARAMETER)?)
+    };
     unmap_view(at);
     unmap_away(at);
-    if page == 0 {
-        return true;
-    }
+    let Some((section, index, home)) = source else { return Ok(()) };
     // a page moved elsewhere comes home first (it is at one address outside the spaces at most,
     // as before): its views then show what it holds
     if let Some(old) = with(|s| s.away.get(&page).copied()) {
         unmap_away(old);
     }
-    let (section, index, home) = with(|s| s.page(page)).unwrap();
     if with(|s| s.in_space(at)) {
         if !section.map(index, 1, at) {
-            return false;
+            return Err(fnd::ERROR_INVALID_ADDRESS);
         }
         with(|s| s.views.insert(at, (page, section, index)));
         guards::watch(page, at);
@@ -251,9 +270,9 @@ unsafe fn map_one(at: usize, page: usize) -> bool {
             // a page never used: committed at its first touch here (or through its home)
             lazy::mark(at);
         }
-        return true;
+        return Ok(());
     }
-    move_to(at, page, home)
+    move_to(at, page, home).then_some(()).ok_or(fnd::ERROR_INVALID_ADDRESS)
 }
 
 /// Page `page` moved to `at`, an address outside the spaces: committed there with its bytes.
@@ -564,6 +583,55 @@ mod tests {
             assert_eq!(free_space(at, 0, mem::MEM_RELEASE), Some(true));
             free(&[p[1]]);
             assert!(!pages_live(&p));
+        }
+    }
+
+    #[test]
+    fn a_source_freed_after_validation_leaves_the_destination_mapped() {
+        let _g = SERIAL.lock().unwrap_or_else(|e| e.into_inner());
+        let p = pages(2);
+        let last = pages(1);
+        let at = reserve_space(2 * PAGE).unwrap();
+        unsafe {
+            assert!(map(at, &[p[0]]));
+            write64(at, 0xABCD);
+            // Each source was valid at preflight. Reject both an individual release and
+            // a release that destroys the source block at the point of mapping.
+            assert!(pages_live(&[p[1], last[0]]));
+            free(&[p[1], last[0]]);
+            let mapping = MAPPINGS.lock().unwrap_or_else(|e| e.into_inner());
+            for source in [p[1], last[0]] {
+                assert_eq!(map_one(at, source, &mapping), Err(fnd::ERROR_INVALID_PARAMETER));
+                assert!(physical_page_at(at));
+                assert_eq!(read64(at), 0xABCD);
+            }
+            drop(mapping);
+            assert!(!map(at, &[p[1]]));
+            assert_eq!(fnd::GetLastError(), fnd::ERROR_INVALID_PARAMETER);
+            assert!(!map(at, &[0, last[0]]));
+            assert_eq!(fnd::GetLastError(), fnd::ERROR_INVALID_PARAMETER);
+            assert_eq!(read64(at), 0xABCD);
+
+            assert_eq!(free_space(at, 0, mem::MEM_RELEASE), Some(true));
+            free(&p[..1]);
+        }
+    }
+
+    #[test]
+    fn freeing_pages_at_the_bitmap_boundary_leaves_the_other_bits_alone() {
+        let _g = SERIAL.lock().unwrap_or_else(|e| e.into_inner());
+        let p = pages(65);
+        unsafe {
+            assert!(pages_live(&p));
+            free(&p[63..64]);
+            assert!(!pages_live(&p[63..64]));
+            assert!(pages_live(&[p[0], p[62], p[64]]));
+            free(&[p[64], p[63], p[64]]);
+            assert!(!pages_live(&p[64..]));
+            assert!(pages_live(&p[..63]));
+            free(&p[..63]);
+            assert!(!pages_live(&[p[0]]));
+            assert!(!pages_live(&[p[62]]));
         }
     }
 
