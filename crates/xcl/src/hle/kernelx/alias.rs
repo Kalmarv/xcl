@@ -419,6 +419,40 @@ mod tests {
     }
 
     #[test]
+    fn scatter_without_pages_unmaps_only_the_listed_aliases() {
+        use super::super::XMemMapPhysicalPagesScatter;
+        if !enabled() {
+            return crate::gpu::recomp::runner::skip_test("XCL_PAGE_ALIAS=1 required");
+        }
+        let _g = SERIAL.lock().unwrap_or_else(|e| e.into_inner());
+        let p = pages(2);
+        let first = reserve_space(2 * PAGE).unwrap();
+        let survivor = reserve_space(2 * PAGE).unwrap();
+        let addresses = [first as *mut c_void, (first + PAGE) as *mut c_void];
+        let mut ids = [p[0] as u64, p[1] as u64];
+        unsafe {
+            assert_eq!(XMemMapPhysicalPagesScatter(addresses.as_ptr(), 2, ids.as_mut_ptr()), 1);
+            assert!(map(survivor, &p));
+            write64(first, 17);
+            write64(first + PAGE, 23);
+
+            assert_eq!(XMemMapPhysicalPagesScatter(addresses.as_ptr(), 2, std::ptr::null_mut()), 1);
+            assert!(!physical_page_at(first));
+            assert!(!physical_page_at(first + PAGE));
+            assert_eq!((read64(survivor), read64(survivor + PAGE)), (17, 23));
+
+            ids.swap(0, 1);
+            assert_eq!(XMemMapPhysicalPagesScatter(addresses.as_ptr(), 2, ids.as_mut_ptr()), 1);
+            assert_eq!((read64(first), read64(first + PAGE)), (23, 17));
+
+            assert_eq!(free_space(first, 0, mem::MEM_RELEASE), Some(true));
+            assert_eq!(free_space(survivor, 0, mem::MEM_RELEASE), Some(true));
+            free(&p);
+            assert!(!read(&p, 0, &mut [0; 8]), "released pages cannot be read by ID");
+        }
+    }
+
+    #[test]
     fn remapping_an_address_shows_the_new_page_and_keeps_the_old_one() {
         let _g = SERIAL.lock().unwrap_or_else(|e| e.into_inner());
         let p = pages(2);

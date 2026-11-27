@@ -1527,7 +1527,10 @@ pub unsafe extern "system" fn XMemMapPhysicalPagesScatter(addresses: *const *mut
         return 0;
     }
     if alias::enabled() {
-        return (0..n).all(|i| !map_aliased(*addresses.add(i), 1, pages.add(i) as *mut usize).is_null()) as BOOL;
+        return (0..n).all(|i| {
+            let page = if pages.is_null() { std::ptr::null_mut() } else { pages.add(i).cast() };
+            !map_aliased(*addresses.add(i), 1, page).is_null()
+        }) as BOOL;
     }
     if crate::gpu::uma::get().is_none() {
         fnd::SetLastError(fnd::ERROR_INVALID_PARAMETER);
