@@ -160,8 +160,10 @@ fn split_compute_prefers_the_offline_whole_pipeline() {
     assert!(files.next().is_none() && blob.metadata().unwrap().len() > 0);
     for case in ["hit","stale","miss"] {
         if case == "stale" { fs::write(&blob, b"rejected driver cache fixture").unwrap(); }
+        // (16: the entry block, with its thread limit test, is about 50 instructions, and a block
+        // over 4 x the limit keeps the program whole)
         run(Command::new(std::env::current_exe().unwrap()).args(["--exact","split_compute_prefers_the_offline_whole_pipeline","--nocapture"])
-            .env("XCL_DIRECT_SPLIT_INSTRUCTIONS","12").env("XCL_TEST_WHOLE_CASE",case));
+            .env("XCL_DIRECT_SPLIT_INSTRUCTIONS","16").env("XCL_TEST_WHOLE_CASE",case));
         assert_eq!(blob.exists(), case == "hit");
     }
     fs::remove_dir_all(dir).unwrap();
