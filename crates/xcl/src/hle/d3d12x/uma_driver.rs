@@ -344,21 +344,29 @@ pub(super) fn hot_priority_wanted() -> bool {
 }
 
 pub(super) unsafe fn set_hot_priority(device: &ID3D12Device, obj: &ID3D12Pageable, what: &str) {
+    set_residency_priority(device, obj, D3D12_RESIDENCY_PRIORITY_HIGH, "HIGH", what);
+}
+
+pub(super) unsafe fn set_low_priority(device: &ID3D12Device, obj: &ID3D12Pageable, what: &str) {
+    set_residency_priority(device, obj, D3D12_RESIDENCY_PRIORITY_LOW, "LOW", what);
+}
+
+unsafe fn set_residency_priority(device: &ID3D12Device, obj: &ID3D12Pageable, prio: D3D12_RESIDENCY_PRIORITY, label: &str, what: &str) {
     if !hot_priority_wanted() {
         return;
     }
-    let set = device.cast::<ID3D12Device1>().and_then(|d| d.SetResidencyPriority(1, &Some(obj.clone()), &D3D12_RESIDENCY_PRIORITY_HIGH));
+    let set = device.cast::<ID3D12Device1>().and_then(|d| d.SetResidencyPriority(1, &Some(obj.clone()), &prio));
     static LOGGED: std::sync::atomic::AtomicU32 = std::sync::atomic::AtomicU32::new(0);
     match set {
         Ok(()) => {
             let n = LOGGED.fetch_add(1, Ordering::Relaxed) + 1;
-            if n <= 4 || n.is_power_of_two() {
-                crate::xlog_info!("D3D12.X: XCL_VRAM_HOT_PRIORITY: {what} set to HIGH residency priority ({n} total)");
+            if n <= 8 || n.is_power_of_two() {
+                crate::xlog_info!("D3D12.X: XCL_VRAM_HOT_PRIORITY: {what} set to {label} residency priority ({n} total)");
             }
         }
         Err(e) => {
             if LOGGED.fetch_add(1, Ordering::Relaxed) < 4 {
-                crate::xlog_warn!("D3D12.X: XCL_VRAM_HOT_PRIORITY: SetResidencyPriority({what}): {e}");
+                crate::xlog_warn!("D3D12.X: XCL_VRAM_HOT_PRIORITY: SetResidencyPriority({what}, {label}): {e}");
             }
         }
     }

@@ -523,7 +523,9 @@ impl TilePool {
 }
 
 /// Allocate one 64 MiB default heap for `Pages`.
-unsafe fn alloc_pool_heap(dev: &ID3D12Device) -> Option<ID3D12Heap> {
+/// When `XCL_VRAM_HOT_PRIORITY=1`, hot pools (render targets / depth / UAV / non-lazy textures)
+/// get `HIGH` residency priority and cold pools (lazy streamed sampled textures) get `LOW`.
+unsafe fn alloc_pool_heap(dev: &ID3D12Device, cold: bool) -> Option<ID3D12Heap> {
     let desc = D3D12_HEAP_DESC {
         SizeInBytes: POOL_PAGES as u64 * PAGE as u64,
         Properties: D3D12_HEAP_PROPERTIES { Type: D3D12_HEAP_TYPE_DEFAULT, ..Default::default() },
@@ -536,6 +538,15 @@ unsafe fn alloc_pool_heap(dev: &ID3D12Device) -> Option<ID3D12Heap> {
         crate::xlog_warn!("D3D12.X: no video memory for more pages of title textures ({e})");
         return None;
     }
+    if let Some(ref h) = heap {
+        if let Ok(p) = h.cast::<ID3D12Pageable>() {
+            if cold {
+                super::uma_driver::set_low_priority(dev, &p, "cold texture tile pool");
+            } else {
+                super::uma_driver::set_hot_priority(dev, &p, "hot target tile pool");
+            }
+        }
+    }
     heap
 }
 
@@ -543,28 +554,35 @@ unsafe fn alloc_pool_heap(dev: &ID3D12Device) -> Option<ID3D12Heap> {
 /// are reclaimed back to local VRAM. `len()` reports the count of live heaps.
 struct PoolHeaps {
     slots: Vec<Option<ID3D12Heap>>,
+    cold: Vec<bool>,
     free_slots: Vec<u32>,
     live: usize,
 }
 
 impl PoolHeaps {
     fn new() -> Self {
-        Self { slots: Vec::new(), free_slots: Vec::new(), live: 0 }
+        Self { slots: Vec::new(), cold: Vec::new(), free_slots: Vec::new(), live: 0 }
     }
 
     fn len(&self) -> usize {
         self.live
     }
 
-    fn push_heap(&mut self, heap: ID3D12Heap) -> u32 {
+    fn is_cold(&self, idx: u32) -> bool {
+        self.cold.get(idx as usize).copied().unwrap_or(false)
+    }
+
+    fn push_heap(&mut self, heap: ID3D12Heap, cold: bool) -> u32 {
         self.live += 1;
         if let Some(idx) = self.free_slots.pop() {
             debug_assert!(self.slots[idx as usize].is_none());
             self.slots[idx as usize] = Some(heap);
+            self.cold[idx as usize] = cold;
             idx
         } else {
             let idx = self.slots.len() as u32;
             self.slots.push(Some(heap));
+            self.cold.push(cold);
             idx
         }
     }
@@ -610,6 +628,8 @@ struct Pages {
     /// pool heaps by `Tile` index (a reclaimed one's slot is empty, as `TilePool::live` has it)
     pools: PoolHeaps,
     pool: TilePool,
+    /// separate `LOW`-priority pool for lazy streamed sampled textures when `XCL_VRAM_HOT_PRIORITY=1`
+    cold_pool: TilePool,
     /// title page address → its video memory
     pages: std::collections::HashMap<usize, Page>,
     /// extra / sub-64 KiB tiles keyed by `(va, tile_index)` so repeated placements at the same
@@ -656,6 +676,7 @@ impl Pages {
             last_reclaim: std::time::Instant::now(),
             pools: PoolHeaps::new(),
             pool: TilePool::new(),
+            cold_pool: TilePool::new(),
             pages: std::collections::HashMap::new(),
             extra_pages: std::collections::HashMap::new(),
             idle: std::collections::VecDeque::new(),
@@ -671,7 +692,19 @@ impl Pages {
 
     /// Pages no resource used for `IDLE` go back to the pools.
     fn sweep(&mut self, now: std::time::Instant) {
-        sweep_idle(&mut self.idle, &mut self.pages, &mut self.extra_pages, &mut self.pool.cooling, now);
+        if self.cold_pool.live.is_empty() {
+            sweep_idle(&mut self.idle, &mut self.pages, &mut self.extra_pages, &mut self.pool.cooling, now);
+            return;
+        }
+        let mut cooled = std::collections::VecDeque::new();
+        sweep_idle(&mut self.idle, &mut self.pages, &mut self.extra_pages, &mut cooled, now);
+        for (tile, when) in cooled {
+            if self.pools.is_cold(tile.0) {
+                self.cold_pool.cooling.push_back((tile, when));
+            } else {
+                self.pool.cooling.push_back((tile, when));
+            }
+        }
     }
 
     /// Sweep expired idle pages, drain cooled tiles, and reclaim any completely empty 64 MiB
@@ -680,7 +713,10 @@ impl Pages {
     fn sweep_and_reclaim(&mut self, now: std::time::Instant) -> Vec<ID3D12Heap> {
         self.sweep(now);
         self.pool.drain_cooling(now);
-        let reclaimed_ids = self.pool.reclaim_empty_heaps(keep_spare_pools(), POOL_PAGES);
+        self.cold_pool.drain_cooling(now);
+        let spare = keep_spare_pools();
+        let mut reclaimed_ids = self.pool.reclaim_empty_heaps(spare, POOL_PAGES);
+        reclaimed_ids.extend(self.cold_pool.reclaim_empty_heaps(spare, POOL_PAGES));
         let mut dropped = Vec::with_capacity(reclaimed_ids.len());
         for idx in reclaimed_ids {
             if let Some(h) = self.pools.take_heap(idx) {
@@ -777,7 +813,11 @@ impl Pages {
                 if p.users == 0 {
                     if immediate_cool {
                         if let Some(p) = self.pages.remove(&a) {
-                            self.pool.push_cooling(p.tile, now);
+                            if self.pools.is_cold(p.tile.0) {
+                                self.cold_pool.push_cooling(p.tile, now);
+                            } else {
+                                self.pool.push_cooling(p.tile, now);
+                            }
                         }
                     } else {
                         p.idle_since = Some(now);
@@ -792,7 +832,11 @@ impl Pages {
                 if p.users == 0 {
                     if immediate_cool {
                         if let Some(p) = self.extra_pages.remove(&k) {
-                            self.pool.push_cooling(p.tile, now);
+                            if self.pools.is_cold(p.tile.0) {
+                                self.cold_pool.push_cooling(p.tile, now);
+                            } else {
+                                self.pool.push_cooling(p.tile, now);
+                            }
                         }
                     } else {
                         p.idle_since = Some(now);
@@ -805,12 +849,13 @@ impl Pages {
 
     /// Acquire/share all `total` tiles for `res` at `va` and map them on the `Pages` queue.
     unsafe fn bind(&mut self, dev: &ID3D12Device, res: &ID3D12Resource, va: usize, console_bytes: Option<u64>, total: u32) -> Option<(Vec<usize>, Vec<(usize, usize)>)> {
-        self.bind_range(dev, res, va, console_bytes, total, 0, 0..total as usize)
+        self.bind_range(dev, res, va, console_bytes, total, 0, 0..total as usize, false)
     }
 
     /// `bind` for the tiles `range` of the resource's `total`, which start at subresource `sub`.
     #[allow(clippy::too_many_arguments)]
-    unsafe fn bind_range(&mut self, dev: &ID3D12Device, res: &ID3D12Resource, va: usize, console_bytes: Option<u64>, total: u32, sub: u32, range: std::ops::Range<usize>) -> Option<(Vec<usize>, Vec<(usize, usize)>)> {
+    unsafe fn bind_range(&mut self, dev: &ID3D12Device, res: &ID3D12Resource, va: usize, console_bytes: Option<u64>, total: u32, sub: u32, range: std::ops::Range<usize>, cold: bool) -> Option<(Vec<usize>, Vec<(usize, usize)>)> {
+        let cold = cold && super::uma_driver::hot_priority_wanted();
         let (first, own) = (total > 0).then(|| owned_pages(va, console_bytes, total as usize)).flatten()?;
         let now = std::time::Instant::now();
         self.sweep(now);
@@ -824,17 +869,17 @@ impl Pages {
                 self.extra_pages.get(&(va, i)).map(|p| p.tile.0)
             };
             match existing {
-                Some(h) if preferred.is_none() => preferred = Some(h),
+                Some(h) if preferred.is_none() && self.pools.is_cold(h) == cold => preferred = Some(h),
                 Some(_) => {}
                 None => missing += 1,
             }
         }
 
         let pools = &mut self.pools;
-        let pool = &mut self.pool;
+        let pool = if cold { &mut self.cold_pool } else { &mut self.pool };
         let fresh = pool.take_batch(missing, preferred, now, POOL_PAGES, || {
-            let heap = alloc_pool_heap(dev)?;
-            Some(pools.push_heap(heap))
+            let heap = alloc_pool_heap(dev, cold)?;
+            Some(pools.push_heap(heap, cold))
         })?;
         let mut fresh_iter = fresh.into_iter();
 
@@ -1412,7 +1457,7 @@ pub(super) unsafe fn map_levels(res: &ID3D12Resource, levels: Option<&[u32]>) ->
         let Some(dev) = ID3D12Device::from_raw_borrowed(&d) else { return Vec::new() };
         let mut fresh = Vec::new();
         for (k, sub, first, n, levels) in todo {
-            let Some((used, used_extra)) = pages.bind_range(dev, res, va, console_bytes, total, sub, first as usize..(first + n) as usize) else { continue };
+            let Some((used, used_extra)) = pages.bind_range(dev, res, va, console_bytes, total, sub, first as usize..(first + n) as usize, true) else { continue };
             let Some(t) = pages.targets.get_mut(&key) else { return fresh };
             t.used.extend(used);
             t.used_extra.extend(used_extra);
