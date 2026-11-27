@@ -645,28 +645,8 @@ pub fn init() -> Result<String, String> {
                 }
             }
         }
-        // `XCL_DRED=1`: on a device removal the faulting address and the last GPU operations
-        // (logged by `log_device_removed`); no debug layer needed. Opt-in: with it XDefiant
-        // stalled in its first seconds twice.
-        if let Some(dred) = std::env::var_os("XCL_DRED") {
-            match crate::gpu::agility::configuration_interface::<ID3D12DeviceRemovedExtendedDataSettings>(
-                &CLSID_D3D12DeviceRemovedExtendedData,
-            ) {
-                Ok(d) => {
-                    // (`XCL_DRED=pagefault`: the faulting address and what was there only; the
-                    // breadcrumbs put a marker around every operation of every list, which is
-                    // what made a title stall)
-                    if dred != "pagefault" {
-                        d.SetAutoBreadcrumbsEnablement(D3D12_DRED_ENABLEMENT_FORCED_ON);
-                    }
-                    d.SetPageFaultEnablement(D3D12_DRED_ENABLEMENT_FORCED_ON);
-                    crate::xlog_info!("D3D12: DRED on ({})", if dred == "pagefault" { "page faults" } else { "page faults and the lists' last operations" });
-                }
-                Err(e) => {
-                    crate::xlog_warn!("D3D12: DRED requested but unavailable: {e}");
-                }
-            }
-        }
+        // `XCL_DRED=1` (`create_device` does it too; this call only puts the log line before the device)
+        crate::gpu::agility::enable_dred_once();
         let factory: IDXGIFactory6 = CreateDXGIFactory2(DXGI_CREATE_FACTORY_FLAGS(0)).map_err(|e| format!("DXGI: {e}"))?;
         let mut device: Option<ID3D12Device> = None;
         let mut name = String::new();
@@ -5092,6 +5072,7 @@ unsafe fn translated_compute_pso_once(this: *mut c_void, f: PsoFn, desc: *const 
             LAST_COMPUTE_RS.with(|c| c.set(rs));
             note_pso_rs(*ppv, rs as *mut c_void);
             super::dred::label(*ppv as usize, &[("cs", Some(cs))]);
+            super::dred::label_code(*ppv as usize, &dxil, true);
             if let Some(i) = crate::gpu::recomp::pso::compute_interface(cs) {
                 PSO_USER_SGPRS.insert(*ppv as usize, (i.user_sgprs, i.threads));
             }
@@ -5133,6 +5114,7 @@ unsafe fn translated_compute_pso_once(this: *mut c_void, f: PsoFn, desc: *const 
     TRANSLATED_PSO.fetch_add(1, Ordering::Relaxed);
     note_pso_rs(*ppv, rs);
     super::dred::label(*ppv as usize, &[("cs", Some(cs))]);
+    super::dred::label_code(*ppv as usize, &dxil, false);
     if let Some(i) = crate::gpu::recomp::pso::compute_interface(cs) {
         PSO_USER_SGPRS.insert(*ppv as usize, (i.user_sgprs, i.threads));
     }
@@ -9494,6 +9476,17 @@ mod dred_tests {
     use super::*;
 
     #[test]
+    fn no_page_fault_address_is_in_no_window() {
+        // (windows 2 and 3 are not open: their address is 0)
+        let windows = [0x5_0000_0000, 0x7_0000_0000, 0, 0];
+        assert_eq!(page_fault_window(0, &windows), None, "a hung GPU's removal: not 'window 2 + 0x0'");
+        assert_eq!(page_fault_window(0x1234, &windows), None);
+        assert_eq!(page_fault_window(0x7_0000_1000, &windows), Some((1, 0x1000)));
+        assert_eq!(page_fault_window(0x5_ffff_ffff, &windows), Some((0, 0xffff_ffff)));
+        assert_eq!(page_fault_window(0x8_0000_0000, &windows), None);
+    }
+
+    #[test]
     fn video_memory_is_over_its_budget_only_past_a_known_one() {
         assert_eq!(over_video_budget(30 << 30, 28 << 30), Some(2 << 30));
         assert_eq!(over_video_budget(28 << 30, 28 << 30), None);
@@ -9521,6 +9514,14 @@ mod dred_tests {
             assert_eq!((node, done), (std::ptr::from_ref(&nodes[i]), 0));
         }
     }
+}
+
+/// The memory window DRED's page-fault address `va` lies in and the offset there (`windows`:
+/// their GPU addresses, 0 for one that is not open – which address 0, a removal that was no
+/// page fault, is not in).
+fn page_fault_window(va: u64, windows: &[u64]) -> Option<(usize, u64)> {
+    let k = windows.iter().position(|&w| w != 0 && va >= w && va < w + 0x1_0000_0000)?;
+    Some((k, va - windows[k]))
 }
 
 /// If the device was removed: the reason, DRED's page fault (address, the allocations around
@@ -9560,8 +9561,14 @@ pub fn log_device_removed() {
                 v.join(", ")
             };
             let va = pf.PageFaultVA;
-            let window = uma_window_vas().iter().position(|&w| va >= w && va < w + 0x1_0000_0000).map(|k| format!(" = window {k} + {:#x}", va - uma_window_vas()[k])).unwrap_or_default();
-            crate::xlog_error!("DRED page fault at GPU VA {va:#x}{window}; allocations there: [{}]; recently freed: [{}]", names(pf.pHeadExistingAllocationNode), names(pf.pHeadRecentFreedAllocationNode));
+            let (there, freed) = (names(pf.pHeadExistingAllocationNode), names(pf.pHeadRecentFreedAllocationNode));
+            if va == 0 && there.is_empty() && freed.is_empty() {
+                // (a hung GPU, state 3: nothing faulted)
+                crate::xlog_error!("DRED: no page fault (no address, no allocations named)");
+            } else {
+                let window = page_fault_window(va, &uma_window_vas()).map(|(k, off)| format!(" = window {k} + {off:#x}")).unwrap_or_default();
+                crate::xlog_error!("DRED page fault at GPU VA {va:#x}{window}; allocations there: [{there}]; recently freed: [{freed}]");
+            }
         }
         let breadcrumbs = dred.GetAutoBreadcrumbsOutput();
         match &breadcrumbs {
@@ -9593,6 +9600,11 @@ pub fn log_device_removed() {
                         super::dred::ops(key, &history, done, to),
                         if to < count { format!(" … {} more", count - to) } else { String::new() }
                     );
+                    // how much work those were: a hung GPU was in one that takes too long
+                    let work = super::dred::work(key, &history, done.saturating_sub(16), to, super::indirect_guard::counts_of);
+                    if !work.is_empty() {
+                        crate::xlog_error!("DRED: … that list's dispatches there, in order under each pipeline (no counts read back: the GPU has not run that check, or its slot was used again): {work}");
+                    }
                 }
             });
         }

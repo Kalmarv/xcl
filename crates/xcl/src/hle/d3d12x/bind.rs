@@ -3477,6 +3477,8 @@ unsafe fn translated_dispatch(this: *mut c_void, list: &ID3D12GraphicsCommandLis
     bind_abi(this, list, pso, false, Some([x, y, z]), limit)?;
     // (one span for a split program's whole chain of dispatches, cut into slabs from the folded
     // groups; the span names the console's)
+    // (the budget asked for again: `bind_abi`'s, but at the edge of a time-gated XCL_DISPATCH_LOOP_SCALE)
+    super::dred::note_work(this, || super::dred::Work::Dispatch { groups: [x, y, z], recorded: folded, loop_budget: if dispatch_loop_budget_wanted() { scaled_loop_budget([x, y, z]) } else { 0 } });
     let t = super::gpu_profile::begin(this, pso, super::gpu_profile::Kind::Dispatch, [x, y, z]);
     let ran = super::real::dispatch_chain::dispatch(list, pso, with(this, |s| s.allocator), folded);
     super::gpu_profile::end(this, t);

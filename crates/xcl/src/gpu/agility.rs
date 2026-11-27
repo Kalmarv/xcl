@@ -46,6 +46,12 @@ pub enum State {
 
 static STATE: OnceLock<State> = OnceLock::new();
 static DEBUG_LAYER: OnceLock<Result<(), String>> = OnceLock::new();
+static DRED: OnceLock<Option<Result<(), String>>> = OnceLock::new();
+/// Devices `create_device` has returned in this process (`XCL_DEVICE_LOG=1` numbers them).
+static DEVICES: std::sync::atomic::AtomicU32 = std::sync::atomic::AtomicU32::new(0);
+/// Tests: set when any `create_device` started while the DRED step had not run yet.
+#[cfg(test)]
+pub(crate) static DRED_LATE: std::sync::atomic::AtomicBool = std::sync::atomic::AtomicBool::new(false);
 
 /// Candidate directories in search order.
 pub(crate) fn candidates(env_override: Option<PathBuf>, exe_dir: Option<PathBuf>, local_app_data: Option<PathBuf>) -> Vec<PathBuf> {
@@ -315,13 +321,56 @@ pub fn loaded() -> Option<(u32, &'static Path)> {
     }
 }
 
+/// The line `XCL_DEVICE_LOG=1` writes for each device `create_device` returns: which one of the
+/// process it is, where and for whom it was made, and what the DRED step had answered by then.
+pub(crate) fn device_created_line(nth: u32, pid: u32, tid: u32, luid: (i32, u32), dev: usize, feature_level: i32, agility: bool, dred: &str, at: &std::panic::Location) -> String {
+    format!(
+        "D3D12: device #{nth} of pid {pid} (tid {tid}): adapter LUID {:08x}:{:08x}, device {dev:#x}, feature level {feature_level:#x}, {}, DRED {dred}, from {}:{}",
+        luid.0,
+        luid.1,
+        if agility { "Agility SDK factory" } else { "inbox D3D12CreateDevice" },
+        at.file(),
+        at.line()
+    )
+}
+
 /// Create a D3D12 device through the Agility SDK factory when loaded, otherwise via
 /// inbox `D3D12CreateDevice`.
+#[track_caller]
 pub fn create_device<P>(adapter: P, feature_level: D3D_FEATURE_LEVEL) -> windows::core::Result<ID3D12Device>
 where
     P: Param<IUnknown>,
 {
+    // DRED only applies to devices created after it is set: before the process's first one
+    let dred = enable_dred_once();
+    let at = std::panic::Location::caller();
+    let device = create_device_inner(adapter, feature_level)?;
+    let nth = DEVICES.fetch_add(1, std::sync::atomic::Ordering::Relaxed) + 1;
+    if std::env::var_os("XCL_DEVICE_LOG").is_some() {
+        // SAFETY: `device` is the live device just created.
+        let luid = unsafe { device.GetAdapterLuid() };
+        let dred = match dred {
+            None => "not requested",
+            Some(Ok(())) => "set before it",
+            Some(Err(_)) => "requested but unavailable",
+        };
+        // SAFETY: reads the calling thread's id.
+        let tid = unsafe { windows::Win32::System::Threading::GetCurrentThreadId() };
+        let agility = matches!(state(), State::Loaded { .. });
+        crate::xlog_info!("{}", device_created_line(nth, std::process::id(), tid, (luid.HighPart, luid.LowPart), device.as_raw() as usize, feature_level.0, agility, dred, at));
+    }
+    Ok(device)
+}
+
+fn create_device_inner<P>(adapter: P, feature_level: D3D_FEATURE_LEVEL) -> windows::core::Result<ID3D12Device>
+where
+    P: Param<IUnknown>,
+{
     let mut device: Option<ID3D12Device> = None;
+    #[cfg(test)]
+    if DRED.get().is_none() {
+        DRED_LATE.store(true, std::sync::atomic::Ordering::SeqCst);
+    }
     match state() {
         State::Loaded { factory, .. } => {
             // SAFETY: `factory` is a valid `ID3D12DeviceFactory` kept alive for `'static`,
@@ -355,6 +404,41 @@ pub fn configuration_interface<T: Interface>(clsid: &GUID) -> windows::core::Res
             out.ok_or_else(|| windows::core::Error::from(windows::Win32::Foundation::E_NOINTERFACE))
         }
     }
+}
+
+/// What `XCL_DRED` asks for: `None` when it is unset, else whether the breadcrumbs are on too
+/// (`XCL_DRED=pagefault`: the faulting address and what was there only; the breadcrumbs put a
+/// marker around every operation of every list, which is what made a title stall).
+pub(crate) fn dred_request(var: Option<std::ffi::OsString>) -> Option<bool> {
+    var.map(|v| v != "pagefault")
+}
+
+/// `XCL_DRED=1`: on a device removal the faulting address and the last GPU operations (logged
+/// by `log_device_removed`); no debug layer needed. Opt-in: with it XDefiant stalled in its
+/// first seconds twice. The settings apply only to devices created after them, so this runs
+/// from `create_device`, before the first device of the process (the launch preparation's
+/// runner makes one before the title's); once per process.
+pub fn enable_dred_once() -> &'static Option<Result<(), String>> {
+    DRED.get_or_init(|| {
+        let breadcrumbs = dred_request(std::env::var_os("XCL_DRED"))?;
+        Some(match configuration_interface::<ID3D12DeviceRemovedExtendedDataSettings>(&CLSID_D3D12DeviceRemovedExtendedData) {
+            Ok(d) => {
+                // SAFETY: `d` is a valid settings interface; the calls only record the setting.
+                unsafe {
+                    if breadcrumbs {
+                        d.SetAutoBreadcrumbsEnablement(D3D12_DRED_ENABLEMENT_FORCED_ON);
+                    }
+                    d.SetPageFaultEnablement(D3D12_DRED_ENABLEMENT_FORCED_ON);
+                }
+                crate::xlog_info!("D3D12: DRED on ({})", if breadcrumbs { "page faults and the lists' last operations" } else { "page faults" });
+                Ok(())
+            }
+            Err(e) => {
+                crate::xlog_warn!("D3D12: DRED requested but unavailable: {e}");
+                Err(e.to_string())
+            }
+        })
+    })
 }
 
 /// Enable the debug layer at most once per process. The GPU test runner may create a

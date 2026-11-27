@@ -13,7 +13,7 @@
 //! `XCL_INDIRECT_MAX_GROUPS` is the most groups one ExecuteIndirect may run (4 Mi: a 4K target
 //! in 8x8 groups has 130 thousand).
 
-use std::collections::HashMap;
+use std::collections::{HashMap, VecDeque};
 use std::ffi::c_void;
 use std::mem::{transmute_copy, ManuallyDrop};
 use std::sync::atomic::{AtomicU32, AtomicU64, Ordering};
@@ -50,6 +50,17 @@ const MAX_INSTANCES: u32 = 1 << 24;
 /// the memory window (a diagnostic: the two are one memory).
 fn compare() -> bool {
     static ON: LazyLock<bool> = LazyLock::new(|| std::env::var("XCL_INDIRECT_GUARD").is_ok_and(|v| v.trim() == "compare"));
+    *ON
+}
+
+/// `XCL_INDIRECT_GUARD_CPU=1` (a diagnostic, off unless set): what the CPU's range of the
+/// arguments holds when the title calls ExecuteIndirect is kept and compared with what the GPU
+/// reads there. Counts the CPU wrote are the same in both; counts a program of the title wrote
+/// are in the GPU's memory only. A line of counts out of range then says what the CPU's range
+/// held at its call, which of the two its program's other calls were, and what the sparse
+/// windows know of that memory.
+fn cpu_notes() -> bool {
+    static ON: LazyLock<bool> = LazyLock::new(|| std::env::var("XCL_INDIRECT_GUARD_CPU").is_ok_and(|v| v.trim() == "1"));
     *ON
 }
 
@@ -333,9 +344,17 @@ pub(super) unsafe fn check(list: *mut c_void, pso: usize, sig: usize, max: u32, 
     let va = title.and_then(counts_va).filter(|v| v % 4 == 0).unwrap_or(shown);
     let shown = if compare() { shown } else { va };
     let g = guard_of(l)?;
-    let slot = g.next.fetch_add(1, Ordering::Relaxed) % SLOTS;
+    let nth = g.next.fetch_add(1, Ordering::Relaxed);
+    let slot = nth % SLOTS;
     g.word(SEEN_AT + slot * SLOT + 4 * SEEN_WORD).store(0, Ordering::Release);
     let id = real::pso_shaders(pso).map_or(0, |(a, _)| a);
+    if cpu_notes() {
+        let cpu = title.and_then(|t| cpu_copy(t).flatten());
+        let mut n = CPU_NOTES.lock().unwrap();
+        let n = n.get_or_insert_with(Default::default);
+        n.at_call.insert(slot, cpu);
+        n.waiting.push_back((nth, id, cpu));
+    }
     // the counts were written as UAVs: they are read after those writes
     let written = D3D12_RESOURCE_BARRIER {
         Type: D3D12_RESOURCE_BARRIER_TYPE_UAV,
@@ -355,6 +374,7 @@ pub(super) unsafe fn check(list: *mut c_void, pso: usize, sig: usize, max: u32, 
     l.SetComputeRootUnorderedAccessView(3, g.seen_va);
     l.SetComputeRootUnorderedAccessView(4, shown);
     l.Dispatch(1, 1, 1);
+    super::dred::note_work(list, || super::dred::Work::Checked(nth));
     report(&g);
     Some(Checked { guard: g, slot })
 }
@@ -387,8 +407,97 @@ impl Checked {
 /// instances, the first of them), once the GPU has read them.
 pub(super) fn counts(slot: u32) -> Option<[u32; 3]> {
     let g = GUARD.lock().unwrap().clone()?;
+    counts_in(&g, slot)
+}
+
+/// `counts` in the guard `g`.
+fn counts_in(g: &Guard, slot: u32) -> Option<[u32; 3]> {
     let at = SEEN_AT + slot * SLOT;
     (g.word(at + 4 * SEEN_WORD).load(Ordering::Acquire) != 0).then(|| std::array::from_fn(|k| g.word(at + 4 * k as u32).load(Ordering::Relaxed)))
+}
+
+/// `counts` of the ExecuteIndirect checked as the `nth` (`check` counts them). None also when
+/// its slot has been given to a later one since: those would be that one's counts.
+pub(super) fn counts_of(nth: u32) -> Option<[u32; 3]> {
+    let given = GUARD.lock().unwrap().as_ref()?.next.load(Ordering::Relaxed);
+    if given.wrapping_sub(nth) > SLOTS {
+        return None;
+    }
+    counts(nth % SLOTS)
+}
+
+/// The first three counts at the title's address `at` as the CPU's range of that memory holds
+/// them now, or None where it cannot be read. The outer None: `at` is not in unified memory
+/// (a buffer of the GPU's own, logged by its GPU address).
+fn cpu_copy(at: usize) -> Option<Option<[u32; 3]>> {
+    use windows_sys::Win32::System::Diagnostics::Debug::ReadProcessMemory;
+    use windows_sys::Win32::System::Threading::GetCurrentProcess;
+    real::uma_window_buffer_gpu(at, COUNT_BYTES)?;
+    let (mut b, mut read) = ([0u8; 12], 0usize);
+    // (a read that fails instead of faulting: the title may decommit the page meanwhile)
+    let ok = unsafe { ReadProcessMemory(GetCurrentProcess(), super::view_want::cpu(at as u64) as usize as *const c_void, b.as_mut_ptr() as *mut c_void, b.len(), &mut read) } != 0 && read == b.len();
+    Some(ok.then(|| std::array::from_fn(|k| u32::from_le_bytes([b[4 * k], b[4 * k + 1], b[4 * k + 2], b[4 * k + 3]]))))
+}
+
+/// Calls whose counts the GPU has not read that `CpuNotes::settle` waits behind: one of a list
+/// that is never submitted is passed over once this many wait.
+const WAITING_MAX: usize = 4096;
+
+/// How a program's checked calls compared (`cpu_notes`): the CPU's range held at the call what
+/// the GPU read, zeros where the GPU read something else, or other words; and calls whose
+/// counts were not read back.
+#[derive(Default, Clone, Copy, PartialEq, Eq, Debug)]
+struct Tally {
+    same: u64,
+    zeros: u64,
+    other: u64,
+    unread: u64,
+}
+
+/// What `cpu_notes` keeps.
+#[derive(Default)]
+struct CpuNotes {
+    /// calls not compared yet, oldest first: the nth checked, its program, the CPU's words then
+    /// (None: not read)
+    waiting: VecDeque<(u32, u64, Option<[u32; 3]>)>,
+    /// by slot: the CPU's words at the call that took it last
+    at_call: HashMap<u32, Option<[u32; 3]>>,
+    /// by program
+    tally: HashMap<u64, Tally>,
+}
+
+static CPU_NOTES: Mutex<Option<CpuNotes>> = Mutex::new(None);
+
+impl CpuNotes {
+    /// Compare the waiting calls whose counts the GPU has read (`counts`, by the nth checked),
+    /// oldest first, up to the first it has not read.
+    fn settle(&mut self, counts: impl Fn(u32) -> Option<[u32; 3]>) {
+        while let Some(&(nth, id, cpu)) = self.waiting.front() {
+            let gpu = counts(nth);
+            if gpu.is_none() && self.waiting.len() <= WAITING_MAX {
+                break;
+            }
+            self.waiting.pop_front();
+            let t = self.tally.entry(id).or_default();
+            match (cpu, gpu) {
+                (_, None) => t.unread += 1,
+                (Some(c), Some(g)) if c == g => t.same += 1,
+                (Some([0, 0, 0]), Some(_)) => t.zeros += 1,
+                _ => t.other += 1,
+            }
+        }
+    }
+
+    /// For the line of counts out of range that program `id`'s call in `slot` read.
+    fn line(&self, slot: u32, id: u64) -> String {
+        let at = match self.at_call.get(&slot) {
+            Some(Some(c)) => format!("; at the call it showed {:#x}, {:#x}, {:#x}", c[0], c[1], c[2]),
+            Some(None) => "; at the call it was not read".to_string(),
+            None => String::new(),
+        };
+        let t = self.tally.get(&id).copied().unwrap_or_default();
+        format!("{at}; of this program's checked calls so far the CPU's range held at the call what the GPU read in {}, zeros in {}, other words in {} ({} not read back)", t.same, t.zeros, t.other, t.unread)
+    }
 }
 
 /// Counts out of range so far.
@@ -419,6 +528,12 @@ fn report(g: &Guard) {
     let (bad, d, n) = (bad_so_far(g) as u64, g.word(4).load(Ordering::Acquire) as u64, g.word(8).load(Ordering::Acquire));
     let records = RECORDS.try_lock();
     let Ok(mut records) = records else { return };
+    let mut notes = if cpu_notes() { Some(CPU_NOTES.lock().unwrap()) } else { None };
+    let mut notes = notes.as_mut().and_then(|n| n.as_mut());
+    if let Some(notes) = notes.as_mut() {
+        // (a slot given to a later call since holds that one's counts)
+        notes.settle(|nth| if g.next.load(Ordering::Relaxed).wrapping_sub(nth) > SLOTS { None } else { counts_in(g, nth % SLOTS) });
+    }
     while *records < n.min(BAD_KEPT) {
         let at = BAD_AT + *records * BAD_SIZE;
         // (a record the GPU has counted but not written yet is logged the next time)
@@ -435,7 +550,18 @@ fn report(g: &Guard) {
         };
         let shown = if w[13] & 1 != 0 { format!(" (the title's buffer shows {:#x}, {:#x}, {:#x})", w[8], w[9], w[10]) } else { String::new() };
         let verdict = if w[13] & 2 != 0 { "out of range, not run" } else { "run" };
-        crate::xlog_warn!("D3D12.X: ExecuteIndirect of {what}, arguments at {title:#x}{shown} – {verdict} ({bad} out of range so far)");
+        // (the same words there: the title's memory holds them, whoever wrote them; other ones:
+        // the CPU has written since, or the GPU's copy of that memory is not the CPU's)
+        let cpu = match cpu_copy(title as usize) {
+            Some(Some(c)) => format!("; the CPU's range shows {:#x}, {:#x}, {:#x} there now", c[0], c[1], c[2]),
+            Some(None) => "; the CPU's range cannot be read there now".to_string(),
+            None => String::new(),
+        };
+        let cpu = match notes.as_ref() {
+            Some(notes) => format!("{cpu}{}{}", notes.line(w[14], id), super::sparse::chunk_note(title as usize).map_or(String::new(), |s| format!("; the sparse windows: {s}"))),
+            None => cpu,
+        };
+        crate::xlog_warn!("D3D12.X: ExecuteIndirect of {what}, arguments at {title:#x}{shown} – {verdict} ({bad} out of range so far){cpu}");
     }
     drop(records);
     for (counter, now, what) in [(&BAD, bad, "counts out of range so far, not run"), (&DIFFERED, d, "time(s) the title's buffer did not show the counts the memory window holds")] {
@@ -527,6 +653,34 @@ mod tests {
         assert_eq!(counts_va_in(0x1_1000 - COUNT_BYTES, in_one_window, va_of), Some(0x7000_1000 - COUNT_BYTES as u64), "the last record in a window");
         assert_eq!(counts_va_in(0x1_1000 - 8, in_one_window, va_of), None, "a record across the window's end");
         assert_eq!(counts_va_in(0x100, in_one_window, va_of), None, "not in a window");
+    }
+
+    /// `XCL_INDIRECT_GUARD_CPU=1`: a call is compared once the GPU has read its counts, in the
+    /// order of the calls; one never read is passed over when enough wait behind it.
+    #[test]
+    fn calls_are_compared_with_the_cpus_words_once_the_gpu_has_read_them() {
+        let mut n = CpuNotes::default();
+        // program 7: counts the CPU wrote, counts only the GPU has, garbage over the CPU's zeros
+        n.waiting.extend([(0, 7, Some([4, 1, 1])), (1, 7, Some([0, 0, 0])), (2, 7, Some([0, 0, 0])), (3, 9, None), (4, 9, Some([2, 2, 2]))]);
+        n.at_call.insert(2, Some([0, 0, 0]));
+        let gpu = |nth: u32| [Some([4, 1, 1]), Some([8, 8, 1]), None, Some([1, 1, 1]), Some([3, 2, 2])][nth as usize];
+        n.settle(gpu);
+        assert_eq!(n.tally[&7], Tally { same: 1, zeros: 1, other: 0, unread: 0 });
+        assert_eq!(n.waiting.len(), 3, "the third is not read yet: the later ones wait behind it");
+        let read = |nth: u32| if nth == 2 { Some([0xffff_0001, 0xffff_0002, 0xffff_0004]) } else { gpu(nth) };
+        n.settle(read);
+        assert_eq!(n.tally[&7], Tally { same: 1, zeros: 2, other: 0, unread: 0 });
+        assert_eq!(n.tally[&9], Tally { same: 0, zeros: 0, other: 2, unread: 0 }, "words not read, and other words");
+        assert!(n.waiting.is_empty());
+        let line = n.line(2, 7);
+        assert!(line.starts_with("; at the call it showed 0x0, 0x0, 0x0; of this program's checked calls so far"), "{line}");
+        assert!(line.ends_with("what the GPU read in 1, zeros in 2, other words in 0 (0 not read back)"), "{line}");
+        assert!(n.line(77, 5).starts_with("; of this program's"), "a slot with no call noted");
+        // a call the GPU never reads does not hold the later ones for good
+        n.waiting.extend((0..=WAITING_MAX as u32).map(|k| (100 + k, 7, Some([1, 1, 1]))));
+        n.settle(|nth| (nth != 100).then_some([1, 1, 1]));
+        assert!(n.waiting.is_empty());
+        assert_eq!(n.tally[&7], Tally { same: 1 + WAITING_MAX as u64, zeros: 2, other: 0, unread: 1 });
     }
 
     #[test]
