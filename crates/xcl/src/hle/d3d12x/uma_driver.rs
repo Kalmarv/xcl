@@ -621,6 +621,78 @@ pub(super) unsafe fn read_vram_bytes(at: usize, len: usize) -> Option<Vec<u8>> {
     Some(out)
 }
 
+/// Batch-read multiple `[at, at + len)` ranges that overlap a `GPU_UPLOAD` VRAM segment using a
+/// single COPY-queue submission + fence wait per `readback_cap` chunk. Entries not overlapping
+/// VRAM (or with `len == 0`) return `None` (callers read them directly from CPU memory).
+pub(super) unsafe fn read_vram_batch(ranges: &[(usize, usize)]) -> Vec<Option<Vec<u8>>> {
+    let mut out: Vec<Option<Vec<u8>>> = (0..ranges.len()).map(|_| None).collect();
+    if ranges.is_empty() || !VRAM_READER_ACTIVE.load(Ordering::Acquire) {
+        return out;
+    }
+    let mut g = VRAM_READER.lock().unwrap();
+    let Some(r) = g.as_mut() else { return out };
+    let mut hits: Vec<(usize, usize, usize)> = Vec::new();
+    for (idx, &(at, len)) in ranges.iter().enumerate() {
+        if len == 0 {
+            continue;
+        }
+        let Some(end) = at.checked_add(len) else { continue };
+        if at >= r.window_base && end <= r.window_end && r.vram_ranges.iter().any(|&(s, e)| at < e && end > s) {
+            hits.push((idx, at - r.window_base, len));
+        }
+    }
+    if hits.is_empty() {
+        return out;
+    }
+    let max_one = hits.iter().map(|h| h.2).max().unwrap_or(0);
+    if max_one > r.readback_cap {
+        let new_cap = max_one.next_power_of_two().max(32 << 20);
+        if let Ok((rb, ptr)) = make_readback(&r.device, new_cap) {
+            r.readback.Unmap(0, None);
+            r.readback = rb;
+            r.readback_ptr = ptr;
+            r.readback_cap = new_cap;
+        } else {
+            return out;
+        }
+    }
+    let mut i = 0;
+    while i < hits.len() {
+        if r.alloc.Reset().is_err() || r.list.Reset(&r.alloc, None).is_err() {
+            break;
+        }
+        let mut dst_off = 0usize;
+        let start_i = i;
+        let mut chunk: Vec<(usize, usize, usize)> = Vec::new();
+        while i < hits.len() {
+            let (idx, src_off, len) = hits[i];
+            if dst_off + len > r.readback_cap && i > start_i {
+                break;
+            }
+            r.list.CopyBufferRegion(&r.readback, dst_off as u64, &r.src_buf, src_off as u64, len as u64);
+            chunk.push((idx, dst_off, len));
+            dst_off += len;
+            i += 1;
+        }
+        if r.list.Close().is_err() {
+            break;
+        }
+        let Ok(cl) = r.list.cast::<ID3D12CommandList>() else { break };
+        r.queue.ExecuteCommandLists(&[Some(cl)]);
+        r.fence_val += 1;
+        let fv = r.fence_val;
+        if r.queue.Signal(&r.fence, fv).is_err() || crate::gpu::fence::wait(&r.fence, fv, &r.device, None, 5000).is_err() {
+            break;
+        }
+        for (idx, off, len) in chunk {
+            let mut v = vec![0u8; len];
+            std::ptr::copy_nonoverlapping(r.readback_ptr.add(off), v.as_mut_ptr(), len);
+            out[idx] = Some(v);
+        }
+    }
+    out
+}
+
 #[cfg(test)]
 mod tests {
     use super::{build_segments, decide, parse_mixed};

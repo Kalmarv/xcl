@@ -2286,16 +2286,42 @@ unsafe fn upload_all(todo: Vec<Due>, dirty: &[usize], page: usize, title: Option
         Some((d, changed, bytes))
     }).peekable();
     while todo.peek().is_some() {
-        let (mut items, mut known): (Vec<texture_upload::Item>, Vec<texture_upload::Known>) = (Vec::new(), Vec::new());
+        let mut batch: Vec<(Due, Option<Vec<(usize, usize)>>)> = Vec::new();
         let (mut bytes, mut device) = (0usize, 0usize);
-        while let Some((d, mut changed, n)) = todo.next_if(|(d, _, n)| batch_fits(items.len(), bytes, device, d.device, *n)) {
+        while let Some((d, changed, n)) = todo.next_if(|(d, _, n)| batch_fits(batch.len(), bytes, device, d.device, *n)) {
             device = d.device;
             bytes += n;
+            batch.push((d, changed));
+        }
+        let level_pages = super::vram::level_pages();
+        let trace = super::present::trace_frame();
+        let preloaded: Vec<Option<Vec<u8>>> = if level_pages || trace {
+            let ranges: Vec<(usize, usize)> = batch
+                .iter()
+                .map(|(d, _)| {
+                    if d.pages.is_none() && ((level_pages && super::vram::has_lazy_levels(d.res.as_raw() as usize)) || trace) {
+                        (d.src, d.tex.size() as usize)
+                    } else {
+                        (0, 0)
+                    }
+                })
+                .collect();
+            super::uma_driver::read_vram_batch(&ranges)
+        } else {
+            Vec::new()
+        };
+        let (mut items, mut known): (Vec<texture_upload::Item>, Vec<texture_upload::Known>) = (Vec::with_capacity(batch.len()), Vec::with_capacity(batch.len()));
+        for (idx, (d, mut changed)) in batch.into_iter().enumerate() {
+            let pre = preloaded.get(idx).and_then(|v| v.as_deref());
+            let subs_of = || match pre {
+                Some(mem) => subresources_from_bytes(mem, &d.tex),
+                None => subresources_in(d.src, &d.tex, d.pages.as_deref()),
+            };
             let mut unmapped = false;
-            if super::vram::level_pages() && super::vram::has_lazy_levels(d.res.as_raw() as usize) {
+            if level_pages && super::vram::has_lazy_levels(d.res.as_raw() as usize) {
                 // (the queue waits for these mappings before the copies: `vram::before_execute`
                 // below; what a level's fresh pages held is another texture's, so all of it goes up)
-                if !map_levels_with_texels(&d.res, &subresources_in(d.src, &d.tex, d.pages.as_deref())).is_empty() {
+                if !map_levels_with_texels(&d.res, &subs_of()).is_empty() {
                     changed = None;
                 }
                 unmapped = super::vram::has_unmapped_levels(d.res.as_raw() as usize);
@@ -2311,8 +2337,8 @@ unsafe fn upload_all(todo: Vec<Due>, dirty: &[usize], page: usize, title: Option
                 // (before its bytes are read: what is written from here on is compared)
                 texture_upload::all_sent(&d.known, d.src, d.tex.size() as usize);
             }
-            if super::present::trace_frame() {
-                note_content(d.src, &d.res, &subresources_in(d.src, &d.tex, d.pages.as_deref()));
+            if trace {
+                note_content(d.src, &d.res, &subs_of());
             }
             items.push(texture_upload::Item { res: d.res, src: d.src, tex: d.tex, states: d.states, changed, known: Some(Arc::clone(&d.known)), pages: d.pages });
             known.push(d.known);
@@ -2734,6 +2760,24 @@ unsafe fn title_bytes(at: usize, len: usize) -> std::borrow::Cow<'static, [u8]> 
 #[cfg(test)]
 pub(super) unsafe fn subresources(va: usize, tex: &xg::Texture) -> Vec<Subresource> {
     subresources_in(va, tex, None)
+}
+
+/// Every subresource (D3D12 order) of a texture from already-read bytes `mem`.
+fn subresources_from_bytes(mem: &[u8], tex: &xg::Texture) -> Vec<Subresource> {
+    let Some(tex) = tex.texels() else { return Vec::new() };
+    let c = &tex.chain;
+    let bpe = tex.bpe as usize;
+    if tex.depth > 0 {
+        return c.levels.iter().enumerate().map(|(i, l)| Subresource { depth: l.depth, rows: l.height, row_bytes: l.width * bpe, data: c.detile_volume(mem, i) }).collect();
+    }
+    let mut out = Vec::with_capacity(tex.array as usize * c.levels.len());
+    for s in 0..tex.array as usize {
+        let slice = &mem[s * c.slice_bytes..(s + 1) * c.slice_bytes];
+        for (i, l) in c.levels.iter().enumerate() {
+            out.push(Subresource { depth: 1, rows: l.height, row_bytes: l.width * bpe, data: c.detile_level(slice, i, s) });
+        }
+    }
+    out
 }
 
 /// Every subresource (D3D12 order) of a texture from the title's memory at `va`, read through

@@ -289,10 +289,18 @@ pub(super) unsafe fn changed(textures: &[Written], trust: bool) -> (Vec<Change>,
                 _ => groups.push(k..k + 1),
             }
         }
+        let ranges: Vec<(usize, usize)> = groups
+            .iter()
+            .map(|r| {
+                let (first, last) = (&pages[r.start], &pages[r.end - 1]);
+                if textures[first.texture].pages.is_some() { (0, 0) } else { (first.at, last.at + last.len - first.at) }
+            })
+            .collect();
+        let preloaded = super::uma_driver::read_vram_batch(&ranges);
         let look = |g: usize| {
             let group = &pages[groups[g].clone()];
             let (first, last) = (&group[0], &group[group.len() - 1]);
-            read(textures[first.texture].pages, first.at, last.at + last.len - first.at, |b| {
+            read_preloaded(preloaded[g].as_deref(), textures[first.texture].pages, first.at, last.at + last.len - first.at, |b| {
                 for p in group {
                     let h = content_hash(&b[p.at - first.at..][..p.len]);
                     // SAFETY: see `Page`
@@ -374,6 +382,14 @@ impl PageMap {
             done += n;
         }
     }
+}
+
+/// Like `read`, using `preloaded` (from `uma_driver::read_vram_batch`) when present.
+unsafe fn read_preloaded<R>(preloaded: Option<&[u8]>, pages: Option<&PageMap>, at: usize, len: usize, f: impl FnOnce(&[u8]) -> R) -> R {
+    if let Some(b) = preloaded {
+        return f(b);
+    }
+    read(pages, at, len, f)
 }
 
 /// `f` with the `len` bytes of the title's memory at `at`: where they are in the window that stays
@@ -630,6 +646,38 @@ unsafe fn fill_hashed(items: &[Item], pieces: &[Piece], ptr: *mut u8, bytes: u64
     unsafe impl Sync for Mapped {}
     let to = Mapped(ptr);
     let work = work_of(items, pieces);
+    let ranges: Vec<(usize, usize)> = work
+        .iter()
+        .map(|w| match w {
+            Work::Blocks { piece, by, bx } => {
+                let p = &pieces[*piece];
+                let (it, c) = (&items[p.item], &items[p.item].tex.texels().unwrap().chain);
+                if it.pages.is_some() { (0, 0) } else { (it.src + p.slice * c.slice_bytes + c.block_at(p.level, bx.start, *by), bx.len() * c.layout.block_bytes) }
+            }
+            Work::Tail { pieces: range } => {
+                let first = &pieces[range.start];
+                let (it, c) = (&items[first.item], &items[first.item].tex.texels().unwrap().chain);
+                if it.pages.is_some() { (0, 0) } else { (it.src + first.slice * c.slice_bytes, c.layout.block_bytes) }
+            }
+            Work::Rows { piece, y } => {
+                let p = &pieces[*piece];
+                let (it, c) = (&items[p.item], &items[p.item].tex.texels().unwrap().chain);
+                if it.pages.is_some() {
+                    (0, 0)
+                } else {
+                    let (l, e) = (&c.levels[p.level], c.layout.elem_log2);
+                    let stride = l.pitch << e;
+                    (it.src + p.slice * c.slice_bytes + l.offset + y.start * stride + (p.rect.x0 << e), y.len() * stride - (p.rect.x0 << e))
+                }
+            }
+            Work::Volume { pieces: range } => {
+                let first = &pieces[range.start];
+                let it = &items[first.item];
+                if it.pages.is_some() { (0, 0) } else { (it.src, it.tex.texels().unwrap().size() as usize) }
+            }
+        })
+        .collect();
+    let preloaded = super::uma_driver::read_vram_batch(&ranges);
     let note = |item: usize, from: usize, b: &[u8]| {
         if let Some((pages, _)) = &hashes[item] {
             let it = &items[item];
@@ -638,6 +686,7 @@ unsafe fn fill_hashed(items: &[Item], pieces: &[Piece], ptr: *mut u8, bytes: u64
     };
     let one = |k: usize| {
         let to = &to;
+        let pre = preloaded[k].as_deref();
         // SAFETY: the pieces were placed inside the buffer; the title's memory is only read
         unsafe {
             match &work[k] {
@@ -645,7 +694,7 @@ unsafe fn fill_hashed(items: &[Item], pieces: &[Piece], ptr: *mut u8, bytes: u64
                     let p = &pieces[*piece];
                     let (it, c) = (&items[p.item], &items[p.item].tex.texels().unwrap().chain);
                     let from = it.src + p.slice * c.slice_bytes + c.block_at(p.level, bx.start, *by);
-                    read(it.pages.as_deref(), from, bx.len() * c.layout.block_bytes, |b| {
+                    read_preloaded(pre, it.pages.as_deref(), from, bx.len() * c.layout.block_bytes, |b| {
                         note(p.item, from, b);
                         c.detile_blocks(b, p.level, p.slice, *by, bx.clone(), p.rect, to.0.add(p.at as usize), p.footprint.RowPitch as usize);
                     });
@@ -654,7 +703,7 @@ unsafe fn fill_hashed(items: &[Item], pieces: &[Piece], ptr: *mut u8, bytes: u64
                     let first = &pieces[range.start];
                     let (it, c) = (&items[first.item], &items[first.item].tex.texels().unwrap().chain);
                     let from = it.src + first.slice * c.slice_bytes;
-                    read(it.pages.as_deref(), from, c.layout.block_bytes, |b| {
+                    read_preloaded(pre, it.pages.as_deref(), from, c.layout.block_bytes, |b| {
                         note(first.item, from, b);
                         for p in &pieces[range.clone()] {
                             c.detile_blocks(b, p.level, p.slice, 0, 0..1, p.rect, to.0.add(p.at as usize), p.footprint.RowPitch as usize);
@@ -667,7 +716,7 @@ unsafe fn fill_hashed(items: &[Item], pieces: &[Piece], ptr: *mut u8, bytes: u64
                     let (l, e) = (&c.levels[p.level], c.layout.elem_log2);
                     let (stride, row) = (l.pitch << e, (p.rect.x1 - p.rect.x0) << e);
                     let from = it.src + p.slice * c.slice_bytes + l.offset + y.start * stride + (p.rect.x0 << e);
-                    read(it.pages.as_deref(), from, y.len() * stride - (p.rect.x0 << e), |b| {
+                    read_preloaded(pre, it.pages.as_deref(), from, y.len() * stride - (p.rect.x0 << e), |b| {
                         note(p.item, from, b);
                         for (n, y) in y.clone().enumerate() {
                             let dst = to.0.add(p.at as usize + (y - p.rect.y0) * p.footprint.RowPitch as usize);
@@ -679,7 +728,7 @@ unsafe fn fill_hashed(items: &[Item], pieces: &[Piece], ptr: *mut u8, bytes: u64
                     let first = &pieces[range.start];
                     let it = &items[first.item];
                     let s = it.tex.texels().unwrap();
-                    read(it.pages.as_deref(), it.src, s.size() as usize, |b| {
+                    read_preloaded(pre, it.pages.as_deref(), it.src, s.size() as usize, |b| {
                         note(first.item, it.src, b);
                         for p in &pieces[range.clone()] {
                             let (l, row) = (&s.chain.levels[p.level], p.rect.x1 * s.bpe as usize);
