@@ -296,7 +296,7 @@ mod translated {
                 Backend::current(),
                 direct_version(crate::gpu::dxil::kernel::TRANSLATOR_VERSION, env!("XCL_DIRECT_DXIL_SOURCE_ID")),
             );
-            let id = if Backend::current() != Backend::Hlsl && crate::gpu::dxil::kernel::declared_lds_enabled() {
+            let id = if crate::gpu::dxil::kernel::declared_lds_enabled() {
                 identity_for(&id.to_string(), "declared-lds")
             } else { id };
             // `XCL_DIRECT_COMPACT=0` or `1`: the compact form forced off or on is another output

@@ -190,6 +190,11 @@ impl Names {
         self.by.remove(res)
     }
 
+    /// Whether any descriptor slot in the shared heap currently names `res`.
+    fn has_live(&self, res: usize) -> bool {
+        self.by.with_ref(res, |v| v.iter().any(|&i| self.name(i) == res)).unwrap_or(false)
+    }
+
     /// Whether the descriptor at `i` still names `res`: then it is `GONE` from now on (the caller
     /// writes a null view there, with `SLOT_WRITES` held). One overwritten since names another
     /// resource and stays.
@@ -213,6 +218,11 @@ static SLOT_WRITES: Mutex<()> = Mutex::new(());
 
 fn names() -> &'static Names {
     NAMES.get_or_init(|| Names::new(GLOBAL_MAX as usize))
+}
+
+/// Whether any live slot in the shared shader-visible descriptor heap currently names `res`.
+pub fn has_live_view(res: usize) -> bool {
+    NAMES.get().is_some_and(|n| n.has_live(res))
 }
 
 /// What null views are copied from: the device, the shared heap's start and increment, the

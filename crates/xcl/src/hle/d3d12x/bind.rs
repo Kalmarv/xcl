@@ -1139,15 +1139,17 @@ enum RunItem {
     Bind { pso: usize, _held: Option<ID3D12PipelineState> },
     StencilRef(u32),
     Topology(u32),
+    Scissors(Vec<[i32; 4]>),
 }
 
 /// A run item as `batch_commands` takes it.
-#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+#[derive(Clone, Debug, PartialEq, Eq)]
 enum Step {
     Draw(DrawSnap),
     Bind(usize),
     StencilRef(u32),
     Topology(u32),
+    Scissors(Vec<[i32; 4]>),
 }
 
 impl RunItem {
@@ -1157,6 +1159,7 @@ impl RunItem {
             RunItem::Bind { pso, .. } => Step::Bind(*pso),
             RunItem::StencilRef(r) => Step::StencilRef(*r),
             RunItem::Topology(t) => Step::Topology(*t),
+            RunItem::Scissors(r) => Step::Scissors(r.clone()),
         }
     }
 }
@@ -1230,7 +1233,7 @@ fn batch_region_bytes(need: u64) -> u64 {
 /// the console's own methods – records the run first.
 fn keeps_two_pass_batch(slot: usize, newer_layout: bool) -> bool {
     let (ei, dm) = if newer_layout { (61, 129) } else { (59, 127) };
-    matches!(slot, 0..=8 | 20 | 24 | 25 | 33..=46) || slot == ei || slot == dm
+    matches!(slot, 0..=8 | 20 | 22 | 24 | 25 | 33..=46) || slot == ei || slot == dm || (newer_layout && slot == 142)
 }
 
 /// Whether a list call through `slot` records the list's deferred draws first.
@@ -1369,6 +1372,8 @@ enum Cmd {
     StencilRef(u32),
     /// the title's IASetPrimitiveTopology between deferred draws, replayed before subsequent mesh passes
     Topology(u32),
+    /// the title's RSSetScissorRects between deferred draws, replayed before subsequent mesh passes
+    Scissors(Vec<[i32; 4]>),
     /// an `XCL_GPU_TIMES` span: the rewrites and compute passes (None), the mesh pass of draw `d`
     TimesBegin(Option<usize>),
     TimesEnd,
@@ -1446,6 +1451,10 @@ fn batch_commands(steps: &[Step], records: usize, open: bool) -> Vec<Cmd> {
                 v.push(Cmd::Topology(*t));
                 continue;
             }
+            Step::Scissors(r) => {
+                v.push(Cmd::Scissors(r.clone()));
+                continue;
+            }
             Step::Draw(d) => d,
         };
         v.push(Cmd::TimesBegin(Some(i)));
@@ -1499,6 +1508,7 @@ unsafe fn emit_commands(this: *mut c_void, list: &ID3D12GraphicsCommandList, cmd
             Cmd::Bind(p) => super::real::bind_pipeline(this, *p as *mut c_void),
             Cmd::StencilRef(r) => super::list_x::apply_stencil_ref(this, *r),
             Cmd::Topology(t) => super::list_x::apply_topology(this, *t),
+            Cmd::Scissors(r) => super::list_x::apply_scissors(this, r),
             Cmd::TimesBegin(None) => super::gpu_times::before(this, 0, super::gpu_times::Kind::MeshBatch, [draws.len() as u32, 0, 0], false),
             Cmd::TimesBegin(Some(d)) => {
                 let d = &draws[*d];
@@ -1531,6 +1541,7 @@ pub(super) unsafe fn flush_two_pass(this: *mut c_void, why: RunEnd) {
                 RunItem::Bind { pso: p, .. } => super::real::bind_pipeline(this, *p as *mut c_void),
                 RunItem::StencilRef(r) => super::list_x::apply_stencil_ref(this, *r),
                 RunItem::Topology(t) => super::list_x::apply_topology(this, *t),
+                RunItem::Scissors(r) => super::list_x::apply_scissors(this, r),
                 RunItem::Draw(_) => {}
             }
         }
@@ -1655,6 +1666,16 @@ pub(super) unsafe fn queue_topology(this: *mut c_void, t: u32) -> bool {
         return false;
     }
     with(this, |s| s.deferred.push(RunItem::Topology(t)));
+    true
+}
+
+/// Queue `RSSetScissorRects` into the list's deferred two-pass run when deferring, so it
+/// replays in title order between mesh passes instead of flushing the batch.
+pub(super) unsafe fn queue_scissors(this: *mut c_void, rects: Vec<[i32; 4]>) -> bool {
+    if DEFERRING_LISTS.load(Ordering::Relaxed) == 0 || !DEFERRING.contains(this as usize) {
+        return false;
+    }
+    with(this, |s| s.deferred.push(RunItem::Scissors(rects)));
     true
 }
 
@@ -5279,34 +5300,36 @@ void main(uint t : SV_GroupIndex) {
         let (mut cv, mut gv) = (BTreeMap::new(), BTreeMap::new());
         let mut out = Vec::new();
         for c in cmds {
-            match *c {
+            match c {
                 Cmd::ComputeRs(r) => {
+                    let r = *r;
                     if r != crs {
                         cv.clear();
                     }
                     crs = r;
                 }
                 Cmd::GraphicsRs(r) => {
+                    let r = *r;
                     if r != grs {
                         gv.clear();
                     }
                     grs = r;
                 }
-                Cmd::Pso(p) => pso = p,
+                Cmd::Pso(p) => pso = *p,
                 Cmd::ComputeView(s, va) => {
-                    cv.insert(s, va);
+                    cv.insert(*s, *va);
                 }
                 Cmd::GraphicsView(s, va) => {
-                    gv.insert(s, va);
+                    gv.insert(*s, *va);
                 }
                 Cmd::Dispatch(_) | Cmd::Indirect(0xD0, ..) => out.push(Call { call: c.clone(), pso, rs: crs, views: cv.clone() }),
                 Cmd::DispatchMesh(_) | Cmd::Indirect(..) => out.push(Call { call: c.clone(), pso, rs: grs, views: gv.clone() }),
                 // (the title's pipeline set, with what it sets: as a call of its own, in order)
                 Cmd::Bind(p) => {
-                    pso = p;
+                    pso = *p;
                     out.push(Call { call: c.clone(), pso, rs: 0, views: BTreeMap::new() });
                 }
-                Cmd::StencilRef(_) | Cmd::Topology(_) => {
+                Cmd::StencilRef(_) | Cmd::Topology(_) | Cmd::Scissors(_) => {
                     out.push(Call { call: c.clone(), pso, rs: 0, views: BTreeMap::new() });
                 }
                 Cmd::Barriers { .. } | Cmd::TimesBegin(_) | Cmd::TimesEnd => {}
@@ -5353,6 +5376,7 @@ void main(uint t : SV_GroupIndex) {
                 Step::Bind(p) => alone.push(calls(&[Cmd::Bind(*p)])[0].clone()),
                 Step::StencilRef(r) => alone.push(calls(&[Cmd::StencilRef(*r)])[0].clone()),
                 Step::Topology(t) => alone.push(calls(&[Cmd::Topology(*t)])[0].clone()),
+                Step::Scissors(r) => alone.push(calls(&[Cmd::Scissors(r.clone())])[0].clone()),
                 Step::Draw(d) => alone.extend(calls(&unbatched_commands(d))),
             }
         }
@@ -5522,11 +5546,14 @@ void main(uint t : SV_GroupIndex) {
         for newer in [false, true] {
             let kept: Vec<usize> = (0..600).filter(|&s| keeps_two_pass_batch(s, newer)).collect();
             let (ei, dm) = if newer { (61, 129) } else { (59, 127) };
-            let want: Vec<usize> = (0..=8).chain([20, 24, 25]).chain(33..=46).chain([ei, dm]).collect();
+            let mut want: Vec<usize> = (0..=8).chain([20, 22, 24, 25]).chain(33..=46).chain([ei, dm]).collect();
+            if newer {
+                want.push(142);
+            }
             assert_eq!(kept, want, "newer layout: {newer}");
             // pipelines, barriers, draws, dispatches, copies, clears, IA / RS / OM state, heaps,
             // queries, predication, bundles, markers, Close, Reset, the console's own methods
-            for slot in [26, 12, 13, 14, 15, 16, 17, 18, 19, 21, 22, 23, 27, 28, 29, 30, 31, 32, 47, 48, 49, 50, 51, 52, 53, 54, 55, 56, 57, 58, 9, 10, 11, 60, 67, 78, 81, 85, 93, 104, 105, 106, 124, 125, 139, 146, 148] {
+            for slot in [26, 12, 13, 14, 15, 16, 17, 18, 19, 21, 23, 27, 28, 29, 30, 31, 32, 47, 48, 49, 50, 51, 52, 53, 54, 55, 56, 57, 58, 9, 10, 11, 60, 67, 78, 81, 85, 93, 104, 105, 106, 124, 125, 139, 146, 148] {
                 assert!(flush_wanted(slot, newer, true, true), "slot {slot}, newer layout: {newer}");
             }
             // the other layout's DispatchMesh / ExecuteIndirect slots are other methods there

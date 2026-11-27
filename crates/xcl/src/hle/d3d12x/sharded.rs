@@ -74,6 +74,10 @@ impl<V> Sharded<V> {
         self.shard(key).as_ref()?.get(&key).cloned()
     }
 
+    pub fn with_ref<R>(&self, key: usize, f: impl FnOnce(&V) -> R) -> Option<R> {
+        Some(f(self.shard(key).as_ref()?.get(&key)?))
+    }
+
     /// `f` with the value of `key` (made when there is none), with its part's lock held: `f` looks
     /// up nothing else here.
     pub fn with<R>(&self, key: usize, f: impl FnOnce(&mut V) -> R) -> R

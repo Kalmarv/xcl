@@ -607,11 +607,31 @@ pub(super) unsafe extern "system" fn rs_set_scissors_x(this: *mut c_void, n: u32
         let rs = if r.is_null() { &[][..] } else { std::slice::from_raw_parts(r, n as usize) };
         Some(super::capture::Op::Scissors(rs.iter().map(|r| [r.left, r.top, r.right, r.bottom]).collect()))
     });
-    if !r.is_null() {
-        let rs = std::slice::from_raw_parts(r, n as usize).to_vec();
-        with_bindings(this, |b| b.scissors = rs);
+    if !r.is_null() && n > 0 {
+        let rs = std::slice::from_raw_parts(r, n as usize);
+        let rects: Vec<[i32; 4]> = rs.iter().map(|r| [r.left, r.top, r.right, r.bottom]).collect();
+        if super::bind::queue_scissors(this, rects) {
+            return;
+        }
+        with_bindings(this, |b| b.scissors = rs.to_vec());
+    } else if r.is_null() || n == 0 {
+        if super::bind::queue_scissors(this, Vec::new()) {
+            return;
+        }
     }
     pc::<unsafe extern "system" fn(*mut c_void, u32, *const windows::Win32::Foundation::RECT)>(this, PC_RS_SET_SCISSOR_RECTS)(this, n, r)
+}
+
+pub(super) unsafe fn apply_scissors(this: *mut c_void, rects: &[[i32; 4]]) {
+    let rs: Vec<windows::Win32::Foundation::RECT> = rects
+        .iter()
+        .map(|&[left, top, right, bottom]| windows::Win32::Foundation::RECT { left, top, right, bottom })
+        .collect();
+    if !rs.is_empty() {
+        with_bindings(this, |b| b.scissors = rs.clone());
+    }
+    let ptr = if rs.is_empty() { std::ptr::null() } else { rs.as_ptr() };
+    pc::<unsafe extern "system" fn(*mut c_void, u32, *const windows::Win32::Foundation::RECT)>(this, PC_RS_SET_SCISSOR_RECTS)(this, rs.len() as u32, ptr)
 }
 
 /// console #23 OMSetBlendFactor (PC #23)

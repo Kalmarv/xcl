@@ -1383,20 +1383,26 @@ pub fn page_owners() -> String {
     let g = PAGES.lock().unwrap();
     // (with every page, with pages by level): textures, pages held
     let mut kinds = [(0usize, 0usize); 2];
+    let (mut unviewed_n, mut unviewed_p) = (0usize, 0usize);
     let (mut pages, mut idle) = (0usize, 0usize);
     for p in g.values().flatten() {
         pages += p.pages.len() + p.extra_pages.len();
         idle += p.idle.len();
-        for t in p.targets.values() {
+        for (&res, t) in &p.targets {
             let k = if t.levels.is_none() { 0 } else { 1 };
+            let n = t.used.len() + t.used_extra.len();
             kinds[k].0 += 1;
-            kinds[k].1 += t.used.len() + t.used_extra.len();
+            kinds[k].1 += n;
+            if k == 1 && n > 0 && !super::console_heap::has_live_view(res) {
+                unviewed_n += 1;
+                unviewed_p += n;
+            }
         }
     }
     let mb = |n: usize| n * PAGE >> 20;
     format!(
-        "target pages by owner: {} textures with all their pages hold {} MB, {} sampled textures with pages by level hold {} MB (a shared page counts for each); {} MB of pages in all, {} MB of them idle",
-        kinds[0].0, mb(kinds[0].1), kinds[1].0, mb(kinds[1].1), mb(pages), mb(idle)
+        "target pages by owner: {} textures with all their pages hold {} MB, {} sampled textures with pages by level hold {} MB ({} without a live shared-heap view hold {} MB; a shared page counts for each); {} MB of pages in all, {} MB of them idle",
+        kinds[0].0, mb(kinds[0].1), kinds[1].0, mb(kinds[1].1), unviewed_n, mb(unviewed_p), mb(pages), mb(idle)
     )
 }
 
