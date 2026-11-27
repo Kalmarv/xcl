@@ -376,13 +376,25 @@ fn cooled(cooling: &VecDeque<((u32, u32), std::time::Instant)>, now: std::time::
     cooling.front().is_some_and(|&(_, at)| now.duration_since(at) >= COOL)
 }
 
-/// The pool tile to use next (`State::take_tile`): the oldest of `cooling` if it cooled, else
-/// one of `free`. None: neither, though tiles freed less than `COOL` ago may be cooling.
-fn reuse_tile(free: &mut Vec<(u32, u32)>, cooling: &mut VecDeque<((u32, u32), std::time::Instant)>, now: std::time::Instant) -> Option<(u32, u32)> {
-    if cooled(cooling, now) {
-        return cooling.pop_front().map(|(t, _)| t);
+/// `XCL_SPARSE_COLD_OWN=1` with `XCL_VRAM_HOT_PRIORITY=1` (read once): the windows' own tiles
+/// come from pool heaps of their own with `D3D12_RESIDENCY_PRIORITY_MINIMUM`, the tiles of GPU
+/// views and of placed buffers from heaps with `HIGH`. A process over its video memory budget
+/// then has the own tiles demoted first: only shaders that take an address from the title's
+/// own tables read them, while every draw reads the views.
+fn cold_own_wanted() -> bool {
+    static ON: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
+    *ON.get_or_init(|| super::uma_driver::hot_priority_wanted() && std::env::var("XCL_SPARSE_COLD_OWN").is_ok_and(|v| v.trim() == "1"))
+}
+
+/// The pool tile to use next (`State::take_tile`) among the heaps `of_class` names: the oldest
+/// cooled one of `cooling`, else the last of `free`. None: neither, though tiles freed less
+/// than `COOL` ago may be cooling.
+fn reuse_tile(free: &mut Vec<(u32, u32)>, cooling: &mut VecDeque<((u32, u32), std::time::Instant)>, now: std::time::Instant, of_class: impl Fn(u32) -> bool) -> Option<(u32, u32)> {
+    if let Some(i) = cooling.iter().take_while(|&&(_, at)| now.duration_since(at) >= COOL).position(|&((h, _), _)| of_class(h)) {
+        return cooling.remove(i).map(|(t, _)| t);
     }
-    free.pop()
+    let i = free.iter().rposition(|&(h, _)| of_class(h))?;
+    Some(free.remove(i))
 }
 
 /// The pool heaps (`pools` of them) all of whose tiles are in `free` or cooled in `cooling` at
@@ -505,6 +517,9 @@ struct State {
     windows: Vec<(usize, ID3D12Resource)>,
     /// video-memory pool heaps (None: given back, its index free for the next one)
     pools: Vec<Option<ID3D12Heap>>,
+    /// by pool index, whether the heap holds the windows' own tiles (`cold_own_wanted`; all
+    /// false without it)
+    cold: Vec<bool>,
     /// pool tiles to use: those of a pool that were never used, and cooled ones (`cooling`)
     free: Vec<(u32, u32)>,
     /// pool tiles freed (`flush_parked`, once `quarantined` lets them go, and `release_if_unused`),
@@ -1066,6 +1081,7 @@ unsafe fn new_state(dev: &ID3D12Device, windows: Vec<(usize, ID3D12Resource)>) -
         job_seq: 0,
         windows,
         pools: Vec::new(),
+        cold: Vec::new(),
         free: Vec::new(),
         cooling: VecDeque::new(),
         retired: Vec::new(),
@@ -1222,13 +1238,17 @@ impl State {
     /// A pool tile (true: used before, to be cleared). One freed less than `COOL` ago, or one
     /// still `quarantined`, is not taken: a retired pool is taken back or a heap made instead.
     /// (Parked tiles are not flushed for it: freed now, they would wait and cool all the same.)
-    unsafe fn take_tile(&mut self) -> Option<((u32, u32), bool)> {
+    /// `cold`: for one of the windows' own tiles, which `cold_own_wanted` takes from heaps of
+    /// their own.
+    unsafe fn take_tile(&mut self, cold: bool) -> Option<((u32, u32), bool)> {
         #[cfg(test)]
         if tests::NO_TILES.with(|c| c.get()) {
             return None;
         }
+        let cold = cold && cold_own_wanted();
         self.drain_quarantined();
-        if let Some(t) = reuse_tile(&mut self.free, &mut self.cooling, std::time::Instant::now()) {
+        let class = &self.cold;
+        if let Some(t) = reuse_tile(&mut self.free, &mut self.cooling, std::time::Instant::now(), |h| class.get(h as usize).copied().unwrap_or(false) == cold) {
             return Some((t, true));
         }
         // a pool retired a moment ago (its last tile came free) is taken back before a new
@@ -1236,7 +1256,10 @@ impl State {
         // up to 18 GB of retired heaps in 2 s (#913). Its tiles are reused as freed tiles are
         // (zeroed), and they all cooled before it was retired.
         if let Some((heap, _, _)) = self.retired.pop() {
-            let h = self.add_pool(heap);
+            if cold_own_wanted() {
+                self.set_class_priority(&heap, cold);
+            }
+            let h = self.add_pool(heap, cold);
             return Some(((h, 0), true));
         }
         let desc = D3D12_HEAP_DESC {
@@ -1255,16 +1278,40 @@ impl State {
         }
         let heap = heap?;
         let _ = heap.SetName(windows::core::w!("xcl sparse tile pool"));
-        if let Ok(p) = heap.cast::<ID3D12Pageable>() {
-            super::uma_driver::set_sparse_priority(&self.dev, &p, "sparse tile pool");
+        self.set_class_priority(&heap, cold);
+        let h = self.add_pool(heap, cold);
+        if cold_own_wanted() {
+            let all = self.pools.iter().flatten().count();
+            if all.is_power_of_two() {
+                let own = self.cold.iter().zip(&self.pools).filter(|(c, p)| **c && p.is_some()).count();
+                crate::xlog_info!("sparse windows: XCL_SPARSE_COLD_OWN: {own} pool heaps of the windows' own tiles (MINIMUM), {} of views and placed buffers (NORMAL+), 64 MB each", all - own);
+            }
         }
-        let h = self.add_pool(heap);
         Some(((h, 0), false))
     }
 
-    /// `heap` becomes a pool (in a given-back pool's index if there is one); its tiles but the
-    /// first, which the caller takes, go to the free list.
-    fn add_pool(&mut self, heap: ID3D12Heap) -> u32 {
+    /// The residency priority of a pool heap of its class (`XCL_VRAM_HOT_PRIORITY`).
+    unsafe fn set_class_priority(&self, heap: &ID3D12Heap, cold: bool) {
+        if let Ok(p) = heap.cast::<ID3D12Pageable>() {
+            if cold {
+                super::uma_driver::set_minimum_priority(&self.dev, &p, "sparse tile pool of the windows' own tiles");
+            } else {
+                super::uma_driver::set_sparse_priority(&self.dev, &p, "sparse tile pool");
+            }
+        }
+    }
+
+    /// Whether `take_tile(cold)` finds a tile without making a heap.
+    fn at_hand(&self, cold: bool) -> bool {
+        let cold = cold && cold_own_wanted();
+        let now = std::time::Instant::now();
+        let of_class = |h: u32| self.cold.get(h as usize).copied().unwrap_or(false) == cold;
+        !self.retired.is_empty() || self.free.iter().rev().any(|&(h, _)| of_class(h)) || self.cooling.iter().take_while(|&&(_, at)| now.duration_since(at) >= COOL).any(|&((h, _), _)| of_class(h))
+    }
+
+    /// `heap` becomes a pool of the class `cold` (in a given-back pool's index if there is
+    /// one); its tiles but the first, which the caller takes, go to the free list.
+    fn add_pool(&mut self, heap: ID3D12Heap, cold: bool) -> u32 {
         let h = match self.pools.iter().position(|p| p.is_none()) {
             Some(i) => {
                 self.pools[i] = Some(heap);
@@ -1275,6 +1322,10 @@ impl State {
                 self.pools.len() as u32 - 1
             }
         };
+        if self.cold.len() <= h as usize {
+            self.cold.resize(h as usize + 1, false);
+        }
+        self.cold[h as usize] = cold;
         self.free.extend((1..POOL_TILES).rev().map(|t| (h, t)));
         h
     }
@@ -1507,9 +1558,10 @@ impl State {
         let (mut got, mut left) = (0, 0);
         while t < end {
             if self.mapped.get(&t).is_some_and(|e| e.pool == LAZY) {
-                let at_hand = !self.free.is_empty() || cooled(&self.cooling, std::time::Instant::now()) || !self.retired.is_empty();
+                // (a placed buffer's tiles, `force`, are read as a view's are)
+                let at_hand = self.at_hand(!force);
                 let wait = left > 0 || (!force && self.short_of_memory() && !at_hand);
-                match if wait { None } else { self.take_tile() } {
+                match if wait { None } else { self.take_tile(!force) } {
                     Some((tile, used)) => {
                         if let Some(e) = self.mapped.get_mut(&t) {
                             e.pool = tile;
@@ -1567,7 +1619,7 @@ impl State {
                     self.to_zero.insert((t, TILE));
                     unparked = true;
                 } else {
-                    let Some((tile, reused)) = self.take_tile() else { break };
+                    let Some((tile, reused)) = self.take_tile(true) else { break };
                     self.mapped.insert(t, TileEntry::with_holes(tile, initial_holes(t)));
                     early_add(&mut self.runs, t, t + TILE);
                     if reused {
@@ -3518,6 +3570,14 @@ impl State {
     /// video memory (now or a moment ago, `no_memory`): `w` is in `refused` then (counted once).
     unsafe fn new_mirror(&mut self, w: usize, src: usize, holes: u16, force: bool) -> bool {
         if let Some(tile) = self.parked.remove(&w).or_else(|| self.kept.remove(&w)) {
+            // (parked there as one of the window's own tiles: a view's bytes in a MINIMUM heap)
+            if cold_own_wanted() && self.cold.get(tile.0 as usize).copied().unwrap_or(false) {
+                static N: std::sync::atomic::AtomicU32 = std::sync::atomic::AtomicU32::new(0);
+                let n = N.fetch_add(1, Ordering::Relaxed) + 1;
+                if n.is_power_of_two() {
+                    crate::xlog_info!("sparse windows: XCL_SPARSE_COLD_OWN: {n} GPU-view tiles took back a parked tile of a heap of the windows' own tiles");
+                }
+            }
             self.mapped.insert(w, TileEntry { src, gen: next_gen(), ..TileEntry::with_holes(tile, holes) });
             self.to_zero.insert((w, TILE));
         } else {
@@ -3531,9 +3591,9 @@ impl State {
             // (a moment after a heap could not be made, only tiles at hand: parked ones and those
             // still quarantined or cooling are not)
             self.drain_quarantined();
-            let at_hand = !self.free.is_empty() || cooled(&self.cooling, std::time::Instant::now()) || !self.retired.is_empty();
+            let at_hand = self.at_hand(false);
             let wait = at_cap || (!force && self.short_of_memory() && !at_hand);
-            let got = if wait { None } else { self.take_tile() };
+            let got = if wait { None } else { self.take_tile(false) };
             let Some((tile, reused)) = got else {
                 if !wait {
                     self.no_memory = Some(std::time::Instant::now());
@@ -4989,6 +5049,7 @@ mod tests {
                 job_seq: 0,
                 windows: vec![(base, reserved.clone())],
                 pools: Vec::new(),
+                cold: Vec::new(),
                 free: Vec::new(),
                 cooling: VecDeque::new(),
                 retired: Vec::new(),
@@ -5320,6 +5381,7 @@ mod tests {
                 job_seq: 0,
                 windows: Vec::new(),
                 pools: Vec::new(),
+                cold: Vec::new(),
                 free: Vec::new(),
                 cooling: VecDeque::new(),
                 retired: Vec::new(),
@@ -5368,13 +5430,13 @@ mod tests {
                 poison: None,
             };
 
-            let (first, reused) = s.take_tile().expect("a tile from a new pool");
+            let (first, reused) = s.take_tile(false).expect("a tile from a new pool");
             assert!(!reused, "a new pool's tile needs no clearing");
             s.free.push(first);
             s.retire_free_pools();
             assert_eq!(s.retired.len(), 1, "an all-free pool is retired");
             for round in 0..8 {
-                let (tile, reused) = s.take_tile().expect("a tile");
+                let (tile, reused) = s.take_tile(false).expect("a tile");
                 assert!(reused, "round {round}: a tile of a retired pool is cleared before use");
                 s.free.push(tile);
                 s.retire_free_pools();
@@ -5557,6 +5619,7 @@ mod tests {
                 job_seq: 0,
                 windows: vec![(base, reserved)],
                 pools: Vec::new(),
+                cold: Vec::new(),
                 free: Vec::new(),
                 cooling: VecDeque::new(),
                 retired: Vec::new(),
@@ -5683,6 +5746,7 @@ mod tests {
                 job_seq: 0,
                 windows: vec![(base, reserved)],
                 pools: Vec::new(),
+                cold: Vec::new(),
                 free: Vec::new(),
                 cooling: VecDeque::new(),
                 retired: Vec::new(),
@@ -7397,18 +7461,40 @@ mod tests {
         let mut cooling: VecDeque<((u32, u32), std::time::Instant)> = VecDeque::new();
         cooling.push_back(((0, 5), ms(0)));
         cooling.push_back(((0, 6), ms(10)));
-        assert_eq!(reuse_tile(&mut free, &mut cooling, ms(1999)), None, "freed 1999 ms ago: still cooling");
+        assert_eq!(reuse_tile(&mut free, &mut cooling, ms(1999), |_| true), None, "freed 1999 ms ago: still cooling");
         assert!(!cooled(&cooling, ms(1999)));
         free.push((1, 9));
-        assert_eq!(reuse_tile(&mut free, &mut cooling, ms(1999)), Some((1, 9)), "a free tile meanwhile");
+        assert_eq!(reuse_tile(&mut free, &mut cooling, ms(1999), |_| true), Some((1, 9)), "a free tile meanwhile");
         assert!(cooled(&cooling, ms(2000)));
         free.push((1, 8));
-        assert_eq!(reuse_tile(&mut free, &mut cooling, ms(2005)), Some((0, 5)), "cooled: before a free tile");
-        assert_eq!(reuse_tile(&mut free, &mut cooling, ms(2005)), Some((1, 8)), "the next one freed 10 ms later is not");
+        assert_eq!(reuse_tile(&mut free, &mut cooling, ms(2005), |_| true), Some((0, 5)), "cooled: before a free tile");
+        assert_eq!(reuse_tile(&mut free, &mut cooling, ms(2005), |_| true), Some((1, 8)), "the next one freed 10 ms later is not");
         cooling.push_back(((2, 1), ms(20)));
-        assert_eq!(reuse_tile(&mut free, &mut cooling, ms(5000)), Some((0, 6)), "the oldest first");
-        assert_eq!(reuse_tile(&mut free, &mut cooling, ms(5000)), Some((2, 1)));
-        assert_eq!(reuse_tile(&mut free, &mut cooling, ms(5000)), None);
+        assert_eq!(reuse_tile(&mut free, &mut cooling, ms(5000), |_| true), Some((0, 6)), "the oldest first");
+        assert_eq!(reuse_tile(&mut free, &mut cooling, ms(5000), |_| true), Some((2, 1)));
+        assert_eq!(reuse_tile(&mut free, &mut cooling, ms(5000), |_| true), None);
+    }
+
+    /// With two classes of pool heaps a tile is only taken from a heap of the class asked for:
+    /// a free or cooled tile of the other class stays where it is.
+    #[test]
+    fn a_tile_is_reused_only_within_its_heaps_class() {
+        let t0 = std::time::Instant::now();
+        let ms = |n: u64| t0 + std::time::Duration::from_millis(n);
+        // heaps 0 and 2 hold the windows' own tiles, heap 1 the views'
+        let own = |h: u32| h != 1;
+        let mut free: Vec<(u32, u32)> = vec![(0, 3), (1, 7), (1, 6)];
+        let mut cooling: VecDeque<((u32, u32), std::time::Instant)> = VecDeque::new();
+        cooling.push_back(((1, 9), ms(0)));
+        cooling.push_back(((2, 4), ms(10)));
+        cooling.push_back(((0, 8), ms(4000)));
+        assert_eq!(reuse_tile(&mut free, &mut cooling, ms(2500), own), Some((2, 4)), "the oldest cooled tile of its class, past a view's");
+        assert_eq!(reuse_tile(&mut free, &mut cooling, ms(2500), own), Some((0, 3)), "then a free one of its class, past the views' at the end");
+        assert_eq!(reuse_tile(&mut free, &mut cooling, ms(2500), own), None, "its last one still cools: none, though the views have three");
+        assert_eq!(free, vec![(1, 7), (1, 6)]);
+        assert_eq!(reuse_tile(&mut free, &mut cooling, ms(2500), |h| !own(h)), Some((1, 9)));
+        assert_eq!(reuse_tile(&mut free, &mut cooling, ms(2500), |h| !own(h)), Some((1, 6)));
+        assert_eq!(cooling.len(), 1);
     }
 
     /// The tile mapping line gives the calls and tiles since the counts before, by kind of window.

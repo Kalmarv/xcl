@@ -358,6 +358,10 @@ pub(super) unsafe fn set_low_priority(device: &ID3D12Device, obj: &ID3D12Pageabl
     set_residency_priority(device, obj, D3D12_RESIDENCY_PRIORITY_LOW, "LOW", what);
 }
 
+pub(super) unsafe fn set_minimum_priority(device: &ID3D12Device, obj: &ID3D12Pageable, what: &str) {
+    set_residency_priority(device, obj, D3D12_RESIDENCY_PRIORITY_MINIMUM, "MINIMUM", what);
+}
+
 unsafe fn set_residency_priority(device: &ID3D12Device, obj: &ID3D12Pageable, prio: D3D12_RESIDENCY_PRIORITY, label: &str, what: &str) {
     if !hot_priority_wanted() {
         return;
