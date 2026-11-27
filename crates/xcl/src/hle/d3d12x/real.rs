@@ -5062,6 +5062,7 @@ unsafe fn translated_compute_pso_once(this: *mut c_void, f: PsoFn, desc: *const 
             LAST_COMPUTE_RS.with(|c| c.set(rs));
             note_pso_rs(*ppv, rs as *mut c_void);
             super::dred::label(*ppv as usize, &[("cs", Some(cs))]);
+            super::dred::label_code(*ppv as usize, &dxil, true);
             if let Some(i) = crate::gpu::recomp::pso::compute_interface(cs) {
                 PSO_USER_SGPRS.insert(*ppv as usize, (i.user_sgprs, i.threads));
             }
@@ -5103,6 +5104,7 @@ unsafe fn translated_compute_pso_once(this: *mut c_void, f: PsoFn, desc: *const 
     TRANSLATED_PSO.fetch_add(1, Ordering::Relaxed);
     note_pso_rs(*ppv, rs);
     super::dred::label(*ppv as usize, &[("cs", Some(cs))]);
+    super::dred::label_code(*ppv as usize, &dxil, false);
     if let Some(i) = crate::gpu::recomp::pso::compute_interface(cs) {
         PSO_USER_SGPRS.insert(*ppv as usize, (i.user_sgprs, i.threads));
     }
@@ -9483,6 +9485,11 @@ pub fn log_device_removed() {
                         super::dred::ops(key, &history, done, to),
                         if to < count { format!(" … {} more", count - to) } else { String::new() }
                     );
+                    // how much work those were: a hung GPU was in one that takes too long
+                    let work = super::dred::work(key, &history, done.saturating_sub(16), to, super::indirect_guard::counts_of);
+                    if !work.is_empty() {
+                        crate::xlog_error!("DRED: … that list's dispatches there, in order under each pipeline (no counts read back: the GPU has not run that check, or its slot was used again): {work}");
+                    }
                 }
             });
         }

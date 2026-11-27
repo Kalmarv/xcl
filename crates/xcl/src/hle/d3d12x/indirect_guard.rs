@@ -333,7 +333,8 @@ pub(super) unsafe fn check(list: *mut c_void, pso: usize, sig: usize, max: u32, 
     let va = title.and_then(counts_va).filter(|v| v % 4 == 0).unwrap_or(shown);
     let shown = if compare() { shown } else { va };
     let g = guard_of(l)?;
-    let slot = g.next.fetch_add(1, Ordering::Relaxed) % SLOTS;
+    let nth = g.next.fetch_add(1, Ordering::Relaxed);
+    let slot = nth % SLOTS;
     g.word(SEEN_AT + slot * SLOT + 4 * SEEN_WORD).store(0, Ordering::Release);
     let id = real::pso_shaders(pso).map_or(0, |(a, _)| a);
     // the counts were written as UAVs: they are read after those writes
@@ -355,6 +356,7 @@ pub(super) unsafe fn check(list: *mut c_void, pso: usize, sig: usize, max: u32, 
     l.SetComputeRootUnorderedAccessView(3, g.seen_va);
     l.SetComputeRootUnorderedAccessView(4, shown);
     l.Dispatch(1, 1, 1);
+    super::dred::note_work(list, || super::dred::Work::Checked(nth));
     report(&g);
     Some(Checked { guard: g, slot })
 }
@@ -389,6 +391,16 @@ pub(super) fn counts(slot: u32) -> Option<[u32; 3]> {
     let g = GUARD.lock().unwrap().clone()?;
     let at = SEEN_AT + slot * SLOT;
     (g.word(at + 4 * SEEN_WORD).load(Ordering::Acquire) != 0).then(|| std::array::from_fn(|k| g.word(at + 4 * k as u32).load(Ordering::Relaxed)))
+}
+
+/// `counts` of the ExecuteIndirect checked as the `nth` (`check` counts them). None also when
+/// its slot has been given to a later one since: those would be that one's counts.
+pub(super) fn counts_of(nth: u32) -> Option<[u32; 3]> {
+    let given = GUARD.lock().unwrap().as_ref()?.next.load(Ordering::Relaxed);
+    if given.wrapping_sub(nth) > SLOTS {
+        return None;
+    }
+    counts(nth % SLOTS)
 }
 
 /// Counts out of range so far.
