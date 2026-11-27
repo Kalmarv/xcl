@@ -9386,6 +9386,17 @@ mod dred_tests {
     use super::*;
 
     #[test]
+    fn no_page_fault_address_is_in_no_window() {
+        // (windows 2 and 3 are not open: their address is 0)
+        let windows = [0x5_0000_0000, 0x7_0000_0000, 0, 0];
+        assert_eq!(page_fault_window(0, &windows), None, "a hung GPU's removal: not 'window 2 + 0x0'");
+        assert_eq!(page_fault_window(0x1234, &windows), None);
+        assert_eq!(page_fault_window(0x7_0000_1000, &windows), Some((1, 0x1000)));
+        assert_eq!(page_fault_window(0x5_ffff_ffff, &windows), Some((0, 0xffff_ffff)));
+        assert_eq!(page_fault_window(0x8_0000_0000, &windows), None);
+    }
+
+    #[test]
     fn video_memory_is_over_its_budget_only_past_a_known_one() {
         assert_eq!(over_video_budget(30 << 30, 28 << 30), Some(2 << 30));
         assert_eq!(over_video_budget(28 << 30, 28 << 30), None);
@@ -9413,6 +9424,14 @@ mod dred_tests {
             assert_eq!((node, done), (std::ptr::from_ref(&nodes[i]), 0));
         }
     }
+}
+
+/// The memory window DRED's page-fault address `va` lies in and the offset there (`windows`:
+/// their GPU addresses, 0 for one that is not open – which address 0, a removal that was no
+/// page fault, is not in).
+fn page_fault_window(va: u64, windows: &[u64]) -> Option<(usize, u64)> {
+    let k = windows.iter().position(|&w| w != 0 && va >= w && va < w + 0x1_0000_0000)?;
+    Some((k, va - windows[k]))
 }
 
 /// If the device was removed: the reason, DRED's page fault (address, the allocations around
@@ -9452,8 +9471,14 @@ pub fn log_device_removed() {
                 v.join(", ")
             };
             let va = pf.PageFaultVA;
-            let window = uma_window_vas().iter().position(|&w| va >= w && va < w + 0x1_0000_0000).map(|k| format!(" = window {k} + {:#x}", va - uma_window_vas()[k])).unwrap_or_default();
-            crate::xlog_error!("DRED page fault at GPU VA {va:#x}{window}; allocations there: [{}]; recently freed: [{}]", names(pf.pHeadExistingAllocationNode), names(pf.pHeadRecentFreedAllocationNode));
+            let (there, freed) = (names(pf.pHeadExistingAllocationNode), names(pf.pHeadRecentFreedAllocationNode));
+            if va == 0 && there.is_empty() && freed.is_empty() {
+                // (a hung GPU, state 3: nothing faulted)
+                crate::xlog_error!("DRED: no page fault (no address, no allocations named)");
+            } else {
+                let window = page_fault_window(va, &uma_window_vas()).map(|(k, off)| format!(" = window {k} + {off:#x}")).unwrap_or_default();
+                crate::xlog_error!("DRED page fault at GPU VA {va:#x}{window}; allocations there: [{there}]; recently freed: [{freed}]");
+            }
         }
         let breadcrumbs = dred.GetAutoBreadcrumbsOutput();
         match &breadcrumbs {
