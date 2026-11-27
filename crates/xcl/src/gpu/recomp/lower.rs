@@ -178,6 +178,9 @@ struct Lower<'a, I: Ir> {
     /// Analysis block indices where `S_CBRANCH_EXECZ`/`S_CBRANCH_EXECNZ` can safely use
     /// `ballot_half` (32-lane hardware ballot, zero `Partner::Spin` exchange) in split wave64.
     half_branches: HashSet<usize>,
+    /// Instruction indices where `V_READFIRSTLANE_B32` (inside a half-local waterfall loop)
+    /// can safely use `ballot_half` + `read_lane_half` (zero `Partner::Spin` exchange).
+    pub(super) half_readfirstlane: HashSet<usize>,
     /// Whether SCC is live after instruction `i` (used to skip dead whole-wave SCC ballots).
     scc_live_after: Vec<bool>,
     cur_inst: usize,
@@ -1225,7 +1228,12 @@ pub fn half_branch_enabled() -> bool {
     *ON.get_or_init(|| std::env::var("XCL_HALF_BRANCH").is_ok_and(|v| v.trim() == "1"))
 }
 
-fn compute_half_branches(insts: &[Decoded], sum: &Summary, scc_live_after: &[bool], writes_lds: bool) -> HashSet<usize> {
+fn compute_half_branches(
+    insts: &[Decoded],
+    sum: &Summary,
+    scc_live_after: &[bool],
+    writes_lds: bool,
+) -> (HashSet<usize>, HashSet<usize>) {
     let nb = sum.blocks.len();
     // Backward liveness for SGPRs 0..=125 and SCC.
     let reads_scc = |d: &Decoded| -> bool {
@@ -1323,14 +1331,50 @@ fn compute_half_branches(insts: &[Decoded], sum: &Summary, scc_live_after: &[boo
         false
     };
 
-    // Collect candidate S_CBRANCH_EXECZ / S_CBRANCH_EXECNZ diamonds: (b, body_blk, skip_blk, region).
-    let mut cands: Vec<(usize, usize, Vec<usize>)> = Vec::new();
+    // Collect candidate S_CBRANCH_EXECZ / S_CBRANCH_EXECNZ diamonds and waterfall loops:
+    // (branch_block, exit_block, region_blocks, is_loop).
+    let mut cands: Vec<(usize, usize, Vec<usize>, bool)> = Vec::new();
     for &b in &sum.order {
         let block = &sum.blocks[b];
         if block.insts.is_empty() {
             continue;
         }
         let last = &insts[block.insts.end - 1];
+        // Case 1: waterfall loop (`S_CBRANCH_EXECNZ` back-edge to `hdr`, exit to `exit_blk`).
+        if let ("S_CBRANCH_EXECNZ", [(t, Edge::Taken), (f, Edge::NotTaken)]) = (last.inst.name, block.succ.as_slice()) {
+            if t != f {
+                let (hdr, exit_blk) = (*t, *f);
+                let mut region = Vec::new();
+                let mut seen = vec![false; nb];
+                let mut stack = vec![hdr];
+                let mut ok = true;
+                let mut saw_b = false;
+                while let Some(u) = stack.pop() {
+                    if u == exit_blk {
+                        continue;
+                    }
+                    if std::mem::replace(&mut seen[u], true) {
+                        continue;
+                    }
+                    if u == b {
+                        saw_b = true;
+                    }
+                    if sum.blocks[u].succ.is_empty() || region.len() >= 16 {
+                        ok = false;
+                        break;
+                    }
+                    region.push(u);
+                    for &(s, _) in &sum.blocks[u].succ {
+                        stack.push(s);
+                    }
+                }
+                if ok && saw_b && !region.is_empty() {
+                    cands.push((b, exit_blk, region, true));
+                    continue;
+                }
+            }
+        }
+        // Case 2: acyclic diamond (`S_CBRANCH_EXECZ` / `S_CBRANCH_EXECNZ`).
         let (body_blk, skip_blk) = match (last.inst.name, block.succ.as_slice()) {
             ("S_CBRANCH_EXECZ", [(t, Edge::Taken), (f, Edge::NotTaken)]) if t != f => (*f, *t),
             ("S_CBRANCH_EXECNZ", [(t, Edge::Taken), (f, Edge::NotTaken)]) if t != f => (*t, *f),
@@ -1361,20 +1405,22 @@ fn compute_half_branches(insts: &[Decoded], sum: &Summary, scc_live_after: &[boo
             }
         }
         if ok && !region.is_empty() {
-            cands.push((b, skip_blk, region));
+            cands.push((b, skip_blk, region, false));
         }
     }
 
     let mut half = HashSet::new();
+    let mut half_rfl = HashSet::new();
     loop {
         let mut added = false;
-        for (b, skip_blk, region) in &cands {
+        for (b, skip_blk, region, is_loop) in &cands {
             if half.contains(b) {
                 continue;
             }
             let live_out_s = sgpr_live_in[*skip_blk];
             let live_out_c = scc_live_in[*skip_blk];
             let mut region_exec_sub_s: u128 = 0;
+            let mut loop_rfls: Vec<usize> = Vec::new();
             let mut ok = true;
             for &u in region {
                 for i in sum.blocks[u].insts.clone() {
@@ -1397,11 +1443,22 @@ fn compute_half_branches(insts: &[Decoded], sum: &Summary, scc_live_after: &[boo
                 for i in sum.blocks[u].insts.clone() {
                     let d = &insts[i];
                     let n = d.inst.name;
-                    if is_cross_half_op(d, i) {
+                    if n == "V_READFIRSTLANE_B32" {
+                        if *is_loop || half_rfl.contains(&i) {
+                            loop_rfls.push(i);
+                        } else {
+                            ok = false;
+                            break 'blocks;
+                        }
+                    } else if is_cross_half_op(d, i) {
                         ok = false;
                         break 'blocks;
                     }
-                    if matches!(n, "S_CBRANCH_EXECZ" | "S_CBRANCH_EXECNZ") && !half.contains(&u) {
+                    if *is_loop && n.contains("_ATOMIC_") {
+                        ok = false;
+                        break 'blocks;
+                    }
+                    if matches!(n, "S_CBRANCH_EXECZ" | "S_CBRANCH_EXECNZ") && u != *b && !half.contains(&u) {
                         ok = false;
                         break 'blocks;
                     }
@@ -1430,6 +1487,9 @@ fn compute_half_branches(insts: &[Decoded], sum: &Summary, scc_live_after: &[boo
             }
             if ok {
                 half.insert(*b);
+                if *is_loop {
+                    half_rfl.extend(loop_rfls);
+                }
                 added = true;
             }
         }
@@ -1437,7 +1497,7 @@ fn compute_half_branches(insts: &[Decoded], sum: &Summary, scc_live_after: &[boo
             break;
         }
     }
-    half
+    (half, half_rfl)
 }
 
 fn compute_scc_liveness(insts: &[Decoded], sum: &Summary) -> Vec<bool> {
@@ -1519,11 +1579,11 @@ fn lower_with<I: Ir>(insts: &[Decoded], stage: Stage, wave64: bool, mut ir: I, s
     } else {
         vec![true; insts.len()]
     };
-    let half_branches = if wave_branches && ir.whole_needs_exchange() && half_branch_enabled() {
+    let (half_branches, half_readfirstlane) = if wave_branches && ir.whole_needs_exchange() && half_branch_enabled() {
         let writes_lds = super::emit::lds_order_wanted() && super::emit::writes_lds(insts);
         compute_half_branches(insts, &sum, &scc_live_after, writes_lds)
     } else {
-        HashSet::new()
+        (HashSet::new(), HashSet::new())
     };
     let n = sum.blocks.len();
     if n == 0 {
@@ -1602,6 +1662,7 @@ fn lower_with<I: Ir>(insts: &[Decoded], stage: Stage, wave64: bool, mut ir: I, s
         guarded,
         wave_branches,
         half_branches,
+        half_readfirstlane,
         scc_live_after,
         cur_inst: 0,
         wave64,

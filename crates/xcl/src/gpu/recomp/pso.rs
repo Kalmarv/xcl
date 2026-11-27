@@ -335,9 +335,9 @@ mod translated {
             } else {
                 id
             };
-            // `XCL_HALF_BRANCH=1`: half-local `s_cbranch_execz`/`execnz` in split wave64
+            // `XCL_HALF_BRANCH=1`: half-local `s_cbranch_execz`/`execnz` + waterfall loops in split wave64
             let id = if Backend::current() != Backend::Hlsl && crate::gpu::recomp::lower::half_branch_enabled() {
-                identity_for(&id.to_string(), "xcl-half-branch-1")
+                identity_for(&id.to_string(), "xcl-half-branch-2")
             } else {
                 id
             };

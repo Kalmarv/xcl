@@ -307,9 +307,15 @@ impl<I: Ir> Lower<'_, I> {
             "V_READFIRSTLANE_B32" => {
                 let v = self.src(b, d, s0)?;
                 let r = if s0 >= 256 {
-                    let e = self.exec_words(b, false)?;
-                    let l = self.first_set(e, 0);
-                    self.ir.read_lane(v, l)
+                    if self.half_readfirstlane.contains(&self.cur_inst) {
+                        let [lo, _] = self.exec_words(b, true)?;
+                        let l = self.ctz(lo);
+                        self.ir.read_lane_half(v, l)
+                    } else {
+                        let e = self.exec_words(b, false)?;
+                        let l = self.first_set(e, 0);
+                        self.ir.read_lane(v, l)
+                    }
                 } else {
                     v
                 };
