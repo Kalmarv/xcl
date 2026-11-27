@@ -272,11 +272,31 @@ pub(super) struct Remade {
 /// of the first coherent window; a 16-window layout's further ones are one CUSTOM heap each).
 pub(super) unsafe fn remake_window(device: &ID3D12Device, base: usize, size: usize, first: bool) -> Result<Remade, String> {
     if let Some(ranges) = mixed_ranges().filter(|_| first) {
-        return remake_mixed(device, base, size, &ranges);
+        if gpu_upload_heaps(device) {
+            return remake_mixed(device, base, size, &ranges);
+        }
+        crate::xlog_warn!("D3D12.X: XCL_UMA_DRIVER=mixed: the adapter has no GPU_UPLOAD heaps (Resizable BAR off?), so the coherent window is one CUSTOM heap");
     }
     let (heap, buf) = remake(device, base, size)?;
     let gpu_va = buf.GetGPUVirtualAddress();
     Ok(Remade { buf_raw: buf.into_raw() as usize, gpu_va, heaps: vec![(0, size, heap.into_raw() as usize)], watched_regions: None })
+}
+
+/// Whether the adapter makes `GPU_UPLOAD` heaps (`D3D12_OPTIONS16`; needs Resizable BAR). Asked
+/// before the window is released: a segment's mapping stays with the driver after its heap is
+/// dropped, so a window cannot be made whole again once a segment has been mapped.
+unsafe fn gpu_upload_heaps(device: &ID3D12Device) -> bool {
+    let mut opts = D3D12_FEATURE_DATA_D3D12_OPTIONS16::default();
+    device
+        .CheckFeatureSupport(D3D12_FEATURE_D3D12_OPTIONS16, &mut opts as *mut _ as *mut c_void, std::mem::size_of::<D3D12_FEATURE_DATA_D3D12_OPTIONS16>() as u32)
+        .is_ok()
+        && opts.GPUUploadHeapSupported.as_bool()
+}
+
+#[cfg(test)]
+thread_local! {
+    /// tests: `mapped_segment` refuses `GPU_UPLOAD` heaps on this thread
+    static REFUSE_GPU_UPLOAD: std::cell::Cell<bool> = const { std::cell::Cell::new(false) };
 }
 
 fn heap_props(upload: bool) -> D3D12_HEAP_PROPERTIES {
@@ -309,6 +329,10 @@ fn buffer_desc(size: usize) -> D3D12_RESOURCE_DESC {
 /// One segment of a mixed window: a heap of `size` bytes (write-watched when `watch`), a buffer
 /// over all of it and where the driver mapped it for the CPU.
 unsafe fn mapped_segment(device: &ID3D12Device, size: usize, upload: bool, watch: bool) -> Result<(ID3D12Heap, ID3D12Resource, usize), String> {
+    #[cfg(test)]
+    if upload && REFUSE_GPU_UPLOAD.with(|r| r.get()) {
+        return Err("CreateHeap: refused by the test".into());
+    }
     let flags = if watch { D3D12_HEAP_FLAG_ALLOW_ONLY_BUFFERS | D3D12_HEAP_FLAG_ALLOW_WRITE_WATCH } else { D3D12_HEAP_FLAG_ALLOW_ONLY_BUFFERS };
     let desc = D3D12_HEAP_DESC { SizeInBytes: size as u64, Properties: heap_props(upload), Alignment: 0x1_0000, Flags: flags };
     let mut heap: Option<ID3D12Heap> = None;
@@ -424,7 +448,6 @@ unsafe fn remake_mixed(device: &ID3D12Device, base: usize, size: usize, vram_ran
     let mut fail: Option<String> = None;
     for (idx, &(off, len, upload)) in spec.iter().enumerate() {
         let want = base + off;
-        let what = if upload { "GPU_UPLOAD" } else { "CUSTOM" };
         let ph = std::mem::replace(&mut placeholders[idx], 0);
         if VirtualFree(ph as *mut c_void, 0, MEM_RELEASE) == 0 {
             fail = Some(format!("VirtualFree of the placeholder at {want:#x} failed"));
@@ -432,7 +455,25 @@ unsafe fn remake_mixed(device: &ID3D12Device, base: usize, size: usize, vram_ran
         }
         // (no write watch on GPU_UPLOAD: its write-combined pages refuse the watch trap's
         // read-only protection, which then retried tens of thousands of times)
-        match mapped_segment(device, len, upload, !upload) {
+        let mut made = mapped_segment(device, len, upload, !upload);
+        let mut upload = upload;
+        if upload && !matches!(&made, Ok((_, _, p)) if *p == want) {
+            // a refused GPU_UPLOAD segment becomes a CUSTOM one: the segments mapped so far cannot
+            // be given back (their mappings stay with the driver), so the window is kept whole
+            let why = match &made {
+                Ok((_, _, p)) => format!("Map gave {p:#x}"),
+                Err(e) => e.clone(),
+            };
+            if let Ok((heap, buf, _)) = std::mem::replace(&mut made, Err(String::new())) {
+                buf.Unmap(0, None);
+                drop((buf, heap));
+            }
+            crate::xlog_warn!("D3D12.X: XCL_UMA_DRIVER=mixed: segment {idx} ({} MB GPU_UPLOAD): {why}; it is a CUSTOM write-watched heap instead", len >> 20);
+            upload = false;
+            made = mapped_segment(device, len, false, true);
+        }
+        let what = if upload { "GPU_UPLOAD" } else { "CUSTOM" };
+        match made {
             Ok((heap, buf, p)) if p == want && (upload || readable(want, len)) => placed.push((off, len, upload, heap, buf)),
             Ok((heap, buf, p)) => {
                 buf.Unmap(0, None);
@@ -486,6 +527,7 @@ unsafe fn remake_mixed(device: &ID3D12Device, base: usize, size: usize, vram_ran
     let mut parts = Vec::with_capacity(placed.len());
     let mut heaps = Vec::with_capacity(placed.len());
     let mut watched = Vec::new();
+    let heaps_upload: Vec<(usize, usize)> = placed.iter().filter(|p| p.2).map(|p| (p.0, p.1)).collect();
     for (off, len, upload, heap, placed_buf) in placed {
         parts.push(format!("{off:#x}+{}MB {}", len >> 20, if upload { "GPU_UPLOAD" } else { "CUSTOM, write-watched" }));
         if !upload {
@@ -503,8 +545,10 @@ unsafe fn remake_mixed(device: &ID3D12Device, base: usize, size: usize, vram_ran
         kept >> 10,
         t0.elapsed().as_millis()
     );
-    let vram: Vec<(usize, usize)> = spec.iter().filter(|s| s.2).map(|&(off, len, _)| (base + off, base + off + len)).collect();
-    init_vram_reader(device, base, size, &res, vram);
+    let vram: Vec<(usize, usize)> = heaps_upload.iter().map(|&(off, len)| (base + off, base + off + len)).collect();
+    if !vram.is_empty() {
+        init_vram_reader(device, base, size, &res, vram);
+    }
     let gpu_va = res.GetGPUVirtualAddress();
     Ok(Remade { buf_raw: res.into_raw() as usize, gpu_va, heaps, watched_regions: Some(watched) })
 }
@@ -739,6 +783,9 @@ mod tests {
             return crate::gpu::recomp::runner::skip_test("no D3D12 device");
         }
         let dev = dev.unwrap();
+        if !unsafe { gpu_upload_heaps(&dev) } {
+            return crate::gpu::recomp::runner::skip_test("no GPU_UPLOAD heaps");
+        }
         unsafe {
             let size = 256 << 20;
             let base = VirtualAlloc(std::ptr::null(), size, MEM_RESERVE | MEM_COMMIT | MEM_WRITE_WATCH, PAGE_READWRITE) as usize;
@@ -776,6 +823,55 @@ mod tests {
             assert!(read_vram_bytes(base + at[0] + 0x1000, 4).is_none());
             let got = read_vram_bytes(base + at[1] + 0x1000, 4).expect("read of the GPU_UPLOAD segment");
             assert_eq!(u32::from_le_bytes(got.try_into().unwrap()), 0xCAFE_0001);
+        }
+    }
+
+    /// A `GPU_UPLOAD` segment refused after a CUSTOM one was mapped (an adapter without Resizable
+    /// BAR, or one out of BAR space): the window stays whole, that segment a write-watched CUSTOM
+    /// heap. (It stopped the process: the mapped segment's pages stay with the driver after its
+    /// heap is dropped, so the window could not be reserved again.)
+    #[test]
+    fn a_refused_gpu_upload_segment_becomes_custom() {
+        use super::*;
+        use windows::Win32::Graphics::Direct3D::D3D_FEATURE_LEVEL_12_0;
+        let mut dev: Option<ID3D12Device> = None;
+        if unsafe { D3D12CreateDevice(None, D3D_FEATURE_LEVEL_12_0, &mut dev) }.is_err() {
+            return crate::gpu::recomp::runner::skip_test("no D3D12 device");
+        }
+        let dev = dev.unwrap();
+        unsafe {
+            let size = 256 << 20;
+            let base = VirtualAlloc(std::ptr::null(), size, MEM_RESERVE | MEM_COMMIT | MEM_WRITE_WATCH, PAGE_READWRITE) as usize;
+            assert_ne!(base, 0);
+            let at = [0x1000, (64 << 20) + 0x1000, (192 << 20) + 0x1000];
+            for (i, &o) in at.iter().enumerate() {
+                std::ptr::write_volatile((base + o) as *mut u32, 0x2222_0000 + i as u32);
+            }
+            REFUSE_GPU_UPLOAD.with(|r| r.set(true));
+            let remade = remake_mixed(&dev, base, size, &[(64 << 20, 128 << 20)]);
+            REFUSE_GPU_UPLOAD.with(|r| r.set(false));
+            let remade = remade.expect("remake_mixed with the GPU_UPLOAD segment refused");
+            assert_eq!(remade.heaps.len(), 3);
+            assert_eq!(remade.watched_regions, Some(vec![(base, 64 << 20), (base + (64 << 20), 128 << 20), (base + (192 << 20), 64 << 20)]));
+            for (i, &o) in at.iter().enumerate() {
+                assert_eq!(std::ptr::read_volatile((base + o) as *const u32), 0x2222_0000 + i as u32);
+                std::ptr::write_volatile((base + o + 0x1000) as *mut u32, 0xBEEF_0000 + i as u32);
+            }
+            let queue: ID3D12CommandQueue = dev.CreateCommandQueue(&D3D12_COMMAND_QUEUE_DESC { Type: D3D12_COMMAND_LIST_TYPE_DIRECT, ..Default::default() }).unwrap();
+            let alloc: ID3D12CommandAllocator = dev.CreateCommandAllocator(D3D12_COMMAND_LIST_TYPE_DIRECT).unwrap();
+            let list: ID3D12GraphicsCommandList = dev.CreateCommandList(0, D3D12_COMMAND_LIST_TYPE_DIRECT, &alloc, None).unwrap();
+            let fence: ID3D12Fence = dev.CreateFence(0, D3D12_FENCE_FLAG_NONE).unwrap();
+            let (rb, ptr) = make_readback(&dev, 256).unwrap();
+            let raw = remade.buf_raw as *mut c_void;
+            let src = ID3D12Resource::from_raw_borrowed(&raw).unwrap();
+            for (i, &o) in at.iter().enumerate() {
+                list.CopyBufferRegion(&rb, 4 * i as u64, src, (o + 0x1000) as u64, 4);
+            }
+            list.Close().unwrap();
+            queue.ExecuteCommandLists(&[Some(list.cast::<ID3D12CommandList>().unwrap())]);
+            queue.Signal(&fence, 1).unwrap();
+            crate::gpu::fence::wait(&fence, 1, &dev, None, 2000).unwrap();
+            assert_eq!(std::slice::from_raw_parts(ptr as *const u32, 3), &[0xBEEF_0000, 0xBEEF_0001, 0xBEEF_0002]);
         }
     }
 
