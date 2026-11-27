@@ -135,6 +135,8 @@ struct Op {
     /// (max count, 0, 0)
     size: [u32; 3],
     indirect: bool,
+    /// (diagnostic) an ExecuteIndirect whose counts the guard reads: its slot (`indirect_guard`)
+    counts: Option<u32>,
 }
 
 /// A measured call: the queries before and after it.
@@ -318,7 +320,7 @@ pub(super) unsafe fn before(list: *mut c_void, pso: usize, kind: Kind, size: [u3
     if ty != D3D12_COMMAND_LIST_TYPE_DIRECT && ty != D3D12_COMMAND_LIST_TYPE_COMPUTE {
         return;
     }
-    let op = Op { program: program_of(pso, kind), size, indirect };
+    let op = Op { program: program_of(pso, kind), size, indirect, counts: None };
     if !RECS.with(list as usize, |r| open(heap, r, list, op)) {
         UNMEASURED.fetch_add(1, Ordering::Relaxed);
     }
@@ -338,6 +340,18 @@ pub(super) unsafe fn before_op(list: *mut c_void, pso: usize, kind: super::gpu_p
         P::PcIndirect => (Kind::Pc, true),
     };
     before(list, pso, kind, size, indirect);
+}
+
+/// (diagnostic) The call open on `list` runs the counts in guard slot `slot`.
+pub(super) fn note_counts(list: *mut c_void, slot: u32) {
+    if !recording() || list.is_null() {
+        return;
+    }
+    RECS.with(list as usize, |r| {
+        if let Some((_, op)) = r.open.as_mut() {
+            op.counts = Some(slot);
+        }
+    });
 }
 
 /// After the PC call `before` saw on `list`.
@@ -660,7 +674,7 @@ fn queue_name(ty: i32) -> &'static str {
 /// The measured time of `frames`' calls by kind and, for direct dispatches, by their groups:
 /// (bucket, calls, ns).
 fn by_size(frames: &[FrameRead]) -> Vec<(&'static str, u64, u64)> {
-    const BUCKETS: [&str; 9] = ["compute 1 group", "compute 2-8", "compute 9-69", "compute 70-279", "compute 280+", "mesh <70 groups", "mesh 70+", "indirect", "draws and two-pass batches"];
+    const BUCKETS: [&str; 12] = ["compute 1 group", "compute 2-8", "compute 9-69", "compute 70-279", "compute 280+", "mesh <70 groups", "mesh 70+", "indirect", "draws and two-pass batches", "indirect dispatch read 0 groups", "indirect dispatch read <70", "indirect dispatch read 70+"];
     let mut v = [(0u64, 0u64); BUCKETS.len()];
     for sub in frames.iter().flat_map(|f| &f.submits) {
         for &(op, start, end) in &sub.calls {
@@ -669,7 +683,14 @@ fn by_size(frames: &[FrameRead]) -> Vec<(&'static str, u64, u64)> {
                 continue;
             }
             let g = op.size.iter().map(|&x| x as u64).product::<u64>();
+            // (the guard's slot holds the counts of the last call that used it, read now)
+            let read = op.counts.and_then(super::indirect_guard::counts).map(|c| c.iter().map(|&x| x as u64).product::<u64>());
             let k = match (op.program.kind, op.indirect) {
+                (Kind::Compute, true) if read.is_some() => match read.unwrap() {
+                    0 => 9,
+                    1..=69 => 10,
+                    _ => 11,
+                },
                 (_, true) | (Kind::Pc, _) => 7,
                 (Kind::Compute, false) => match g {
                     0..=1 => 0,
@@ -772,7 +793,7 @@ mod tests {
     }
 
     fn op(kind: Kind, a: u64, size: [u32; 3]) -> Op {
-        Op { program: Program { kind, a, b: 0, pso: 0 }, size, indirect: false }
+        Op { program: Program { kind, a, b: 0, pso: 0 }, size, indirect: false, counts: None }
     }
 
     /// Stamps become ns by their queue's clock; programs add up over the frames and keep their

@@ -2565,6 +2565,7 @@ pub(super) unsafe extern "system" fn execute_indirect(this: *mut c_void, sig: us
                 (_, Some((from, at))) => {
                     if let Some(c) = &checked {
                         super::gpu_profile::note_counts(&t, c.slot);
+                    super::gpu_times::note_counts(this, c.slot);
                         // (`clamp` read the checked counts there)
                         c.read(this);
                     }
@@ -2573,6 +2574,7 @@ pub(super) unsafe extern "system" fn execute_indirect(this: *mut c_void, sig: us
                 }
                 (Some(c), None) => {
                     super::gpu_profile::note_counts(&t, c.slot);
+                    super::gpu_times::note_counts(this, c.slot);
                     c.run(this, |buffer, off| pc(this, sig, 1, buffer, off, 0, 0));
                 }
                 (None, None) => fresh_indirect_arguments(this, || pc(this, sig, max, args, args_off, count_buf, count_off)),
