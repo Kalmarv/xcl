@@ -116,6 +116,9 @@ pub(super) enum Kind {
     /// the argument rewrites and compute passes of a run of deferred two-pass draws
     /// (`XCL_TWO_PASS_BATCH=2`), all programs together; their mesh passes are `Mesh`
     MeshBatch,
+    /// (diagnostic) what was recorded before a compute ExecuteIndirect: "gap" (the title's work
+    /// since the call before) and "xcl" (XCL's guard check, binding barriers and clamp pass)
+    Extra(&'static str),
 }
 
 /// A program: the kind of call and its console shaders' dump hashes – CS, or VS / MS / GS and
@@ -350,6 +353,31 @@ pub(super) fn note_counts(list: *mut c_void, slot: u32) {
     RECS.with(list as usize, |r| {
         if let Some((_, op)) = r.open.as_mut() {
             op.counts = Some(slot);
+        }
+    });
+}
+
+/// (diagnostic) A span on `list` from its last stamp to now, of what was recorded since, as `what`
+/// (`Kind::Extra`) with the counts in guard slot `slot`.
+pub(super) unsafe fn mark(list: *mut c_void, what: &'static str, slot: Option<u32>) {
+    if !recording() || list.is_null() {
+        return;
+    }
+    before(list, 0, Kind::Extra(what), [0; 3], false);
+    if let Some(slot) = slot {
+        note_counts(list, slot);
+    }
+    after(list);
+}
+
+/// (diagnostic) The last span on `list`, if a `mark` of `what`, runs the counts in guard slot `slot`.
+pub(super) fn note_mark_counts(list: *mut c_void, what: &'static str, slot: u32) {
+    if !recording() || list.is_null() {
+        return;
+    }
+    RECS.with(list as usize, |r| {
+        if let Some(s) = r.spans.last_mut().filter(|s| s.op.program.kind == Kind::Extra(what)) {
+            s.op.counts = Some(slot);
         }
     });
 }
@@ -651,12 +679,14 @@ fn program_text(p: &Program, wave: &dyn Fn(u64) -> Option<&'static str>) -> Stri
         Kind::Mesh(k) => format!("mesh two-pass {k} pipeline {:#x} (its shaders not known)", p.pso),
         Kind::Pc => format!("PC pipeline {:#x}", p.pso),
         Kind::MeshBatch => "mesh two-pass compute passes of deferred draws (all programs)".into(),
+        Kind::Extra(w) => format!("work recorded before compute ExecuteIndirects ({w})"),
     }
 }
 
 fn size_text(kind: Kind, size: [u32; 3], indirect: bool) -> String {
     match (kind, indirect) {
         (Kind::MeshBatch, _) => format!("{} draws", size[0]),
+        (Kind::Extra(_), _) => "before an ExecuteIndirect".into(),
         (_, true) => format!("ExecuteIndirect, max count {}", size[0]),
         (Kind::Graphics, false) => format!("{} vertices or indices x {} instances", size[0], size[1]),
         _ => format!("{}x{}x{} groups", size[0], size[1], size[2]),
@@ -674,7 +704,7 @@ fn queue_name(ty: i32) -> &'static str {
 /// The measured time of `frames`' calls by kind and, for direct dispatches, by their groups:
 /// (bucket, calls, ns).
 fn by_size(frames: &[FrameRead]) -> Vec<(&'static str, u64, u64)> {
-    const BUCKETS: [&str; 12] = ["compute 1 group", "compute 2-8", "compute 9-69", "compute 70-279", "compute 280+", "mesh <70 groups", "mesh 70+", "indirect", "draws and two-pass batches", "indirect dispatch read 0 groups", "indirect dispatch read <70", "indirect dispatch read 70+"];
+    const BUCKETS: [&str; 16] = ["compute 1 group", "compute 2-8", "compute 9-69", "compute 70-279", "compute 280+", "mesh <70 groups", "mesh 70+", "indirect", "draws and two-pass batches", "indirect dispatch read 0 groups", "indirect dispatch read <70", "indirect dispatch read 70+", "gap before indirect dispatch read 0", "gap before indirect dispatch read >0 or not read", "XCL before indirect dispatch read 0", "XCL before indirect dispatch read >0 or not read"];
     let mut v = [(0u64, 0u64); BUCKETS.len()];
     for sub in frames.iter().flat_map(|f| &f.submits) {
         for &(op, start, end) in &sub.calls {
@@ -686,6 +716,7 @@ fn by_size(frames: &[FrameRead]) -> Vec<(&'static str, u64, u64)> {
             // (the guard's slot holds the counts of the last call that used it, read now)
             let read = op.counts.and_then(super::indirect_guard::counts).map(|c| c.iter().map(|&x| x as u64).product::<u64>());
             let k = match (op.program.kind, op.indirect) {
+                (Kind::Extra(w), _) => (if w == "gap" { 12 } else { 14 }) + usize::from(read != Some(0)),
                 (Kind::Compute, true) if read.is_some() => match read.unwrap() {
                     0 => 9,
                     1..=69 => 10,

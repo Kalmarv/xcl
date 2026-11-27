@@ -2514,7 +2514,13 @@ pub(super) unsafe extern "system" fn execute_indirect(this: *mut c_void, sig: us
         trace_ui_draw(this, raw_pso, true);
     }
     // (binds a compute root signature and a pipeline: before the dispatch's or draw's own)
+    if compute {
+        super::gpu_times::mark(this, "gap", None);
+    }
     let checked = super::indirect_guard::check(this, pso, sig, max, args, args_off, count_buf);
+    if let (true, Some(c)) = (compute, &checked) {
+        super::gpu_times::note_mark_counts(this, "gap", c.slot);
+    }
     match bind_abi(this, list, pso, gfx, None, 0) {
         Ok(b) => {
             let whole = if compute {
@@ -2560,6 +2566,9 @@ pub(super) unsafe extern "system" fn execute_indirect(this: *mut c_void, sig: us
             }
             ei_work(this, sig, super::targets::RAN);
             count(if gfx { DRAWS } else { DISPATCHES });
+            if compute {
+                super::gpu_times::mark(this, "xcl", checked.as_ref().map(|c| c.slot));
+            }
             let t = super::gpu_profile::begin(this, pso, if gfx { super::gpu_profile::Kind::IndirectDraw } else { super::gpu_profile::Kind::IndirectDispatch }, [max, 0, 0]);
             match (&checked, clamped) {
                 (_, Some((from, at))) => {
