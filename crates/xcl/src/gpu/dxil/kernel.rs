@@ -46,6 +46,15 @@ pub fn declared_lds_enabled() -> bool {
     *ENABLED.get_or_init(|| std::env::var("XCL_DECLARED_LDS").is_ok_and(|value| value == "1"))
 }
 
+/// `XCL_PER_OP_COHERENCE=1` (read once): in heap-window direct DXIL, mark `SMEM` (and scalar-index
+/// `MUBUF`) window handles wave-uniform (`nonuniform = false`) instead of forcing a waterfall loop,
+/// and drop `IsGloballyCoherent` (L1 cache bypass) on non-GLC/non-DLC/non-SLC loads when the
+/// program has no cache-invalidate instruction.
+pub fn per_op_coherence_enabled() -> bool {
+    static ENABLED: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
+    *ENABLED.get_or_init(|| std::env::var("XCL_PER_OP_COHERENCE").is_ok_and(|value| value == "1"))
+}
+
 /// `XCL_DIRECT_DXIL=1`: console compute shaders (and the kernel tests) go through this
 /// translator, with the HLSL path as the fallback for what it cannot translate yet.
 pub fn enabled() -> bool {
@@ -588,6 +597,7 @@ impl Lw {
             s.enable_rov();
         }
         let coherent = cs.is_some() && crate::gpu::recomp::needs_coherent_mem(insts);
+        let has_cache_inv = insts.iter().any(|d| matches!(d.inst.name, "S_DCACHE_INV" | "S_GL1_INV" | "BUFFER_GL0_INV" | "BUFFER_GL1_INV"));
         let (mems, heap_mem) = mem_windows(&mut s, o.mem_windows & !crate::gpu::recomp::BYTE_WINDOWS, coherent);
         let i32 = s.m.i32();
         let z = s.m.i32c(0);
@@ -603,6 +613,9 @@ impl Lw {
             half: z,
             mems,
             heap_mem,
+            per_op_coherence: per_op_coherence_enabled() && !has_cache_inv,
+            cur_uniform_win: false,
+            cur_op_coherent: None,
             byte_windows: o.mem_windows & crate::gpu::recomp::BYTE_WINDOWS != 0 && heap_mem.is_some(),
             res,
             fmt_table: None,

@@ -185,7 +185,9 @@ impl Lw {
             }
             if self.s.m.const_u64(cond) == Some(1) {
                 let i = self.addc(w, crate::gpu::recomp::MEM_HEAP_BASE);
-                let m = self.s.heap_raw_buffer_uav(i, coherent);
+                let op_coh = self.cur_op_coherent.unwrap_or(coherent);
+                let nonuniform = !self.cur_uniform_win;
+                let m = self.s.heap_raw_buffer_uav_opt(i, op_coh, nonuniform);
                 let vals = f(self, m);
                 debug_assert_eq!(vals.len(), out_tys.len());
                 return vals;
@@ -199,7 +201,9 @@ impl Lw {
             #[cfg(debug_assertions)]
             self.ssa.begin_log();
             let i = self.addc(w, crate::gpu::recomp::MEM_HEAP_BASE);
-            let m = self.s.heap_raw_buffer_uav(i, coherent);
+            let op_coh = self.cur_op_coherent.unwrap_or(coherent);
+            let nonuniform = !self.cur_uniform_win;
+            let m = self.s.heap_raw_buffer_uav_opt(i, op_coh, nonuniform);
             let vals = f(self, m);
             #[cfg(debug_assertions)]
             debug_assert!(self.ssa.end_log().is_empty(), "with_mem closure wrote SSA var");
@@ -1158,7 +1162,25 @@ impl Lw {
 
     // ------------------------------------------------------------ SMEM
 
+    fn with_mem_hints<R>(&mut self, uniform_win: bool, op_coherent: Option<bool>, f: impl FnOnce(&mut Self) -> R) -> R {
+        let prev_u = self.cur_uniform_win;
+        let prev_c = self.cur_op_coherent;
+        if self.per_op_coherence {
+            self.cur_uniform_win = uniform_win;
+            self.cur_op_coherent = op_coherent;
+        }
+        let r = f(self);
+        self.cur_uniform_win = prev_u;
+        self.cur_op_coherent = prev_c;
+        r
+    }
+
     pub fn smem(&mut self, d: &Decoded, name: &str) -> LResult<()> {
+        let glc = ["GLC", "DLC", "SLC"].iter().any(|f| rdna2::field_value(d.enc, &d.words, f) == Some(1));
+        self.with_mem_hints(true, Some(glc), |lw| lw.smem_inner(d, name))
+    }
+
+    fn smem_inner(&mut self, d: &Decoded, name: &str) -> LResult<()> {
         if name == "s_memtime" || name == "s_memrealtime" {
             let sdata = Self::field(d, "SDATA");
             let z = self.c(0);
@@ -1251,6 +1273,16 @@ impl Lw {
         if name.starts_with("buffer_atomic_") {
             return self.buffer_atomic(d, name);
         }
+        let is_load = !name.contains("store");
+        let glc = ["GLC", "DLC", "SLC"].iter().any(|f| rdna2::field_value(d.enc, &d.words, f) == Some(1));
+        let offen = rdna2::field_value(d.enc, &d.words, "OFFEN").unwrap_or(0) != 0;
+        let idxen = rdna2::field_value(d.enc, &d.words, "IDXEN").unwrap_or(0) != 0;
+        let uniform_win = !offen && !idxen;
+        let op_coh = is_load.then_some(glc);
+        self.with_mem_hints(uniform_win, op_coh, |lw| lw.mubuf_inner(d, name))
+    }
+
+    fn mubuf_inner(&mut self, d: &Decoded, name: &str) -> LResult<()> {
         let small = match name {
             "buffer_load_ubyte" => Some((1u32, false, false)),
             "buffer_load_sbyte" => Some((1, true, false)),
@@ -2014,6 +2046,12 @@ impl Lw {
         if let Some(a) = op.strip_prefix("atomic_") {
             return self.flat_atomic(d, a);
         }
+        let is_load = !op.contains("store");
+        let glc = ["GLC", "DLC", "SLC"].iter().any(|f| rdna2::field_value(d.enc, &d.words, f) == Some(1));
+        self.with_mem_hints(false, is_load.then_some(glc), |lw| lw.flat_inner(d, op))
+    }
+
+    fn flat_inner(&mut self, d: &Decoded, op: &str) -> LResult<()> {
         let act = self.act();
         if let Some((n, signed, store, half)) = flat_small(op) {
             let (a, _) = self.flat_base(d, store);

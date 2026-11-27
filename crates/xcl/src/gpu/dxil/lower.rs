@@ -199,6 +199,12 @@ pub struct Lw {
     /// the windows come from the descriptor heap (`lower_window`; `mems` only counts them):
     /// Some(globallycoherent)
     pub heap_mem: Option<bool>,
+    /// `XCL_PER_OP_COHERENCE=1` active and no cache-invalidate instruction in this program
+    pub per_op_coherence: bool,
+    /// per-instruction hint: `VAR_WIN` is wave-uniform (`nonuniform = false`)
+    pub cur_uniform_win: bool,
+    /// per-instruction hint: override `IsGloballyCoherent` for heap window handle
+    pub cur_op_coherent: Option<bool>,
     pub byte_windows: bool,
     pub res: Option<RawUav>,
     /// the buffer format table (`FMT_INFO`), created on first use

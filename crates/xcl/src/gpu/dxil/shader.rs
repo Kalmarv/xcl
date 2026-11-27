@@ -336,8 +336,14 @@ impl Shader {
     /// A `RWByteAddressBuffer` from `ResourceDescriptorHeap[NonUniformResourceIndex(index)]`,
     /// `globallycoherent` if `coherent` (the heap memory windows).
     pub fn heap_raw_buffer_uav(&mut self, index: Value, coherent: bool) -> RawUav {
+        self.heap_raw_buffer_uav_opt(index, coherent, true)
+    }
+
+    /// Like `heap_raw_buffer_uav`, with explicit `nonuniform` flag (`false` for wave-uniform
+    /// scalar/buffer window indices).
+    pub fn heap_raw_buffer_uav_opt(&mut self, index: Value, coherent: bool, nonuniform: bool) -> RawUav {
         self.require(Feature::RawAndStructuredBuffers);
-        let h = self.handle_from_heap(index, false, true);
+        let h = self.handle_from_heap(index, false, nonuniform);
         // resource properties: IsUAV (bit 12) | IsGloballyCoherent (bit 14)
         let handle = self.annotate(h, kind::RAW_BUFFER | 0x1000 | if coherent { 0x4000 } else { 0 }, 0);
         RawUav { handle, binding: None }

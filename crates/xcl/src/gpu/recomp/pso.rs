@@ -299,6 +299,9 @@ mod translated {
             let id = if crate::gpu::dxil::kernel::declared_lds_enabled() {
                 identity_for(&id.to_string(), "declared-lds")
             } else { id };
+            let id = if Backend::current() != Backend::Hlsl && crate::gpu::dxil::kernel::per_op_coherence_enabled() {
+                identity_for(&id.to_string(), "per-op-coherence")
+            } else { id };
             // `XCL_DIRECT_COMPACT=0` or `1`: the compact form forced off or on is another output
             let id = match crate::gpu::dxil::kernel::compact_mode() {
                 Some(on) if Backend::current() != Backend::Hlsl => identity_for(&id.to_string(), if on { "xcl-direct-compact-1" } else { "xcl-direct-compact-0" }),
@@ -559,6 +562,9 @@ mod translated {
         };
         let id = if crate::gpu::dxil::kernel::declared_lds_enabled() {
             identity_for(&id.to_string(), "declared-lds")
+        } else { id };
+        let id = if crate::gpu::dxil::kernel::per_op_coherence_enabled() {
+            identity_for(&id.to_string(), "per-op-coherence")
         } else { id };
         let id = match nest_tag {
             Some(tag) => identity_for(&id.to_string(), tag),
