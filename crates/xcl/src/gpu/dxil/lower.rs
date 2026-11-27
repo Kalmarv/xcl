@@ -201,6 +201,7 @@ pub struct Lw {
     pub heap_mem: Option<bool>,
     /// `XCL_PER_OP_COHERENCE=1` active and no cache-invalidate instruction in this program
     pub per_op_coherence: bool,
+    pub uniform_mubuf: bool,
     /// per-instruction hint: `VAR_WIN` is wave-uniform (`nonuniform = false`)
     pub cur_uniform_win: bool,
     /// per-instruction hint: override `IsGloballyCoherent` for heap window handle

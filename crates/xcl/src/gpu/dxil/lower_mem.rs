@@ -1165,8 +1165,10 @@ impl Lw {
     fn with_mem_hints<R>(&mut self, uniform_win: bool, op_coherent: Option<bool>, f: impl FnOnce(&mut Self) -> R) -> R {
         let prev_u = self.cur_uniform_win;
         let prev_c = self.cur_op_coherent;
-        if self.per_op_coherence {
+        if self.per_op_coherence || self.uniform_mubuf {
             self.cur_uniform_win = uniform_win;
+        }
+        if self.per_op_coherence {
             self.cur_op_coherent = op_coherent;
         }
         let r = f(self);
@@ -1277,7 +1279,7 @@ impl Lw {
         let glc = ["GLC", "DLC", "SLC"].iter().any(|f| rdna2::field_value(d.enc, &d.words, f) == Some(1));
         let offen = rdna2::field_value(d.enc, &d.words, "OFFEN").unwrap_or(0) != 0;
         let idxen = rdna2::field_value(d.enc, &d.words, "IDXEN").unwrap_or(0) != 0;
-        let uniform_win = !offen && !idxen;
+        let uniform_win = self.uniform_mubuf || (!offen && !idxen);
         let op_coh = is_load.then_some(glc);
         self.with_mem_hints(uniform_win, op_coh, |lw| lw.mubuf_inner(d, name))
     }
@@ -2048,7 +2050,9 @@ impl Lw {
         }
         let is_load = !op.contains("store");
         let glc = ["GLC", "DLC", "SLC"].iter().any(|f| rdna2::field_value(d.enc, &d.words, f) == Some(1));
-        self.with_mem_hints(false, is_load.then_some(glc), |lw| lw.flat_inner(d, op))
+        let saddr = rdna2::field_value(d.enc, &d.words, "SADDR").unwrap_or(0x7F);
+        let uniform_win = self.uniform_mubuf && d.enc.name == "ENC_FLAT_GLBL" && saddr < 0x7C;
+        self.with_mem_hints(uniform_win, is_load.then_some(glc), |lw| lw.flat_inner(d, op))
     }
 
     fn flat_inner(&mut self, d: &Decoded, op: &str) -> LResult<()> {

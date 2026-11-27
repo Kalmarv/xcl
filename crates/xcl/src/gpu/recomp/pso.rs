@@ -323,6 +323,12 @@ mod translated {
             } else {
                 id
             };
+            // `XCL_UNIFORM_MUBUF=1`: uniform MUBUF and SADDR-based GLOBAL window handles
+            let id = if Backend::current() != Backend::Hlsl && crate::gpu::dxil::kernel::uniform_mubuf_enabled() {
+                identity_for(&id.to_string(), "xcl-uniform-mubuf-1")
+            } else {
+                id
+            };
             // `XCL_PER_LANE=1` (direct compute only): its entries under their own identity
             if Backend::current() != Backend::Hlsl && crate::gpu::recomp::lower_dxil::enabled() {
                 identity_for(&id.to_string(), concat!("xcl-per-lane-", env!("XCL_PER_LANE_SOURCE_ID")))
@@ -565,6 +571,12 @@ mod translated {
         } else { id };
         let id = if crate::gpu::dxil::kernel::per_op_coherence_enabled() {
             identity_for(&id.to_string(), "per-op-coherence")
+        } else { id };
+        let id = if crate::gpu::dxil::ops::uniform_tex_enabled() {
+            identity_for(&id.to_string(), "xcl-uniform-tex-1")
+        } else { id };
+        let id = if crate::gpu::dxil::kernel::uniform_mubuf_enabled() {
+            identity_for(&id.to_string(), "xcl-uniform-mubuf-1")
         } else { id };
         let id = match nest_tag {
             Some(tag) => identity_for(&id.to_string(), tag),

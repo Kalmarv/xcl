@@ -55,6 +55,15 @@ pub fn per_op_coherence_enabled() -> bool {
     *ENABLED.get_or_init(|| std::env::var("XCL_PER_OP_COHERENCE").is_ok_and(|value| value == "1"))
 }
 
+/// `XCL_UNIFORM_MUBUF=1` (read once): also mark `MUBUF` (`OFFEN`/`IDXEN`) and `SADDR`-based
+/// `GLOBAL_*` heap-window handles wave-uniform (`nonuniform = false`), since SGPR-based buffers
+/// stay within a single 4 GiB UMA window and avoid NVIDIA Blackwell `NonUniformResourceIndex`
+/// waterfall loops on every buffer load/store.
+pub fn uniform_mubuf_enabled() -> bool {
+    static ENABLED: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
+    *ENABLED.get_or_init(|| std::env::var("XCL_UNIFORM_MUBUF").is_ok_and(|value| value == "1"))
+}
+
 /// `XCL_DIRECT_DXIL=1`: console compute shaders (and the kernel tests) go through this
 /// translator, with the HLSL path as the fallback for what it cannot translate yet.
 pub fn enabled() -> bool {
@@ -614,6 +623,7 @@ impl Lw {
             mems,
             heap_mem,
             per_op_coherence: per_op_coherence_enabled() && !has_cache_inv,
+            uniform_mubuf: uniform_mubuf_enabled(),
             cur_uniform_win: false,
             cur_op_coherent: None,
             byte_windows: o.mem_windows & crate::gpu::recomp::BYTE_WINDOWS != 0 && heap_mem.is_some(),
