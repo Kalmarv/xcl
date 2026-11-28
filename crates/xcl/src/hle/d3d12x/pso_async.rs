@@ -566,6 +566,12 @@ impl PcCalls {
         let spent = self.spent;
         self.now.iter().any(|(_, since)| spent + now.saturating_duration_since(self.clamp(*since)) >= PC_CALL_HOLDS_AFTER)
     }
+
+    /// `holds`, but a call going on for `cap` or longer holds nothing: it is not waiting for XCL's
+    /// work or the driver's but stuck, maybe behind the very GPU waits the watchdog would release.
+    fn holds_within(&mut self, frame: u64, now: std::time::Instant, cap: std::time::Duration) -> bool {
+        self.holds(frame, now) && !self.now.iter().any(|(_, since)| now.saturating_duration_since(*since) >= cap)
+    }
 }
 
 static PC_CALLS: Mutex<PcCalls> = Mutex::new(PcCalls::new());
@@ -582,6 +588,23 @@ pub fn title_held() -> bool {
 
 fn held_by_pc_call() -> bool {
     PC_CALLS.lock().unwrap().holds(super::present::presents(), std::time::Instant::now())
+}
+
+/// From this long on, one PC call of the title's going on no longer holds it for the GPU wait
+/// watchdog (`title_held_for_watchdog`); `XCL_PC_HOLD_CAP_MS` overrides.
+const PC_CALL_HOLD_CAP: std::time::Duration = std::time::Duration::from_secs(120);
+
+fn pc_call_hold_cap() -> std::time::Duration {
+    static T: std::sync::OnceLock<std::time::Duration> = std::sync::OnceLock::new();
+    *T.get_or_init(|| std::env::var("XCL_PC_HOLD_CAP_MS").ok().and_then(|v| v.trim().parse::<u64>().ok()).filter(|&ms| ms > 0).map_or(PC_CALL_HOLD_CAP, std::time::Duration::from_millis))
+}
+
+/// `title_held` for the GPU wait watchdog, whose clocks stand while it is true: a bind waiting for a
+/// pipeline holds it as long as the build lasts, but a PC call holds it only up to
+/// `pc_call_hold_cap`. A submission stuck in the driver behind a queue that waits on a fence its own
+/// lists would signal held every clock for good, and nothing ran again (a retail title, 20 min).
+pub fn title_held_for_watchdog() -> bool {
+    HELD.load(Ordering::Acquire) != 0 || PC_CALLS.lock().unwrap().holds_within(super::present::presents(), std::time::Instant::now(), pc_call_hold_cap())
 }
 
 /// A call of the title into D3D12 that XCL or the PC's driver can keep for long where the
@@ -1301,6 +1324,21 @@ mod used_tests {
     /// Short PC calls add up between two frames: none of them is long, but after many in a row
     /// the one going on holds the title. The title's own time between them is not held, and a
     /// frame shown ends it.
+    #[test]
+    fn a_pc_call_stuck_past_the_cap_no_longer_holds_the_title_for_the_watchdog() {
+        let cap = std::time::Duration::from_secs(120);
+        let mut calls = PcCalls::new();
+        let began = std::time::Instant::now();
+        calls.begin(1, 0, began);
+        let later = began + 2 * PC_CALL_HOLDS_AFTER;
+        assert!(calls.holds_within(0, later, cap), "a call of {:?} holds the title", 2 * PC_CALL_HOLDS_AFTER);
+        let stuck = began + cap;
+        assert!(calls.holds(0, stuck), "the title is held, as before");
+        assert!(!calls.holds_within(0, stuck, cap), "a call going on for {cap:?} still holds the watchdog's clocks");
+        calls.end(1, 0, stuck);
+        assert!(!calls.holds_within(0, stuck, cap));
+    }
+
     #[test]
     fn short_pc_calls_between_two_frames_hold_the_title() {
         let mut calls = PcCalls::new();

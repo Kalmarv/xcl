@@ -1974,7 +1974,7 @@ pub(super) unsafe fn break_cycles_before_title_signal(sig_q: usize, title_fence:
     }
 }
 
-/// Whether an armed GPU wait has outlasted the watchdog; its clock stands while a submit or bind is held for a pipeline build.
+/// Whether an armed GPU wait has outlasted the watchdog; its clock stands while a submit or bind is held for a pipeline build (`pso_async::title_held_for_watchdog`).
 fn wait_expired(aw: &mut ArmedGpuWait, held: bool) -> bool {
     if held {
         aw.armed_at = Instant::now();
@@ -2033,7 +2033,7 @@ fn wake_sync_watchdog() {
                         let mut waiter_q = 0usize;
                         let mut waiter_ty = -1i32;
                         let before = cell.armed_waits.len();
-                        let held = super::pso_async::title_held();
+                        let held = super::pso_async::title_held_for_watchdog();
                         cell.armed_waits.retain_mut(|aw| {
                             if wait_expired(aw, held) {
                                 if aw.val >= max_exp {
