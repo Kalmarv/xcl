@@ -3738,7 +3738,8 @@ pub(super) unsafe extern "system" fn flush_pipeline_x(this: *mut c_void, _flags:
 
 /// command list #84 CopyResourceX(destination, source, flags); in place (the console's
 /// compression operations) there is nothing to do on PC
-pub(super) unsafe extern "system" fn copy_resource_flags_x(this: *mut c_void, dst: usize, src: usize, _flags: u32) {
+pub(super) unsafe extern "system" fn copy_resource_flags_x(this: *mut c_void, dst: usize, src: usize, flags: u32) {
+    note_copy_flags("CopyResourceX", flags, dst == src);
     if dst != src {
         copy_resource_x(this, dst, src);
     }
@@ -5256,8 +5257,24 @@ pub(super) unsafe extern "system" fn copy_texture_region_x(this: *mut c_void, ds
 
 /// command list #83 CopyTextureRegionX(dst, x, y, z, src, box, flags): CopyTextureRegion with
 /// console copy flags (the title's texture streaming calls it where the DMA list gets #12)
-pub(super) unsafe extern "system" fn copy_texture_region_flags_x(this: *mut c_void, dst: *const D3D12_TEXTURE_COPY_LOCATION, x: u32, y: u32, z: u32, src: *const D3D12_TEXTURE_COPY_LOCATION, bx: *const D3D12_BOX, _flags: u32) {
+pub(super) unsafe extern "system" fn copy_texture_region_flags_x(this: *mut c_void, dst: *const D3D12_TEXTURE_COPY_LOCATION, x: u32, y: u32, z: u32, src: *const D3D12_TEXTURE_COPY_LOCATION, bx: *const D3D12_BOX, flags: u32) {
+    note_copy_flags("CopyTextureRegionX", flags, false);
     copy_texture_region_x(this, dst, x, y, z, src, bx)
+}
+
+/// The flags of the two flagged copy calls are not acted on: each new value is logged once with
+/// the call, so a log shows whether a title asks for a copy that is more than a plain one.
+fn note_copy_flags(call: &'static str, flags: u32, in_place: bool) {
+    if flags == 0 {
+        return;
+    }
+    static SEEN: Mutex<Vec<(u32, &'static str, bool)>> = Mutex::new(Vec::new());
+    let key = (flags, call, in_place);
+    let mut seen = SEEN.lock().unwrap();
+    if seen.len() < 64 && !seen.contains(&key) {
+        seen.push(key);
+        crate::xlog_info!("D3D12.X: {call} with flags {flags:#x}{} (flags are not acted on; first call with this value)", if in_place { ", in place" } else { "" });
+    }
 }
 
 const PC_CLEAR_DEPTH_STENCIL_VIEW: usize = 47;
