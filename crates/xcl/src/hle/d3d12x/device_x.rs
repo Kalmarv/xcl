@@ -1220,7 +1220,10 @@ pub(super) unsafe extern "system" fn create_placed_resource_x(this: *mut c_void,
                 }
                 return hr;
             }
-        } else {
+        } else if !super::format_alias::sampled_texture_is_copied(this as usize, va as usize, &pc, flags) {
+            // (`XCL_FORMAT_ALIAS=1`: not one that gets a GPU-written texture's texels by copy.
+            // On the pages its tiles would be the writer's, and the next textures' where its
+            // description takes more of the title's memory than the writer's)
             placed_hr = super::vram::place_pages(this, va as usize, &pc, state, clear, console_bytes, riid, ppv);
         }
     }
