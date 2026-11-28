@@ -4191,8 +4191,11 @@ impl State {
             let Some(e) = self.mapped.get(&w).filter(|e| e.pool != LAZY) else { continue };
             // (a tile of a GPU view reads its CPU view; one of the windows' own, its own address)
             let cpu = if e.src != 0 { e.src } else { w };
+            // (read only what Windows has committed and readable now: a page of the title's
+            // may be decommitted, guarded or on its way elsewhere since the entry was made)
+            let holes = e.holes | query_tile_holes(cpu);
             for idx in 0..PAGES_PER_TILE {
-                if e.holes & (1 << idx) != 0 {
+                if holes & (1 << idx) != 0 {
                     continue;
                 }
                 pages += 1;
