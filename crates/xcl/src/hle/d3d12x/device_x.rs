@@ -630,22 +630,30 @@ pub(super) unsafe extern "system" fn unregister_page_pool_x(_this: *mut c_void, 
 }
 
 /// PC filter of a console sampler desc. The fields are numbered as in an S#: magnification and
-/// minification 1 bilinear, 2 anisotropic point, 3 anisotropic bilinear, mip 2 linear.
-fn sampler_x_filter(mag: u32, min: u32, mip: u32, max_anisotropy: u32) -> D3D12_FILTER {
+/// minification 1 bilinear, 2 anisotropic point, 3 anisotropic bilinear, mip 2 linear; the filter
+/// mode 1 takes the minimum of the footprint, 2 its maximum (the PC's reduction 2 / 3).
+fn sampler_x_filter(mag: u32, min: u32, mip: u32, mode: u32, max_anisotropy: u32) -> D3D12_FILTER {
+    let reduction = match mode {
+        1 => 2u32,
+        2 => 3,
+        _ => 0,
+    };
     if max_anisotropy > 1 && (mag == 3 || min == 3) {
-        return D3D12_FILTER_ANISOTROPIC;
+        // D3D12_ENCODE_ANISOTROPIC_FILTER
+        return D3D12_FILTER((0x55 | reduction << 7) as i32);
     }
     // D3D12_ENCODE_BASIC_FILTER: linear = 1
-    D3D12_FILTER(((min & 1) << 4 | (mag & 1) << 2 | (mip == 2) as u32) as i32)
+    D3D12_FILTER(((min & 1) << 4 | (mag & 1) << 2 | (mip == 2) as u32 | reduction << 7) as i32)
 }
 
 /// PC sampler desc of a console one (0x6C bytes; `u`: the dword at an offset). It carries the PC
-/// fields at other offsets (+4 / +8 / +0x10 magnification / minification / mip filter, +0x18
-/// address U / V / W, +0x24 / +0x28 min / max LOD, +0x2C bias, +0x34 max anisotropy, +0x40
-/// comparison, +0x44 border colour); its further anisotropy fields are not modelled.
+/// fields at other offsets (+0 flags, +4 / +8 / +0xC magnification / minification / mip filter,
+/// +0x10 z filter, +0x14 filter mode, +0x18 address U / V / W, +0x24 / +0x28 min / max LOD,
+/// +0x2C bias, +0x34 max anisotropy, +0x40 comparison, +0x44 border colour); the flags, the z
+/// filter and the further anisotropy fields are not modelled.
 fn pc_sampler_desc(u: impl Fn(usize) -> u32) -> D3D12_SAMPLER_DESC {
     D3D12_SAMPLER_DESC {
-        Filter: sampler_x_filter(u(4), u(8), u(0x10), u(0x34)),
+        Filter: sampler_x_filter(u(4), u(8), u(0xC), u(0x14), u(0x34)),
         AddressU: D3D12_TEXTURE_ADDRESS_MODE(u(0x18) as i32),
         AddressV: D3D12_TEXTURE_ADDRESS_MODE(u(0x1C) as i32),
         AddressW: D3D12_TEXTURE_ADDRESS_MODE(u(0x20) as i32),
@@ -663,7 +671,25 @@ pub(super) unsafe extern "system" fn create_sampler_x(this: *mut c_void, x: *con
     if x.is_null() || !crate::gpu::shader::readable(x as usize, 0x6C) {
         return;
     }
-    let d = pc_sampler_desc(|o| (x.add(o) as *const u32).read_unaligned());
+    let u = |o: usize| (x.add(o) as *const u32).read_unaligned();
+    // each different console desc once (64 at most): what the title asks of its samplers
+    static SEEN: std::sync::Mutex<Vec<[u32; 8]>> = std::sync::Mutex::new(Vec::new());
+    let key = [u(0), u(4), u(8), u(0xC), u(0x10), u(0x14), u(0x34), u(0x40)];
+    let new = {
+        let mut seen = SEEN.lock().unwrap_or_else(|e| e.into_inner());
+        let new = seen.len() < 64 && !seen.contains(&key);
+        if new {
+            seen.push(key);
+        }
+        new
+    };
+    if new {
+        crate::xlog_info!(
+            "D3D12.X: CreateSamplerX: flags {:#x}, filters mag {} min {} mip {} z {}, mode {}, max anisotropy {}, comparison {}",
+            key[0], key[1], key[2], key[3], key[4], key[5], key[6], key[7]
+        );
+    }
+    let d = pc_sampler_desc(u);
     real::dev_create_sampler_x(this, &d, dest);
 }
 
@@ -1409,7 +1435,7 @@ pub(super) unsafe extern "system" fn create_command_signature_x(this: *mut c_voi
 mod tests {
     use super::*;
 
-    /// A console sampler desc: [mag, min, z, mip] filters, address U / V / W, maximum anisotropy.
+    /// A console sampler desc: [mag, min, mip, z] filters, address U / V / W, maximum anisotropy.
     fn console_sampler(filters: [u32; 4], address: [u32; 3], anisotropy: u32) -> [u32; 0x6C / 4] {
         let mut d = [0u32; 0x6C / 4];
         d[1..5].copy_from_slice(&filters);
@@ -1430,14 +1456,27 @@ mod tests {
         assert_eq!(pc([2, 2, 1, 1], 1).Filter, D3D12_FILTER_MIN_MAG_MIP_POINT);
         assert_eq!(pc([1, 1, 2, 2], 1).Filter, D3D12_FILTER_MIN_MAG_MIP_LINEAR);
         assert_eq!(pc([1, 1, 1, 1], 1).Filter, D3D12_FILTER_MIN_MAG_LINEAR_MIP_POINT);
-        // the z filter is not the mip filter, and mag and min are not swapped
-        assert_eq!(pc([1, 1, 1, 2], 1).Filter, D3D12_FILTER_MIN_MAG_MIP_LINEAR);
+        // the mip filter is at +0xC, the z filter (+0x10) is not it, and mag and min are not swapped
+        assert_eq!(pc([1, 1, 1, 2], 1).Filter, D3D12_FILTER_MIN_MAG_LINEAR_MIP_POINT);
+        assert_eq!(pc([1, 1, 2, 1], 1).Filter, D3D12_FILTER_MIN_MAG_MIP_LINEAR);
         assert_eq!(pc([1, 2, 1, 1], 1).Filter, D3D12_FILTER_MIN_POINT_MAG_LINEAR_MIP_POINT);
         let d = pc([3, 3, 2, 2], 8);
         assert_eq!((d.Filter, d.MaxAnisotropy), (D3D12_FILTER_ANISOTROPIC, 8));
         // a maximum of 1 is trilinear, and anisotropic point is point
         assert_eq!(pc([3, 3, 2, 2], 1).Filter, D3D12_FILTER_MIN_MAG_MIP_LINEAR);
         assert_eq!(pc([2, 2, 1, 1], 8).Filter, D3D12_FILTER_MIN_MAG_MIP_POINT);
+        // the filter mode: minimum / maximum reductions (a depth pyramid's), lerp as before
+        let mode = |m: u32, anisotropy: u32| {
+            let mut d = console_sampler([1, 1, 1, 0], [3, 3, 3], anisotropy);
+            d[0x14 / 4] = m;
+            pc_sampler_desc(|o| d[o / 4]).Filter
+        };
+        assert_eq!(mode(0, 1), D3D12_FILTER_MIN_MAG_LINEAR_MIP_POINT);
+        assert_eq!(mode(1, 1), D3D12_FILTER_MINIMUM_MIN_MAG_LINEAR_MIP_POINT);
+        assert_eq!(mode(2, 1), D3D12_FILTER_MAXIMUM_MIN_MAG_LINEAR_MIP_POINT);
+        let mut d = console_sampler([3, 3, 2, 2], [1, 1, 1], 8);
+        d[0x14 / 4] = 2;
+        assert_eq!(pc_sampler_desc(|o| d[o / 4]).Filter, D3D12_FILTER_MAXIMUM_ANISOTROPIC);
         // the other fields as before
         let d = pc([1, 1, 2, 2], 1);
         assert_eq!((d.AddressU.0, d.AddressV.0, d.AddressW.0, d.MinLOD, d.MaxLOD, d.ComparisonFunc.0), (1, 2, 3, 0.0, 12.0, 1));
