@@ -9732,11 +9732,13 @@ unsafe extern "system" fn q_execute_command_lists(this: *mut c_void, n: u32, lis
             super::alloc_pool::wait_for_previous_submits(chunk);
         }
         super::submit_cost::previous(t.elapsed());
+        serial_queues_before(this);
         let t = std::time::Instant::now();
         {
             let _in_driver = super::watch::in_driver(super::watch::Call::Execute);
             f(this, chunk.len() as u32, chunk.as_ptr());
         }
+        serial_queues_after(this);
         super::gpu_times::executed(this, chunk);
         let t1 = std::time::Instant::now();
         super::submit_cost::driver(t1 - t);
@@ -9756,6 +9758,77 @@ unsafe extern "system" fn q_execute_command_lists(this: *mut c_void, n: u32, lis
     stop_if_device_removed();
     super::submit_cost::end(t_end.elapsed());
     super::submit_cost::done(submit_t0);
+}
+
+/// `XCL_SERIAL_QUEUES=1` (a diagnostic, off by default): each title compute queue signals a fence
+/// of XCL's after its lists, and a direct queue's lists wait on the CPU (up to 100 ms in all) until
+/// what the compute queues were given before them is done. Work a compute queue holds back for a
+/// direct queue's later signal runs into the limit instead of a deadlock.
+fn serial_queues() -> bool {
+    static ON: OnceLock<bool> = OnceLock::new();
+    *ON.get_or_init(|| {
+        let on = std::env::var("XCL_SERIAL_QUEUES").is_ok_and(|v| v.trim() == "1");
+        if on {
+            crate::xlog_info!("D3D12.X: XCL_SERIAL_QUEUES=1: direct-queue submits wait (up to 100 ms) for the compute queues' earlier submits");
+        }
+        on
+    })
+}
+
+/// compute queue → XCL's fence on it and the last value it was given
+static SERIAL_COMPUTE: Mutex<Option<HashMap<usize, (ID3D12Fence, u64)>>> = Mutex::new(None);
+/// direct-queue submits that waited, that ran into the limit, and the time they waited (µs)
+static SERIAL_STATS: [AtomicU64; 3] = [AtomicU64::new(0), AtomicU64::new(0), AtomicU64::new(0)];
+
+unsafe fn serial_queue_type(q: *mut c_void) -> Option<D3D12_COMMAND_LIST_TYPE> {
+    Some(ID3D12CommandQueue::from_raw_borrowed(&q)?.GetDesc().Type)
+}
+
+unsafe fn serial_queues_before(q: *mut c_void) {
+    if !serial_queues() || serial_queue_type(q) != Some(D3D12_COMMAND_LIST_TYPE_DIRECT) {
+        return;
+    }
+    let pending: Vec<(ID3D12Fence, u64)> = SERIAL_COMPUTE.lock().unwrap().as_ref().map_or_else(Vec::new, |m| m.values().filter(|(f, v)| fence_completed(f) < *v).cloned().collect());
+    if pending.is_empty() {
+        return;
+    }
+    let t = std::time::Instant::now();
+    let limit = std::time::Duration::from_millis(100);
+    let mut late = false;
+    for (f, v) in &pending {
+        while fence_completed(f) < *v {
+            if t.elapsed() >= limit {
+                late = true;
+                break;
+            }
+            std::thread::sleep(std::time::Duration::from_micros(200));
+        }
+    }
+    let waited = SERIAL_STATS[0].fetch_add(1, Ordering::Relaxed) + 1;
+    let lates = SERIAL_STATS[1].fetch_add(late as u64, Ordering::Relaxed) + late as u64;
+    let us = SERIAL_STATS[2].fetch_add(t.elapsed().as_micros() as u64, Ordering::Relaxed) + t.elapsed().as_micros() as u64;
+    if waited.is_power_of_two() || (late && lates.is_power_of_two()) {
+        crate::xlog_info!("D3D12.X: XCL_SERIAL_QUEUES: {waited} direct submits waited for compute queues ({lates} ran into the 100 ms limit), {} ms in all", us / 1000);
+    }
+}
+
+unsafe fn serial_queues_after(q: *mut c_void) {
+    if !serial_queues() || serial_queue_type(q) != Some(D3D12_COMMAND_LIST_TYPE_COMPUTE) {
+        return;
+    }
+    let Some(queue) = ID3D12CommandQueue::from_raw_borrowed(&q) else { return };
+    let mut g = SERIAL_COMPUTE.lock().unwrap();
+    let m = g.get_or_insert_with(HashMap::new);
+    if !m.contains_key(&(q as usize)) {
+        let raw = device_raw();
+        let Some(dev) = ID3D12Device::from_raw_borrowed(&raw) else { return };
+        let Ok(f) = dev.CreateFence::<ID3D12Fence>(0, D3D12_FENCE_FLAG_NONE) else { return };
+        m.insert(q as usize, (f, 0));
+    }
+    let e = m.get_mut(&(q as usize)).unwrap();
+    if queue.Signal(&e.0, e.1 + 1).is_ok() {
+        e.1 += 1;
+    }
 }
 
 /// Wait (up to 10 s) until the GPU has finished the work submitted to the queues console code
