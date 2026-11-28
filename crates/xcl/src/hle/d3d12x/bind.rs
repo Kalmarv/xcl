@@ -2318,10 +2318,37 @@ unsafe fn shared_res_buffer(this: *mut c_void, need: u64) -> Result<(ID3D12Resou
 /// `RECORD_MIN.min(max_need)`; `Some(g)` reserves `2 × g` records up to `max_need`.
 fn indirect_record_need_hint(record_bytes: u64, split: u32, hint_groups: Option<u32>) -> u64 {
     let max_need = indirect_record_need(record_bytes, split);
-    match hint_groups {
+    match hint_groups.filter(|_| !hint_off()) {
         None => max_need,
         Some(0) => RECORD_MIN.min(max_need),
         Some(g) => max_need.min(record_bytes.saturating_mul((g as u64).saturating_mul(2))),
+    }
+}
+
+/// `XCL_TWO_PASS_HINT=0`: a two-pass ExecuteIndirect's records are not sized from the groups its
+/// pipeline had before (`indirect_record_need_hint`): every command gets the full
+/// `indirect_record_need`. For telling the groups a late history costs from those the cap costs.
+fn hint_off() -> bool {
+    static OFF: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
+    *OFF.get_or_init(|| std::env::var("XCL_TWO_PASS_HINT").is_ok_and(|v| v.trim() == "0"))
+}
+
+/// A feedback window in which a pipeline's largest command had more groups than the smallest
+/// record region it was given held (the first 32 such windows, then as their count doubles):
+/// the groups past the region were not drawn. `hint` is the largest count of the windows before:
+/// a region of twice that many records was sized from the history, a smaller one is the cap's.
+fn note_cut(slot: usize, encoded: u32, cap: u32, hint: Option<u32>) {
+    if encoded == 0 || cap == u32::MAX || encoded - 1 <= cap {
+        return;
+    }
+    static CUTS: AtomicU64 = AtomicU64::new(0);
+    let n = CUTS.fetch_add(1, Ordering::Relaxed) + 1;
+    if n <= 32 || n.is_power_of_two() {
+        crate::xlog_info!(
+            "D3D12.X: two-pass feedback: pipeline slot {slot} had a command of {} groups where its record region held {cap} (largest in the windows before: {hint:?}; regions are capped at {} MiB, XCL_TWO_PASS_INDIRECT_MB; window {n} with a cut)",
+            encoded - 1,
+            indirect_records_cap() >> 20
+        );
     }
 }
 
@@ -2499,7 +2526,8 @@ impl IndirectFeedback {
             if clamped_groups > 0 {
                 note_two_pass_add(TP_INDIRECT_GROUPS_DROPPED, clamped_groups);
             }
-            for (slot, &encoded) in self.slots.iter_mut().zip(&vals[FEEDBACK_HEADER_U32S..]) {
+            for (i, (slot, &encoded)) in self.slots.iter_mut().zip(&vals[FEEDBACK_HEADER_U32S..]).enumerate() {
+                note_cut(i, encoded, slot.in_flight_cap, slot.hint());
                 slot.apply_window(encoded);
             }
             let empty = D3D12_RANGE { Begin: 0, End: 0 };
