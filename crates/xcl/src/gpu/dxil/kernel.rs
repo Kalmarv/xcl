@@ -418,8 +418,9 @@ fn translate_on_this_thread(
     // a compute program's loops: each entry has its own count of passes besides the lane's budget
     let passes = if compute && plan.is_none() && !cfg.headers.is_empty() { Some(loop_passes(&mut lw, &cfg, numthreads.iter().product())) } else { None };
     // scalar loads the program repeats keep their first values (compute programs and kernels:
-    // the other stages enter their code by edges the CFG does not hold)
-    let reloads = if follow_loads { super::reload::analyze(&cfg) } else { Default::default() };
+    // the other stages enter their code by edges the CFG does not hold; the compact form
+    // lowers its blocks without them)
+    let reloads = if follow_loads && plan.is_none() { super::reload::analyze(&cfg) } else { Default::default() };
     let mut gs_entry: Option<usize> = None;
     if let Some(p) = &plan {
         match nest {
