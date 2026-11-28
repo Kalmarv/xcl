@@ -277,6 +277,52 @@ pub(super) fn uma_window_buffer_gpu(p: usize, len: usize) -> Option<(usize, u64)
     Some((UMA_BUFFER.lock().ok()?.get(k)?.0, (p - base) as u64))
 }
 
+/// Diagnostic (`bvh_want`): `len` bytes at UMA address `p` as the window's buffer holds them on
+/// the GPU (a view window's video memory too), copied on the tile queue into a readback buffer of
+/// its own; the CPU's copy is left alone. Slow (objects made per call): for a probe now and then.
+pub(super) unsafe fn peek_window(p: usize, len: usize) -> Result<Vec<u8>, &'static str> {
+    let (buf, off) = uma_window_buffer_gpu(p, len).ok_or("not in a UMA window")?;
+    let raw = device_raw();
+    let dev = ID3D12Device::from_raw_borrowed(&raw).ok_or("no device")?;
+    let q = super::sparse::queue().ok_or("no tile queue")?;
+    let src_raw = buf as *mut c_void;
+    let src = ID3D12Resource::from_raw_borrowed(&src_raw).ok_or("no window buffer")?;
+    let desc = D3D12_RESOURCE_DESC {
+        Dimension: D3D12_RESOURCE_DIMENSION_BUFFER,
+        Width: len as u64,
+        Height: 1,
+        DepthOrArraySize: 1,
+        MipLevels: 1,
+        SampleDesc: windows::Win32::Graphics::Dxgi::Common::DXGI_SAMPLE_DESC { Count: 1, Quality: 0 },
+        Layout: D3D12_TEXTURE_LAYOUT_ROW_MAJOR,
+        ..Default::default()
+    };
+    let mut rb: Option<ID3D12Resource> = None;
+    dev.CreateCommittedResource(&D3D12_HEAP_PROPERTIES { Type: D3D12_HEAP_TYPE_READBACK, ..Default::default() }, D3D12_HEAP_FLAG_NONE, &desc, D3D12_RESOURCE_STATE_COPY_DEST, None, &mut rb)
+        .map_err(|_| "no readback buffer")?;
+    let rb = rb.ok_or("no readback buffer")?;
+    let ty = q.GetDesc().Type;
+    let alloc: ID3D12CommandAllocator = dev.CreateCommandAllocator(ty).map_err(|_| "no allocator")?;
+    let list: ID3D12GraphicsCommandList = dev.CreateCommandList(0, ty, &alloc, None).map_err(|_| "no list")?;
+    list.CopyBufferRegion(&rb, 0, src, off, len as u64);
+    list.Close().map_err(|_| "the list did not close")?;
+    let l: ID3D12CommandList = list.cast().map_err(|_| "not a command list")?;
+    q.ExecuteCommandLists(&[Some(l)]);
+    let fence: ID3D12Fence = dev.CreateFence(0, D3D12_FENCE_FLAG_NONE).map_err(|_| "no fence")?;
+    q.Signal(&fence, 1).map_err(|_| "the queue did not signal")?;
+    let _ = crate::gpu::fence::wait(&fence, 1, dev, None, 2000);
+    match fence_completed(&fence) {
+        u64::MAX => return Err("device removed"),
+        v if v < 1 => return Err("the copy did not finish within 2 s"),
+        _ => {}
+    }
+    let mut ptr = std::ptr::null_mut();
+    rb.Map(0, Some(&D3D12_RANGE { Begin: 0, End: len }), Some(&mut ptr)).map_err(|_| "the readback buffer did not map")?;
+    let out = std::slice::from_raw_parts(ptr as *const u8, len).to_vec();
+    rb.Unmap(0, Some(&D3D12_RANGE { Begin: 0, End: 0 }));
+    Ok(out)
+}
+
 /// GPU virtual address of a UMA address (None: not in UMA or not open on the GPU).
 pub fn uma_va_of(p: usize) -> Option<u64> {
     let u = crate::gpu::uma::get()?;

@@ -180,7 +180,12 @@ fn probe_headers() {
         let readable = read_title(va, &mut cpu);
         let cpu_line = if readable { words(&cpu) } else { "not readable".to_string() };
         // (read at this present: the title's queues are not waited for, so a build of this frame may be in flight)
-        let gpu_line = match unsafe { super::sparse::peek_gpu(va as usize, 256) } {
+        // (a view window is not one of the sparse windows: read through its window buffer)
+        let peek = match unsafe { super::sparse::peek_gpu(va as usize, 256) } {
+            Err("not in a sparse window") => unsafe { super::real::peek_window(va as usize, 256) },
+            r => r,
+        };
+        let gpu_line = match peek {
             Ok(b) => format!("{}{}", words(&b), if !readable { "" } else if b[..] == cpu[..] { " (same 256 B)" } else { " (differs)" }),
             Err(e) => e.to_string(),
         };
