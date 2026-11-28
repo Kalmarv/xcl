@@ -2800,8 +2800,9 @@ impl Em {
             if let Some(o) = &offset {
                 // the mip the sample below reads: the given LOD, else that of the given gradients or
                 // the pixel's own (none outside PS), plus the bias. A comparison sample is
-                // SampleCmpLevelZero outside PS, and SampleCmp, which takes neither gradients nor a
-                // bias in SM 6.6, in a PS: its offset moves by the mip that one reads.
+                // SampleCmpLevelZero outside PS, and SampleCmp in a PS, which takes no bias in
+                // SM 6.6 (its given gradients become each pixel's footprint, `sample_cmp_grad`):
+                // its offset moves by the mip that one reads.
                 let level = if has_lz || base.starts_with("gather4") || (has_c && !ps) {
                     "0u".to_string()
                 } else if let Some(l) = &lod {
@@ -2824,8 +2825,9 @@ impl Em {
                     // the LOD before any clamp, so that the bias sees a magnified (negative) one;
                     // CalculateLevelOfDetail takes no comparison sampler: the screen derivatives
                     let screen = |op: &str| (0..[1, 2, 3, 3, 1, 2][dim as usize]).map(|k| format!("{op}({})", coords_unmoved[k])).collect::<Vec<_>>();
-                    // the gradients and the bias that the sample below takes (SampleCmp neither)
-                    let lod_grads = if has_c { None } else { grads.as_ref() };
+                    // the gradients and the bias that the sample below takes (a comparison sample
+                    // here is in a PS and takes its gradients, but no bias)
+                    let lod_grads = grads.as_ref();
                     let lod_bias = if has_c { None } else { bias.as_ref() };
                     let l = match lod_grads {
                         Some((dx, dy)) => grad_lod(dx, dy),
