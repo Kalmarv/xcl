@@ -2328,6 +2328,7 @@ impl State {
         if runs.is_empty() || !self.ensure_zero_buf() {
             return;
         }
+        trace_uploads(runs, 1);
         let slot_idx = self.begin_slot();
         let mut last_wi: Option<usize> = None;
         let zero_buf = self.zero_buf.as_ref().unwrap();
@@ -2401,6 +2402,7 @@ impl State {
             }
         }
         let Some(p) = self.staging_ptr() else { return };
+        trace_uploads(runs, 0);
         let mut open_slot: Option<usize> = None;
         let mut last_wi: Option<usize> = None;
         // the copies into the ring (source address, ring offset, bytes), done before their slot is
@@ -4165,6 +4167,37 @@ impl State {
         true
     }
 
+    /// `XCL_TRACE_UPLOAD_RANGE`: once a second, a line for each range: the bytes uploaded and
+    /// cleared into it since the line before (and at how many of the submits since), and of its
+    /// tiles now: with video memory, linked over a CPU view, waiting for video memory, refused.
+    fn trace_line(&mut self, queue: &ID3D12CommandQueue) {
+        let Some(ranges) = trace_ranges() else { return };
+        let n = TRACE_SUBMITS.fetch_add(1, Ordering::Relaxed) + 1;
+        let mut last = TRACE_AT.lock().unwrap_or_else(|e| e.into_inner());
+        if last.is_some_and(|t| t.elapsed() < std::time::Duration::from_secs(1)) {
+            return;
+        }
+        *last = Some(std::time::Instant::now());
+        drop(last);
+        let waiting: FxHashSet<usize> = self.later.iter().map(|l| l.0).collect();
+        for r in ranges {
+            let (mut mem, mut linked, mut wait, mut refused) = (0usize, 0usize, 0usize, 0usize);
+            let tiles = (r.hi - r.lo) / TILE;
+            for t in (r.lo..r.hi).step_by(TILE) {
+                mem += self.mapped.get(&t).is_some_and(|e| e.pool != LAZY) as usize;
+                linked += self.mirror_src.contains_key(&t) as usize;
+                wait += waiting.contains(&t) as usize;
+                refused += self.refused.contains(&t) as usize;
+            }
+            let [up, zero, at] = std::array::from_fn(|k| r.counts[k].swap(0, Ordering::Relaxed));
+            crate::xlog_info!(
+                "XCL_TRACE_UPLOAD_RANGE {}: {up} bytes uploaded, {zero} cleared at {at} submit(s) up to submit {n} (queue {:#x}); of {tiles} tiles now {mem} with video memory, {linked} over a CPU view, {wait} waiting, {refused} refused",
+                r.text,
+                queue.as_raw() as usize
+            );
+        }
+    }
+
     /// A tile over a CPU view found no video memory a moment ago (`no_memory`, 1 s)
     fn short_of_memory(&self) -> bool {
         self.no_memory.is_some_and(|t| t.elapsed() < std::time::Duration::from_secs(1))
@@ -4787,6 +4820,73 @@ pub(super) fn will_write(va: usize, len: usize) {
     WRITE_ASKING.store(true, Ordering::Release);
 }
 
+/// A range of `XCL_TRACE_UPLOAD_RANGE` (addresses, end excluded) and what went up into it since
+/// its last line: [bytes uploaded, bytes cleared, submits with either].
+struct TraceRange {
+    text: String,
+    lo: usize,
+    hi: usize,
+    counts: [AtomicU64; 3],
+}
+
+/// `XCL_TRACE_UPLOAD_RANGE=<window>:<start>-<end>;…` (diagnostic): ranges of the memory windows
+/// by window index (as `gpu::uma` counts them: 0-2 sparse, 3 coherent, 4-9 GPU views with 16)
+/// and offset in it, hex, e.g. `4:0x12561000-0x1792e000;9:0x71188000-0x713c5000`. A range is
+/// widened to whole tiles. None: unset, or no range parses.
+fn trace_ranges() -> Option<&'static [TraceRange]> {
+    static RANGES: std::sync::OnceLock<Vec<TraceRange>> = std::sync::OnceLock::new();
+    let r = RANGES.get_or_init(|| {
+        let Ok(v) = std::env::var("XCL_TRACE_UPLOAD_RANGE") else { return Vec::new() };
+        let Some(u) = crate::gpu::uma::get() else { return Vec::new() };
+        let r = parse_trace_ranges(&v, |k| (k < u.shader_windows()).then(|| u.window(k).0));
+        crate::xlog_info!("XCL_TRACE_UPLOAD_RANGE: {} range(s) of {:?}", r.len(), v.trim());
+        r
+    });
+    (!r.is_empty()).then_some(&r[..])
+}
+
+/// The ranges of `XCL_TRACE_UPLOAD_RANGE`'s value `v`, with `base` the address of a window index
+/// (None: no such window); one that does not parse is left out.
+fn parse_trace_ranges(v: &str, base: impl Fn(usize) -> Option<usize>) -> Vec<TraceRange> {
+    let hex = |x: &str| usize::from_str_radix(x.trim().trim_start_matches("0x").trim_start_matches("0X"), 16).ok();
+    v.split(';')
+        .filter_map(|part| {
+            let (k, span) = part.split_once(':')?;
+            let (a, b) = span.split_once('-')?;
+            let (a, b) = (hex(a)?, hex(b)?);
+            let b0 = base(k.trim().parse().ok()?)?;
+            (a < b && b <= crate::gpu::uma::WINDOW).then(|| TraceRange {
+                text: part.trim().to_string(),
+                lo: b0 + a / TILE * TILE,
+                hi: b0 + b.next_multiple_of(TILE),
+                counts: Default::default(),
+            })
+        })
+        .collect()
+}
+
+/// `runs` (address, bytes) go up (`what` 0) or are cleared (1): counted for the ranges of
+/// `XCL_TRACE_UPLOAD_RANGE` they meet.
+fn trace_uploads(runs: &[(usize, usize)], what: usize) {
+    let Some(ranges) = trace_ranges() else { return };
+    for r in ranges {
+        r.count(runs, what);
+    }
+}
+
+impl TraceRange {
+    fn count(&self, runs: &[(usize, usize)], what: usize) {
+        let bytes: usize = runs.iter().map(|&(a, n)| (a + n).min(self.hi).saturating_sub(a.max(self.lo))).sum();
+        if bytes > 0 {
+            self.counts[what].fetch_add(bytes as u64, Ordering::Relaxed);
+            self.counts[2].fetch_add(1, Ordering::Relaxed);
+        }
+    }
+}
+
+static TRACE_SUBMITS: AtomicU64 = AtomicU64::new(0);
+static TRACE_AT: Mutex<Option<std::time::Instant>> = Mutex::new(None);
+
 /// microseconds in `before_execute`, the wait for the state's lock with it
 static SUBMIT_US: AtomicU64 = AtomicU64::new(0);
 
@@ -4920,6 +5020,7 @@ impl State {
     unsafe fn before_execute_on(&mut self, queue: &ID3D12CommandQueue, dirty: &[usize], page: usize) -> Vec<RbJob> {
         let t0 = std::time::Instant::now();
         let s = self;
+        s.trace_line(queue);
         // (`XCL_LOOK_STATS=2`: the time after each step, and the work counted so far)
         let split = super::look_stats::deep();
         let stamp = || split.then(std::time::Instant::now);
@@ -5325,6 +5426,22 @@ fn forget_in(s: &mut State, res: usize) {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// `XCL_TRACE_UPLOAD_RANGE`'s ranges: by window index and offset, widened to whole tiles, the
+    /// ones that do not parse or name no window left out; a range counts only the bytes of runs
+    /// inside it, and the runs' calls that met it.
+    #[test]
+    fn upload_ranges_parse_by_window_and_count_their_bytes() {
+        let w = crate::gpu::uma::WINDOW;
+        let r = parse_trace_ranges(" 4:0x12561000-0x1792e000; 9:0x10-0x20 ;bad;3:0x20-0x10;99:0x0-0x1000", |k| (k < 16).then(|| k * w));
+        assert_eq!(r.iter().map(|r| (r.text.as_str(), r.lo, r.hi)).collect::<Vec<_>>(), [("4:0x12561000-0x1792e000", 4 * w + 0x1256_0000, 4 * w + 0x1793_0000), ("9:0x10-0x20", 9 * w, 9 * w + TILE)]);
+        let a = r[0].lo;
+        r[0].count(&[(a - 0x100, 0x200), (a + 0x1000, 0x10)], 0);
+        r[0].count(&[(a - 0x100, 0x100)], 1);
+        r[0].count(&[(r[0].hi - 8, 64)], 1);
+        let got: [u64; 3] = std::array::from_fn(|k| r[0].counts[k].load(Ordering::Relaxed));
+        assert_eq!(got, [0x110, 8, 2]);
+    }
 
     thread_local! {
         /// The VirtualQuery calls `source_holes` made on this thread.
