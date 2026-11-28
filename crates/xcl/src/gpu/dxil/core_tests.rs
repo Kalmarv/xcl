@@ -1319,7 +1319,7 @@ fn compute_movrel_uses_program_max_vgpr_and_masks_m0() {
         // Keep v0 live across DCE by storing it to global memory.
         ("GLOBAL_STORE_DWORD", "ENC_FLAT_GLBL", &[("ADDR", 1), ("DATA", 0), ("SADDR", 127)], None),
     ]);
-    let cs = CsInterface { threads: [32, 1, 1], user_sgprs: 2, tgid: [false; 3], tg_size: false, tid_components: 1 };
+    let cs = CsInterface { threads: [32, 1, 1], user_sgprs: 2, tgid: [false; 3], tg_size: false, tid_components: 1, lds_dwords: 0 };
     let k = super::kernel::translate_compute(&code, ko, &cs).expect("compute movrel translates");
     super::validate::validate(&k.dxil).expect("validates");
     if let Ok(dis) = super::validate::disassemble(&k.dxil) {
