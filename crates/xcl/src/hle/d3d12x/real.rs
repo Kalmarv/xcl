@@ -1524,7 +1524,7 @@ static NON_UMA_BUFFER_VIEWS: AtomicU64 = AtomicU64::new(0);
 /// buffer placed in a GPU view asks for the tiles of the range viewed (`view_want`).
 fn buffer_view(res: usize, format: windows::Win32::Graphics::Dxgi::Common::DXGI_FORMAT, first: u64, n: u32, stride: u32, raw: bool) -> [u32; 4] {
     let Some((at, bytes)) = console_buffer(res) else {
-        note_buffer_view();
+        note_buffer_view(EmptyView::Buffer);
         return [0; 4];
     };
     let fmt = crate::gpu::desc::gfx10_format(format).unwrap_or(22);
@@ -2297,9 +2297,36 @@ unsafe fn texture_memory(res: *mut c_void) -> Option<usize> {
     Some(p)
 }
 
-fn note_buffer_view() {
+/// Why a view was written empty (`note_buffer_view`).
+#[derive(Clone, Copy)]
+enum EmptyView {
+    /// a buffer view of a buffer that is not in unified memory
+    Buffer,
+    /// a constant buffer view of memory outside unified memory
+    Constants,
+    /// a shader resource view with no console form
+    Read,
+    /// an unordered access view with no console form
+    Written,
+}
+
+fn note_buffer_view(why: EmptyView) {
     if NON_UMA_BUFFER_VIEWS.fetch_add(1, Ordering::Relaxed) == 0 {
         crate::xlog_warn!("buffer view in the console heap: the buffer is not in UMA – the shader gets an empty V# (num_records 0)");
+    }
+    // how many of each kind, as the count of a kind doubles: one line at the start says nothing
+    // of a title that makes thousands
+    static BY_KIND: [AtomicU64; 4] = [AtomicU64::new(0), AtomicU64::new(0), AtomicU64::new(0), AtomicU64::new(0)];
+    let n = BY_KIND[why as usize].fetch_add(1, Ordering::Relaxed) + 1;
+    if n.is_power_of_two() {
+        let k = |i: usize| BY_KIND[i].load(Ordering::Relaxed);
+        crate::xlog_info!(
+            "D3D12.X: empty views written so far: {} of buffers outside unified memory, {} of constants outside it, {} read views and {} unordered access views with no console form",
+            k(0),
+            k(1),
+            k(2),
+            k(3)
+        );
     }
 }
 
@@ -2315,7 +2342,7 @@ unsafe extern "system" fn dev_create_cbv_x(this: *mut c_void, desc: *const D3D12
     };
     let (va, size) = desc.as_ref().map_or((0, 0), |d| (d.BufferLocation, d.SizeInBytes));
     let words = cbv_at(crate::gpu::uma::get(), va, size).unwrap_or_else(|| {
-        note_buffer_view();
+        note_buffer_view(EmptyView::Constants);
         crate::gpu::desc::cbv_words(0, 0)
     });
     super::view_want::want(super::view_want::Path::Cbv, va, size as u64);
@@ -2815,7 +2842,7 @@ unsafe fn dev_create_srv_inner(this: *mut c_void, res: *mut c_void, desc: *const
     match srv_tsharp_from_desc(slot.index, &rdesc, desc.as_ref()) {
         Some(t) => super::console_heap::write(&slot, &t),
         None => {
-            note_buffer_view();
+            note_buffer_view(EmptyView::Read);
             super::console_heap::write(&slot, &[0; 8]);
         }
     }
@@ -3263,7 +3290,7 @@ unsafe extern "system" fn dev_create_uav_x(this: *mut c_void, res: *mut c_void, 
         format!("an unordered access view made in console slot {cpu:#x} (T# index {}, the UAV at + 1): format {}, mip {mip}, depth slices {first} (+{})", slot.index, format.0, array as i32)
     });
     let Some((fmt, ty, w, h, d, _)) = view_shape(r, format, dim, array, 1) else {
-        note_buffer_view();
+        note_buffer_view(EmptyView::Written);
         return super::console_heap::write(&slot, &[0; 8]);
     };
     // RDNA images have no SRV / UAV distinction: console shaders may read any image UAV slot
