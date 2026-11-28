@@ -3840,6 +3840,19 @@ pub(super) unsafe extern "system" fn flush_cache_range_x(this: *mut c_void, flag
     let _t = crate::hle::api_cost::time_if(super::look_stats::deep(), crate::hle::api_cost::Call::ListBarrier);
     if (flags != 0 || wait != 0) && bytes != 0 {
         flush_barrier(this);
+    } else if bytes == 0 && wait != 0 {
+        // (a diagnostic: an empty range that still waits for the work before it; with
+        // `XCL_FLUSH_EMPTY_RANGE=1` it orders that work as a range would)
+        static ON: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
+        let on = *ON.get_or_init(|| std::env::var("XCL_FLUSH_EMPTY_RANGE").is_ok_and(|v| v.trim() == "1"));
+        static N: AtomicU64 = AtomicU64::new(0);
+        let n = N.fetch_add(1, Ordering::Relaxed) + 1;
+        if n <= 8 || n.is_power_of_two() {
+            crate::xlog_info!("D3D12.X: cache flush of an empty range that waits (flags {flags:#x}, wait {wait:#x}): {n} so far, {}", if on { "a UAV barrier (XCL_FLUSH_EMPTY_RANGE=1)" } else { "nothing done" });
+        }
+        if on {
+            flush_barrier(this);
+        }
     }
 }
 
