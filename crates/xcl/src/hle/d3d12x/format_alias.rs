@@ -1637,4 +1637,174 @@ mod tests {
         assert_eq!(Arc::strong_count(&h2), 1);
         drop(h2);
     }
+
+    /// (not in amd-dev's) On a device: the title moves the reader to where it is read, and the
+    /// writer's texels are in the reader bit for bit, through a buffer, on the title's list.
+    #[test]
+    fn gpu_reader_barrier_copies_the_writers_texels_into_the_reader() {
+        use windows::Win32::Graphics::Dxgi::Common::*;
+        unsafe {
+            let dev: ID3D12Device = {
+                use windows::Win32::Graphics::Dxgi::*;
+                if std::env::var_os("XCL_D3D12_DEBUG").is_some() {
+                    let _ = crate::gpu::agility::enable_debug_layer();
+                }
+                let sel = crate::gpu::adapter::Selector::from_env_or("auto");
+                let adapter: Option<windows::core::IUnknown> = if sel == crate::gpu::adapter::Selector::Warp {
+                    let Ok(factory) = CreateDXGIFactory2::<IDXGIFactory6>(DXGI_CREATE_FACTORY_FLAGS(0)) else {
+                        return crate::gpu::recomp::runner::skip_test("no DXGI factory");
+                    };
+                    let Ok(warp) = factory.EnumWarpAdapter::<IDXGIAdapter1>() else {
+                        return crate::gpu::recomp::runner::skip_test("no WARP adapter");
+                    };
+                    Some(warp.cast().unwrap())
+                } else {
+                    None
+                };
+                let Ok(d) = crate::gpu::agility::create_device(adapter.as_ref(), windows::Win32::Graphics::Direct3D::D3D_FEATURE_LEVEL_11_0) else {
+                    return crate::gpu::recomp::runner::skip_test("no GPU");
+                };
+                d
+            };
+            let q: ID3D12CommandQueue = dev.CreateCommandQueue(&D3D12_COMMAND_QUEUE_DESC { Type: D3D12_COMMAND_LIST_TYPE_DIRECT, ..Default::default() }).unwrap();
+            let alloc: ID3D12CommandAllocator = dev.CreateCommandAllocator(D3D12_COMMAND_LIST_TYPE_DIRECT).unwrap();
+            let list: ID3D12GraphicsCommandList = dev.CreateCommandList(0, D3D12_COMMAND_LIST_TYPE_DIRECT, &alloc, None).unwrap();
+            let fence: ID3D12Fence = dev.CreateFence(0, D3D12_FENCE_FLAG_NONE).unwrap();
+
+            const N: u32 = 16;
+            let tex_desc = |format: DXGI_FORMAT, flags: D3D12_RESOURCE_FLAGS| D3D12_RESOURCE_DESC {
+                Dimension: D3D12_RESOURCE_DIMENSION_TEXTURE2D,
+                Width: N as u64,
+                Height: N,
+                DepthOrArraySize: 1,
+                MipLevels: 1,
+                Format: format,
+                SampleDesc: DXGI_SAMPLE_DESC { Count: 1, Quality: 0 },
+                Flags: flags,
+                ..Default::default()
+            };
+            let make = |heap: D3D12_HEAP_TYPE, desc: &D3D12_RESOURCE_DESC, state: D3D12_RESOURCE_STATES| -> ID3D12Resource {
+                let mut r: Option<ID3D12Resource> = None;
+                dev.CreateCommittedResource(&D3D12_HEAP_PROPERTIES { Type: heap, ..Default::default() }, D3D12_HEAP_FLAG_NONE, desc, state, None, &mut r).unwrap();
+                r.unwrap()
+            };
+            let writer_desc = tex_desc(DXGI_FORMAT_R32_UINT, D3D12_RESOURCE_FLAG_ALLOW_UNORDERED_ACCESS);
+            let reader_desc = tex_desc(DXGI_FORMAT_R9G9B9E5_SHAREDEXP, D3D12_RESOURCE_FLAG_NONE);
+            let read_state = D3D12_RESOURCE_STATE_NON_PIXEL_SHADER_RESOURCE | D3D12_RESOURCE_STATE_PIXEL_SHADER_RESOURCE;
+            let writer = make(D3D12_HEAP_TYPE_DEFAULT, &writer_desc, D3D12_RESOURCE_STATE_COPY_DEST);
+            let reader = make(D3D12_HEAP_TYPE_DEFAULT, &reader_desc, read_state);
+
+            let mut fp = D3D12_PLACED_SUBRESOURCE_FOOTPRINT::default();
+            dev.GetCopyableFootprints(&writer_desc, 0, 1, 0, Some(&mut fp), None, None, None);
+            let pitch = fp.Footprint.RowPitch as usize;
+            let buf_desc = D3D12_RESOURCE_DESC {
+                Dimension: D3D12_RESOURCE_DIMENSION_BUFFER,
+                Width: (pitch * N as usize) as u64,
+                Height: 1,
+                DepthOrArraySize: 1,
+                MipLevels: 1,
+                Format: DXGI_FORMAT_UNKNOWN,
+                SampleDesc: DXGI_SAMPLE_DESC { Count: 1, Quality: 0 },
+                Layout: D3D12_TEXTURE_LAYOUT_ROW_MAJOR,
+                ..Default::default()
+            };
+            let upload = make(D3D12_HEAP_TYPE_UPLOAD, &buf_desc, D3D12_RESOURCE_STATE_GENERIC_READ);
+            let readback = make(D3D12_HEAP_TYPE_READBACK, &buf_desc, D3D12_RESOURCE_STATE_COPY_DEST);
+            // every bit of a texel is used, so a copy that goes through the formats' values shows
+            let texel = |x: u32, y: u32| (y * N + x + 1).wrapping_mul(0x9E37_79B9);
+            let mut mapped = std::ptr::null_mut();
+            upload.Map(0, None, Some(&mut mapped)).unwrap();
+            for y in 0..N {
+                for x in 0..N {
+                    ((mapped as *mut u8).add(y as usize * pitch + x as usize * 4) as *mut u32).write_unaligned(texel(x, y));
+                }
+            }
+            upload.Unmap(0, None);
+
+            real::adopt(dev.as_raw(), real::Kind::Device);
+            real::adopt(list.as_raw(), real::Kind::CommandList);
+            list_x::on_create(list.as_raw(), alloc.as_raw() as usize, 0, D3D12_COMMAND_LIST_TYPE_DIRECT);
+
+            let sub = |r: &ID3D12Resource| OwnedCopyLoc(D3D12_TEXTURE_COPY_LOCATION { pResource: ManuallyDrop::new(Some(r.clone())), Type: D3D12_TEXTURE_COPY_TYPE_SUBRESOURCE_INDEX, Anonymous: D3D12_TEXTURE_COPY_LOCATION_0 { SubresourceIndex: 0 } });
+            let placed = |r: &ID3D12Resource, format: DXGI_FORMAT| {
+                let mut f = fp;
+                f.Footprint.Format = format;
+                OwnedCopyLoc(D3D12_TEXTURE_COPY_LOCATION { pResource: ManuallyDrop::new(Some(r.clone())), Type: D3D12_TEXTURE_COPY_TYPE_PLACED_FOOTPRINT, Anonymous: D3D12_TEXTURE_COPY_LOCATION_0 { PlacedFootprint: f } })
+            };
+            let (w, r) = (writer.as_raw() as usize, reader.as_raw() as usize);
+
+            // the GPU's write into the writer, which is then left where it is written
+            list_x::pc_copy_texture_region(list.as_raw(), &sub(&writer).0, 0, 0, 0, &placed(&upload, DXGI_FORMAT_R32_UINT).0, std::ptr::null());
+            list_x::transition(list.as_raw(), w, D3D12_RESOURCE_STATE_COPY_DEST, D3D12_RESOURCE_STATE_UNORDERED_ACCESS);
+
+            // the pair: two textures the title placed at one address (not a 64 KiB boundary)
+            let va = 0x7B00_0000_4000usize;
+            {
+                let mut g = TABLE.lock().unwrap();
+                let t = g.get_or_insert_with(AliasTable::new);
+                t.insert(w, TrackedTex::new(dev.as_raw() as usize, va, TexShape::from_pc_desc(&writer_desc), Owner::TitlePlaced, STATE_UAV, true));
+                t.insert(r, TrackedTex::new(dev.as_raw() as usize, va, TexShape::from_pc_desc(&reader_desc), Owner::TitlePlaced, read_state.0 as u32, false));
+            }
+
+            // the title moves only the reader: to where it is sampled
+            let tb = D3D12_TEXTURE_BARRIER {
+                SyncBefore: D3D12_BARRIER_SYNC_ALL,
+                SyncAfter: D3D12_BARRIER_SYNC_ALL,
+                AccessBefore: D3D12_BARRIER_ACCESS_COMMON,
+                AccessAfter: D3D12_BARRIER_ACCESS_SHADER_RESOURCE,
+                LayoutBefore: D3D12_BARRIER_LAYOUT_COMMON,
+                LayoutAfter: D3D12_BARRIER_LAYOUT_SHADER_RESOURCE,
+                pResource: std::mem::transmute_copy(&r),
+                Subresources: D3D12_BARRIER_SUBRESOURCE_RANGE::default(),
+                Flags: D3D12_TEXTURE_BARRIER_FLAG_NONE,
+            };
+            let group = D3D12_BARRIER_GROUP { Type: D3D12_BARRIER_TYPE_TEXTURE, NumBarriers: 1, Anonymous: D3D12_BARRIER_GROUP_0 { pTextureBarriers: &tb as *const _ } };
+            let mut writers = Vec::new();
+            filter_enhanced_barriers(1, &group as *const _ as *const c_void, &mut writers);
+            assert_eq!(writers, vec![(w, STATE_UAV)], "a reader moved to where it is read asks for its writer's texels");
+            sync_title_writers(list.as_raw(), &writers);
+            assert_eq!(TABLE.lock().unwrap().as_ref().unwrap().by_res.get(&w).map(|t| t.dirty), Some(false), "the copy was recorded");
+
+            // what the reader holds now
+            list_x::transition(list.as_raw(), r, read_state, D3D12_RESOURCE_STATE_COPY_SOURCE);
+            list_x::pc_copy_texture_region(list.as_raw(), &placed(&readback, DXGI_FORMAT_R9G9B9E5_SHAREDEXP).0, 0, 0, 0, &sub(&reader).0, std::ptr::null());
+            list_x::transition(list.as_raw(), r, D3D12_RESOURCE_STATE_COPY_SOURCE, read_state);
+
+            let close_orig: unsafe extern "system" fn(*mut c_void) -> i32 = std::mem::transmute(real::orig_fn(list.as_raw(), 9));
+            let hr_close = close_orig(list.as_raw());
+            if hr_close != 0 {
+                if let Ok(iq) = dev.cast::<ID3D12InfoQueue>() {
+                    for i in 0..iq.GetNumStoredMessages() {
+                        let mut sz = 0usize;
+                        let _ = iq.GetMessage(i, None, &mut sz);
+                        let mut buf = vec![0u8; sz.max(std::mem::size_of::<D3D12_MESSAGE>())];
+                        if iq.GetMessage(i, Some(buf.as_mut_ptr() as *mut D3D12_MESSAGE), &mut sz).is_ok() {
+                            let msg = &*(buf.as_ptr() as *const D3D12_MESSAGE);
+                            eprintln!("D3D12 INFO[{i}]: id={} {}", msg.ID.0, std::ffi::CStr::from_ptr(msg.pDescription as *const i8).to_string_lossy());
+                        }
+                    }
+                }
+            }
+            assert_eq!(hr_close, 0);
+            q.ExecuteCommandLists(&[Some(list.cast().unwrap())]);
+            q.Signal(&fence, 1).unwrap();
+            while fence.GetCompletedValue() < 1 {
+                std::thread::yield_now();
+            }
+            assert!(dev.GetDeviceRemovedReason().is_ok());
+
+            let mut mapped = std::ptr::null_mut();
+            readback.Map(0, None, Some(&mut mapped)).unwrap();
+            for y in 0..N {
+                for x in 0..N {
+                    let got = ((mapped as *const u8).add(y as usize * pitch + x as usize * 4) as *const u32).read_unaligned();
+                    assert_eq!(got, texel(x, y), "reader texel ({x},{y})");
+                }
+            }
+            readback.Unmap(0, None);
+
+            forget(r);
+            forget(w);
+        }
+    }
 }
