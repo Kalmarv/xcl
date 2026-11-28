@@ -590,6 +590,130 @@ impl Lw {
         self.image_result(vdata, &vals, d16, act)
     }
 
+    /// The texels an integer-format T# gives a sample or gather (2D / 2DArray), into `tmps` as raw
+    /// bits: the console's sampler returns an integer format's values, while a PC sample or gather
+    /// of an integer view is not defined (its float form reads garbage). Point sampling at the
+    /// explicit LOD (rounded as RDNA2 does; level 0 without one), the 2x2 of a gather at level 0,
+    /// through views typed as the format (`cls` 1 uint, 2 sint), with the S# address modes; a
+    /// border texel is 0.
+    #[allow(clippy::too_many_arguments)]
+    fn int_view_texels(
+        &mut self,
+        idx: Value,
+        kind: TexKind,
+        cls: Value,
+        dim: u64,
+        ssamp: u64,
+        coords: &[Value],
+        lod: Option<Value>,
+        ovgpr: Option<Value>,
+        gather: Option<usize>,
+        tmps: &[u32; 4],
+    ) -> LResult<()> {
+        let s0 = self.sreg(ssamp);
+        for (cv, ct) in [(1u32, CompType::U32), (2, CompType::I32)] {
+            let is = self.cmpc(Pred::Eq, cls, cv);
+            self.guarded(is, &mut |lw| {
+                let tex = lw.s.heap_texture(idx, kind, false, ct, 4, true);
+                let z0 = lw.c(0);
+                let one = lw.c(1);
+                let dims0 = lw.s.get_dimensions(tex.handle, Some(z0));
+                let num_mips = lw.s.m.extract(dims0, 3);
+                let num_mips = lw.umax(num_mips, one);
+                let max_mip = lw.sub(num_mips, one);
+                let mip = match (lod, gather) {
+                    (Some(l), None) => {
+                        let half_up = lw.fc(0.501953125);
+                        let lb = lw.fadd(l, half_up);
+                        let lf = lw.un(op::ROUND_NI, lb);
+                        let zf = lw.fc(0.0);
+                        let lf = lw.fmax(lf, zf);
+                        let m = lw.ftoui(lf);
+                        lw.umin(m, max_mip)
+                    }
+                    _ => z0,
+                };
+                let dims = lw.s.get_dimensions(tex.handle, Some(mip));
+                let w = lw.s.m.extract(dims, 0);
+                let h = lw.s.m.extract(dims, 1);
+                let w = lw.umax(w, one);
+                let h = lw.umax(h, one);
+                let (wf, hf) = (lw.uitof(w), lw.uitof(h));
+                let force_unorm = lw.lshrc(s0, 15);
+                let force_unorm = lw.andc(force_unorm, 1);
+                let is_unorm = lw.nz(force_unorm);
+                let sx = lw.fmul(coords[0], wf);
+                let sy = lw.fmul(coords[1], hf);
+                let px = lw.sel(is_unorm, coords[0], sx);
+                let py = lw.sel(is_unorm, coords[1], sy);
+                // a gather's 2x2 starts half a texel back; a point sample takes the texel it is in
+                let (px, py) = if gather.is_some() {
+                    let half = lw.fc(0.5);
+                    (lw.fsub(px, half), lw.fsub(py, half))
+                } else {
+                    (px, py)
+                };
+                let fx = lw.un(op::ROUND_NI, px);
+                let fy = lw.un(op::ROUND_NI, py);
+                let mut ix = lw.ftosi(fx);
+                let mut iy = lw.ftosi(fy);
+                if let Some(o) = ovgpr {
+                    let ox = lw.shlc(o, 26);
+                    let ox = lw.ashrc(ox, 26);
+                    let oy = lw.shlc(o, 18);
+                    let oy = lw.ashrc(oy, 26);
+                    ix = lw.add(ix, ox);
+                    iy = lw.add(iy, oy);
+                }
+                let mode_x = lw.andc(s0, 7);
+                let mode_y = lw.lshrc(s0, 3);
+                let mode_y = lw.andc(mode_y, 7);
+                let slice = if dim == 5 {
+                    let arr = lw.s.m.extract(dims, 2);
+                    let arr = lw.umax(arr, one);
+                    let max_s = lw.sub(arr, one);
+                    let sr = lw.un(op::ROUND_NE, coords[2]);
+                    let si = lw.ftosi(sr);
+                    let si = lw.smin_i32(si, max_s);
+                    Some(lw.smax_i32(z0, si))
+                } else {
+                    None
+                };
+                let tap = |lw: &mut Lw, x: Value, y: Value| -> [Value; 4] {
+                    let (cx, bx) = lw.apply_rdna2_addr_mode(x, w, mode_x);
+                    let (cy, by) = lw.apply_rdna2_addr_mode(y, h, mode_y);
+                    let at = match slice {
+                        Some(sl) => vec![cx, cy, sl],
+                        None => vec![cx, cy],
+                    };
+                    let v = lw.s.texture_load(tex, Some(mip), &at, &[]);
+                    let b = lw.lor(bx, by);
+                    let z = lw.c(0);
+                    v.map(|t| lw.sel(b, z, t))
+                };
+                match gather {
+                    Some(ch) => {
+                        let ix1 = lw.add(ix, one);
+                        let iy1 = lw.add(iy, one);
+                        // gather order: (-,+), (+,+), (+,-), (-,-)
+                        for (k, (x, y)) in [(ix, iy1), (ix1, iy1), (ix1, iy), (ix, iy)].into_iter().enumerate() {
+                            let v = tap(lw, x, y);
+                            lw.wr(tmps[k], v[ch]);
+                        }
+                    }
+                    None => {
+                        let v = tap(lw, ix, iy);
+                        for k in 0..4 {
+                            lw.wr(tmps[k], v[k]);
+                        }
+                    }
+                }
+                Ok(())
+            })?;
+        }
+        Ok(())
+    }
+
     /// Lowers non-cube `UNORM=1` sampling / `gather4` (non-`_l`) by converting unnormalized
     /// texel coordinates (plus optional signed 6-bit texel offsets) to normalized `[0, 1]`
     /// via `GetDimensions` before invoking the standard DXIL sample/gather op.
@@ -757,6 +881,30 @@ mod gather4_lod_tests {
 
     fn opts() -> KernelOptions {
         KernelOptions { wave64: true, split: false, mem_windows: 1, sampler_base: 0 }
+    }
+
+    /// Gathers and explicit-LOD samples of 2D / 2DArray T#s carry an integer-view path (an integer
+    /// format's texels through `textureLoad.i32`, as the console's sampler returns them) beside the
+    /// float one, and validate.
+    #[test]
+    fn integer_format_gather_and_sample_read_integer_views() {
+        let cases: &[(&str, &[(&str, u64)])] = &[
+            ("IMAGE_GATHER4", &[("VDATA", 10), ("VADDR", 0), ("SRSRC", 4), ("SSAMP", 6), ("DMASK", 0x1), ("DIM", 1)]),
+            ("IMAGE_GATHER4_LZ", &[("VDATA", 10), ("VADDR", 0), ("SRSRC", 4), ("SSAMP", 6), ("DMASK", 0x2), ("DIM", 5)]),
+            ("IMAGE_GATHER4_O", &[("VDATA", 10), ("VADDR", 0), ("SRSRC", 4), ("SSAMP", 6), ("DMASK", 0x1), ("DIM", 1)]),
+            ("IMAGE_SAMPLE_L", &[("VDATA", 10), ("VADDR", 0), ("SRSRC", 4), ("SSAMP", 6), ("DMASK", 0xF), ("DIM", 1)]),
+            ("IMAGE_SAMPLE_LZ", &[("VDATA", 10), ("VADDR", 0), ("SRSRC", 4), ("SSAMP", 6), ("DMASK", 0x3), ("DIM", 5)]),
+        ];
+        for (name, fields) in cases {
+            let mut code = mimg(name, fields);
+            code.extend(endpgm());
+            let k = translate_full(&code, opts()).unwrap_or_else(|e| panic!("{name} ({fields:?}): {e}"));
+            if let Err(err) = validate(&k.dxil) {
+                panic!("{name} ({fields:?}) DXIL validation failed: {err}");
+            }
+            let dis = super::super::validate::disassemble(&k.dxil).expect("dxil disassemble");
+            assert!(dis.contains("textureLoad.i32"), "{name} ({fields:?}): no integer-view texel load:\n{dis}");
+        }
     }
 
     /// `image_gather4_l` and `image_gather4_l_o` (plus `_c_l`, `_c_l_o`, `UNORM=1`, `A16`, `D16`,
@@ -1304,7 +1452,27 @@ impl Lw {
                 for &t in &tmps {
                     self.wr(t, z);
                 }
-                self.guarded(run, &mut |lw| {
+                // an integer-format T# (2D / 2DArray, explicit LOD or gather, no compare): its
+                // texels through integer views (`int_view_texels`); other formats sample as before
+                let int_ok = matches!(dim, 1 | 5) && cmp.is_none() && grads.is_none() && bias.is_none() && (gather || lod.is_some() || has_lz);
+                let float_run = if int_ok {
+                    if gather && comps.len() != 1 {
+                        return err(d, "gather4 dmask");
+                    }
+                    let fmt = self.lshrc(tw1, 20);
+                    let fmt = self.andc(fmt, 0x1FF);
+                    let cls = self.img_cls(fmt);
+                    let is_int = self.cmpc(Pred::Ne, cls, 0);
+                    let int_run = self.land(run, is_int);
+                    let ch = gather.then(|| comps[0] as usize);
+                    let lod_i = if has_lz { None } else { lod };
+                    self.guarded(int_run, &mut |lw| lw.int_view_texels(tw0, kind, cls, dim, ssamp, &coords, lod_i, ovgpr, ch, &tmps))?;
+                    let not_int = self.lnot(is_int);
+                    self.land(run, not_int)
+                } else {
+                    run
+                };
+                self.guarded(float_run, &mut |lw| {
                     let res = sample_body(lw, tw0)?;
                     for k in 0..4 {
                         let b = lw.bits(res[k]);
