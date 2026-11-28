@@ -2897,8 +2897,8 @@ impl CopyScratchCache {
     /// A scratch for a copy that must not be left out: `want` bytes when the list has recorded
     /// with none yet, at least `min` otherwise. Where `acquire` gives up, this one goes on: a
     /// scratch still executing from the list's last submission is set aside for the GPU to finish
-    /// and replaced, and a new one may reach into `SYNC_SCRATCH_RESERVE` (past it, one of `min` bytes
-    /// where that is one band or less). A list keeps its scratch while it lives and a title
+    /// and replaced, and a new one may reach into `SYNC_SCRATCH_RESERVE` (past it, one band where
+    /// `min` is one band or less). A list keeps its scratch while it lives and a title
     /// records with more lists than the reserve has scratches for, so
     /// one made here for a list that has since been reset, and whose work the GPU has done, is
     /// taken over before a new one is made.
@@ -2932,12 +2932,18 @@ impl CopyScratchCache {
             self.active.insert(key, scratch);
             return Some(given);
         }
-        let bytes = if want <= room { want } else { min };
-        // (a sync that fits one band goes past the reserve: closed lists not yet reset hold their
-        // scratch, and with the reserve theirs a retail title left 8,193 readers stale by 323 s)
-        if bytes > room && min > SYNC_SCRATCH_BAND {
+        // (a sync that fits one band goes past the reserve with a whole band, which the list's later
+        // syncs of other row pitches fit too: closed lists not yet reset hold their scratch, and with
+        // the reserve theirs a retail title left 8,193 readers stale by 323 s)
+        let bytes = if want <= room {
+            want
+        } else if min <= room {
+            min
+        } else if min <= SYNC_SCRATCH_BAND {
+            want.min(SYNC_SCRATCH_BAND).max(min)
+        } else {
             return None;
-        }
+        };
         self.insert(list, bytes, device)
     }
 
@@ -5971,7 +5977,8 @@ mod tests {
             // (past the reserve, a sync of one band still gets one of its own)
             let own = cache.acquire_for_sync(third_raw, band, small).unwrap();
             assert_ne!(own, held, "one a recording uses stays with its list");
-            assert_eq!((own.1, cache.bytes), (small, MAX_COPY_SCRATCH + SYNC_SCRATCH_RESERVE + small));
+            assert_eq!((own.1, cache.bytes), (band, MAX_COPY_SCRATCH + SYNC_SCRATCH_RESERVE + band));
+            assert_eq!(cache.acquire_for_sync(third_raw, band, 2 * small), Some(own), "a later sync of a wider row fits it");
             cache.release(third_raw as usize);
             let scratch = cache.active.get_mut(&(second_raw as usize)).unwrap();
             scratch.recorded = false;
