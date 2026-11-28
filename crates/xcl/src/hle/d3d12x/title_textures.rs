@@ -114,6 +114,14 @@ struct Table {
     shadowed: BTreeMap<usize, Entry>,
     /// Shadowed `(va, PC texture)` → end address (may overlap)
     shadowed_by_va: BTreeMap<(usize, usize), usize>,
+    /// Active `(va, PC texture)` → end address of the ones a newer placement lies over at another
+    /// address and that stay live (`keeps_under_newer`): in `by_res`, not in `by_va` (may overlap)
+    kept_by_va: BTreeMap<(usize, usize), usize>,
+    /// the ones `insert` moved to `kept_by_va` since they were last taken: they still share
+    /// the newer one's tiles (`vram::rebind_private`)
+    newly_kept: Vec<usize>,
+    /// `XCL_KEEP_SUPERSEDED=1` for this table (a test sets it)
+    keep_arrays: bool,
     /// Largest byte span currently in `shadowed` (bounds range queries)
     max_shadowed_size: usize,
     next_seq: u64,
@@ -150,6 +158,9 @@ impl Table {
             by_va: BTreeMap::new(),
             shadowed: BTreeMap::new(),
             shadowed_by_va: BTreeMap::new(),
+            kept_by_va: BTreeMap::new(),
+            newly_kept: Vec::new(),
+            keep_arrays: false,
             max_shadowed_size: 0,
             next_seq: 0,
             src_pieces: BTreeMap::new(),
@@ -224,7 +235,24 @@ impl Table {
                 return true;
             }
         }
-        end > va && self.by_va.range((va, 0)..(end, 0)).next().is_some()
+        if end > va && self.by_va.range((va, 0)..(end, 0)).next().is_some() {
+            return true;
+        }
+        self.kept_by_va.iter().any(|(&(kva, _), &kend)| if kva < va { kend > va } else { kva < end })
+    }
+
+    /// Whether the active texture `e` stays live when a newer placement lies over it at another
+    /// address (`XCL_KEEP_SUPERSEDED=1`): a placed array, cube or 3D texture the CPU fills. Such
+    /// a texture gets all its pages at once, so a title that places a larger texture's
+    /// description over its memory has not given that memory up; unmapped, the views the title
+    /// made of it read zero until the newer one is released.
+    fn keeps_under_newer(&self, e: &Entry) -> bool {
+        (self.keep_arrays || keep_superseded())
+            && e.placed
+            && !e.unmapped
+            && !e.gpu_written
+            && !e.target
+            && e.tex.texels().is_some_and(|s| s.array > 1 || s.depth > 0)
     }
 
     fn active_overlaps(&self, va: usize, end: usize) -> Vec<(usize, usize, usize)> {
@@ -238,6 +266,11 @@ impl Table {
         if end > va {
             for (&(ova, ores), &oend) in self.by_va.range((va, 0)..(end, 0)) {
                 out.push((ova, ores, oend));
+            }
+        }
+        for (&(kva, kres), &kend) in &self.kept_by_va {
+            if if kva < va { kend > va } else { kva < end } {
+                out.push((kva, kres, kend));
             }
         }
         out
@@ -262,6 +295,7 @@ impl Table {
         let (mut pending_delta, mut retired, mut to_unmap) = (0isize, 0usize, Vec::new());
         for (ova, ores, _) in self.active_overlaps(va, end) {
             self.by_va.remove(&(ova, ores));
+            self.kept_by_va.remove(&(ova, ores));
             if let Some(old) = self.by_res.remove(&ores) {
                 self.unlink_src(ores, old.src, old.tex.size() as usize);
                 if old.pending {
@@ -303,6 +337,7 @@ impl Table {
         if let Some(old) = self.by_res.remove(&res) {
             self.unlink_src(res, old.src, old.tex.size() as usize);
             self.by_va.remove(&(old.va, res));
+            self.kept_by_va.remove(&(old.va, res));
             if old.pending {
                 pending_delta -= 1;
             }
@@ -314,7 +349,20 @@ impl Table {
             if !entry.placed && ova == va && oend == end && self.by_res.get(&ores).is_some_and(|e| !e.placed) {
                 continue;
             }
+            // (an array texture under a newer placement at another address stays live, off `by_va`)
+            if entry.placed && ova != va && self.by_res.get(&ores).is_some_and(|e| self.keeps_under_newer(e)) {
+                if self.by_va.remove(&(ova, ores)).is_some() {
+                    // (until it has pages of its own its unfinished uploads go to shared tiles)
+                    if let Some(old) = self.by_res.get(&ores) {
+                        texture_upload::inherit(&entry.known, &old.known);
+                    }
+                    self.kept_by_va.insert((ova, ores), oend);
+                    self.newly_kept.push(ores);
+                }
+                continue;
+            }
             self.by_va.remove(&(ova, ores));
+            self.kept_by_va.remove(&(ova, ores));
             if let Some(mut old) = self.by_res.remove(&ores) {
                 self.unlink_src(ores, old.src, old.tex.size() as usize);
                 if old.pending {
@@ -372,6 +420,7 @@ impl Table {
         let Some(old) = self.by_res.remove(&res) else { return (false, 0, Vec::new()) };
         self.unlink_src(res, old.src, old.tex.size() as usize);
         self.by_va.remove(&(old.va, res));
+        self.kept_by_va.remove(&(old.va, res));
         let mut pending_delta = if old.pending { -1 } else { 0 };
         let va = old.va;
         let end = va.saturating_add(old.tex.size() as usize);
@@ -534,21 +583,59 @@ pub(super) unsafe fn register(device: *mut c_void, res: *mut c_void, va: usize, 
         target: u32::from_le_bytes(desc[0x30..0x34].try_into().unwrap()) & 0x7 != 0,
     };
     let (hot_src, hot_bytes) = (e.src, e.tex.size() as usize);
-    let to_unmap = {
+    let (to_unmap, to_keep) = {
         let mut t = TEXTURES.lock().unwrap();
         let (delta, unmap_ptrs) = t.insert(res as usize, e);
         adjust_pending(delta);
         TEXTURES_LEN.store(t.by_res.len(), Ordering::Relaxed);
-        clone_resources(&unmap_ptrs)
+        let kept = std::mem::take(&mut t.newly_kept);
+        (clone_resources(&unmap_ptrs), clone_resources(&kept))
     };
     for r in &to_unmap {
         super::vram::unmap_superseded(r);
     }
     shadow_unmapped(&to_unmap);
+    for r in &to_keep {
+        keep_on_own_pages(r);
+    }
     TEXTURES_GEN.fetch_add(1, Ordering::Release);
     // the data the title is about to write there is for the next submit
     mark_hot(hot_src, hot_bytes);
     Ok(())
+}
+
+/// `XCL_KEEP_SUPERSEDED=1`: a sampled array, cube or 3D texture stays live when a newer placement
+/// lies over its memory at another address (`Table::keeps_under_newer`).
+fn keep_superseded() -> bool {
+    static ON: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
+    *ON.get_or_init(|| std::env::var("XCL_KEEP_SUPERSEDED").is_ok_and(|v| v.trim() == "1"))
+}
+
+/// `res` stays live under a newer placement (`Table::keeps_under_newer`): its tiles keyed by the
+/// title's pages are the newer one's too, so it moves to pages of its own and is uploaded again
+/// from its memory (after the move: an upload before it went to the shared tiles).
+unsafe fn keep_on_own_pages(res: &ID3D12Resource) {
+    static N: AtomicU64 = AtomicU64::new(0);
+    let key = res.as_raw() as usize;
+    let moved = super::vram::rebind_private(res);
+    if moved {
+        let mut t = TEXTURES.lock().unwrap();
+        if let Some(e) = t.by_res.get_mut(&key) {
+            texture_upload::forget(&e.known);
+            if !std::mem::replace(&mut e.pending, true) {
+                adjust_pending(1);
+            }
+            t.pending_res.insert(key);
+        }
+    }
+    let n = N.fetch_add(1, Ordering::Relaxed) + 1;
+    if n <= 64 || n.is_power_of_two() {
+        let at = TEXTURES.lock().unwrap().by_res.get(&key).map(|e| (e.va, shadow_shape(&e.tex)));
+        crate::xlog_info!(
+            "D3D12.X: an array texture under a newer placement stays live{}: {at:x?} ({n} so far)",
+            if moved { " on pages of its own" } else { " on the pages it has (no move)" }
+        );
+    }
 }
 
 /// Where a texture at `va` is read from: the CPU view behind a GPU view (`kernelx::mirrors`)
@@ -4232,6 +4319,74 @@ pub(super) mod tests {
         assert!(tbl.by_res.contains_key(&10) && tbl.by_res.contains_key(&11));
         assert_eq!(tbl.insert(12, entry(0x20_0000, &tex_64k, true, false)), (-1, vec![]));
         assert!(!tbl.by_res.contains_key(&10) && !tbl.by_res.contains_key(&11) && tbl.by_res.contains_key(&12));
+    }
+
+    /// `XCL_KEEP_SUPERSEDED=1`: a placed cube a newer texture is placed over at another address
+    /// stays active (its uploads go on) and is named once for pages of its own; a texture placed
+    /// at the cube's own address, or a GPU-owned placement over it, retires it as before.
+    #[test]
+    fn a_cube_under_a_newer_placement_at_another_address_stays_active() {
+        let cube = Arc::new(xg::Texture::new(&console_desc(3, 64, 64, 6, 1, 28, 0x105)).unwrap());
+        let tex_16k = Arc::new(xg::Texture::new(&console_desc(3, 64, 64, 1, 1, 28, 0x105)).unwrap());
+        let tex_1m = Arc::new(xg::Texture::new(&console_desc(3, 512, 512, 1, 1, 28, 0x105)).unwrap());
+        assert!(cube.texels().is_some_and(|s| s.array == 6));
+        let cube_end = 0x10_8000 + cube.size() as usize;
+        assert!(cube_end <= 0x20_0000 && tex_1m.size() == 0x10_0000);
+        let entry = |va: usize, tex: &Arc<xg::Texture>| Entry {
+            device: 0,
+            va,
+            src: va,
+            in_gpu_view: false,
+            paged: false,
+            tex: Arc::clone(tex),
+            states: vec![D3D12_RESOURCE_STATE_COMMON],
+            pending: false,
+            gpu_written: false,
+            written_call: 0,
+            placed: true,
+            unmapped: false,
+            seq: 0,
+            known: Default::default(),
+            target: false,
+        };
+        // without the switch the cube is shadowed and loses its tiles
+        let mut tbl = Table::new();
+        tbl.insert(1, entry(0x10_8000, &cube));
+        assert_eq!(tbl.insert(2, entry(0x10_0000, &tex_1m)), (0, vec![1]));
+        assert!(tbl.shadowed.contains_key(&1) && tbl.newly_kept.is_empty());
+        // with it the cube stays active, off `by_va`, and still gets its dirty pages
+        let mut tbl = Table::new();
+        tbl.keep_arrays = true;
+        tbl.insert(1, entry(0x10_8000, &cube));
+        assert_eq!(tbl.insert(2, entry(0x10_0000, &tex_1m)), (0, vec![]));
+        assert!(tbl.by_res.contains_key(&1) && tbl.by_res.contains_key(&2) && tbl.shadowed.is_empty());
+        assert_eq!(std::mem::take(&mut tbl.newly_kept), vec![1]);
+        assert_eq!(tbl.kept_by_va.get(&(0x10_8000, 1)), Some(&cube_end));
+        assert!(!tbl.by_va.contains_key(&(0x10_8000, 1)));
+        assert!(tbl.touched_by(&[0x10_8000]).contains(&1));
+        assert!(tbl.has_active_overlap(0x10_9000, 0x10_a000));
+        // a 2D texture under a newer one is retired as before; the cube is not named again
+        assert_eq!(tbl.insert(3, entry(0x10_4000, &tex_1m)), (0, vec![2]));
+        assert!(tbl.by_res.contains_key(&1) && tbl.shadowed.contains_key(&2) && tbl.newly_kept.is_empty());
+        assert_eq!(tbl.overlapping(0x10_8000, 0x1000), vec![(3, 0x10_4000), (1, 0x10_8000)]);
+        // a texture placed at the cube's own address retires the cube
+        let (_, mut unmap) = tbl.insert(4, entry(0x10_8000, &tex_16k));
+        unmap.sort_unstable();
+        assert_eq!(unmap, vec![1, 3]);
+        assert!(tbl.shadowed.contains_key(&1) && tbl.kept_by_va.is_empty());
+        // a GPU-owned placement over a kept cube retires it, and its release forgets it
+        let mut tbl = Table::new();
+        tbl.keep_arrays = true;
+        tbl.insert(1, entry(0x10_8000, &cube));
+        tbl.insert(2, entry(0x10_0000, &tex_1m));
+        tbl.insert(5, entry(0x30_8000, &cube));
+        tbl.insert(6, entry(0x30_0000, &tex_1m));
+        let (_, retired, mut unmap) = tbl.retire_range(0x10_8000, 0x10_9000);
+        unmap.sort_unstable();
+        assert_eq!((retired, unmap), (2, vec![1, 2]));
+        assert!(!tbl.by_res.contains_key(&1) && tbl.kept_by_va.len() == 1);
+        assert_eq!(tbl.remove(5), (true, 0, vec![]));
+        assert!(tbl.kept_by_va.is_empty() && tbl.by_res.contains_key(&6));
     }
 
     /// Real GPU: render targets at two addresses of one physical page (mapped at the second after

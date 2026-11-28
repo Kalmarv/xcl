@@ -1447,6 +1447,41 @@ unsafe fn unmap_placed(res: &ID3D12Resource, immediate_cool: bool) {
     }
 }
 
+/// Move a mapped placed sampled texture to pages of its own: a newer placement lies over its
+/// memory at another address and both stay live (`title_textures::keep_on_own_pages`), and the
+/// tiles keyed by the title's pages are shared with whatever is placed over those pages. From
+/// here on all its tiles are keyed by its address, as the ones past its console size are.
+/// False: nothing changed (no pages here, not mapped, paged level by level, GPU-owned) or no
+/// pages could be had, and it is then left unmapped as a superseded texture is.
+pub(super) unsafe fn rebind_private(res: &ID3D12Resource) -> bool {
+    let mut dev: Option<ID3D12Device> = None;
+    if res.GetDevice(&mut dev).is_err() {
+        return false;
+    }
+    let Some(dev) = dev else { return false };
+    let key = res.as_raw() as usize;
+    let mut g = PAGES.lock().unwrap();
+    let Some(Some(pages)) = g.get_mut(&(dev.as_raw() as usize)) else { return false };
+    let Some(t) = pages.targets.get_mut(&key).filter(|t| t.mapped && t.levels.is_none() && !t.gpu_owned) else { return false };
+    let (va, total) = (t.va, t.total);
+    let used = std::mem::take(&mut t.used);
+    let used_extra = std::mem::take(&mut t.used_extra);
+    t.mapped = false;
+    t.console_bytes = Some(0);
+    pages.unmap(res, total);
+    pages.release_tiles(used, used_extra, std::time::Instant::now(), true);
+    let Some((used, used_extra)) = pages.bind(&dev, res, va, Some(0), total, &[]) else {
+        crate::xlog_warn!("D3D12.X: no pages of its own for a texture at {va:#x} under a newer placement ({total} tiles): it is left unmapped");
+        return false;
+    };
+    if let Some(t) = pages.targets.get_mut(&key) {
+        t.used = used;
+        t.used_extra = used_extra;
+        t.mapped = true;
+    }
+    true
+}
+
 /// Re-map a previously unmapped placed texture when the newer placement shadowing it is released.
 pub(super) unsafe fn remap_if_unmapped(res: &ID3D12Resource) -> bool {
     let mut dev: Option<ID3D12Device> = None;
