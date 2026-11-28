@@ -1125,6 +1125,59 @@ pub(super) unsafe fn refresh(queue: *mut c_void) {
     own_work(|| refresh_once(queue, true));
 }
 
+/// `XCL_UPLOAD_ON_CPU_SIGNAL=1` (diagnostic, off by default): before the CPU signals a fence, what
+/// the CPU wrote since the last look goes to video memory and the CPU waits until it is there.
+/// Without it, those writes are uploaded only before the title's next ExecuteCommandLists, so GPU
+/// work already submitted that waits on the fence reads what was there before.
+fn upload_on_cpu_signal() -> bool {
+    static ON: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
+    UPLOAD_ON_CPU_SIGNAL_FORCED.load(Ordering::Relaxed) || *ON.get_or_init(|| std::env::var("XCL_UPLOAD_ON_CPU_SIGNAL").is_ok_and(|v| v.trim() == "1"))
+}
+static UPLOAD_ON_CPU_SIGNAL_FORCED: std::sync::atomic::AtomicBool = std::sync::atomic::AtomicBool::new(false);
+/// XCL's queue for the uploads made on a CPU signal, and the fence the CPU waits on (its last value)
+static SIGNAL_UPLOADS: Mutex<Option<(ID3D12CommandQueue, ID3D12Fence, u64)>> = Mutex::new(None);
+static SIGNAL_UPLOAD_WAITS: AtomicU64 = AtomicU64::new(0);
+
+/// Before the CPU signals a fence of the title's (`XCL_UPLOAD_ON_CPU_SIGNAL=1` only): the uploads
+/// of what the CPU wrote, waited for on the CPU (up to 2 s).
+pub(super) unsafe fn before_cpu_signal() {
+    if !upload_on_cpu_signal() || BUSY.with(|b| b.get()) {
+        return;
+    }
+    own_work(|| {
+        let mut g = SIGNAL_UPLOADS.lock().unwrap();
+        if g.is_none() {
+            let raw = super::real::device_raw();
+            let Some(dev) = ID3D12Device::from_raw_borrowed(&raw) else { return };
+            let Ok(q) = dev.CreateCommandQueue::<ID3D12CommandQueue>(&D3D12_COMMAND_QUEUE_DESC { Type: D3D12_COMMAND_LIST_TYPE_DIRECT, ..Default::default() }) else { return };
+            let Ok(f) = dev.CreateFence::<ID3D12Fence>(0, D3D12_FENCE_FLAG_NONE) else { return };
+            crate::xlog_info!("XCL_UPLOAD_ON_CPU_SIGNAL: the CPU's writes are uploaded and waited for before each CPU fence signal");
+            *g = Some((q, f, 0));
+        }
+        let Some((q, f, v)) = g.as_mut() else { return };
+        {
+            let _refresh = REFRESH.lock().unwrap();
+            refresh_once(q.as_raw(), true);
+        }
+        *v += 1;
+        if q.Signal(&*f, *v).is_err() {
+            return;
+        }
+        let t0 = std::time::Instant::now();
+        while super::real::fence_completed(f) < *v {
+            if t0.elapsed() > std::time::Duration::from_secs(2) {
+                crate::xlog_warn!("XCL_UPLOAD_ON_CPU_SIGNAL: uploads not done after 2 s; the signal goes on without them");
+                return;
+            }
+            std::thread::yield_now();
+        }
+        let n = SIGNAL_UPLOAD_WAITS.fetch_add(1, Ordering::Relaxed) + 1;
+        if n.is_power_of_two() {
+            crate::xlog_info!("XCL_UPLOAD_ON_CPU_SIGNAL: {n} CPU signals waited for uploads (last {} µs)", t0.elapsed().as_micros());
+        }
+    });
+}
+
 /// microseconds since the first call, never 0
 fn now_us() -> u64 {
     static T0: std::sync::OnceLock<std::time::Instant> = std::sync::OnceLock::new();
@@ -3071,6 +3124,44 @@ pub(super) mod tests {
                 OWN_WAITED.lock().unwrap().remove(&(q.as_raw() as usize));
             }
             *OWN_UPLOADS.lock().unwrap() = was;
+        }
+    }
+
+    /// With `XCL_UPLOAD_ON_CPU_SIGNAL`, a CPU signal goes on only once the uploads already made on
+    /// XCL's own queue are done on the GPU.
+    #[test]
+    fn gpu_a_cpu_signal_waits_for_the_uploads_with_the_switch_on() {
+        let _guard = TEST_LOCK.lock().unwrap();
+        if super::super::backend() != super::super::Backend::Real {
+            crate::gpu::recomp::runner::skip_test("no GPU");
+            return;
+        }
+        unsafe {
+            let raw_device = super::super::real::device_raw();
+            let dev = ID3D12Device::from_raw_borrowed(&raw_device).unwrap();
+            UPLOAD_ON_CPU_SIGNAL_FORCED.store(true, Ordering::Relaxed);
+            let was = OWN_UPLOADS.lock().unwrap().take();
+            // (no uploads: the signal goes on at once)
+            before_cpu_signal();
+            let (q, f, v) = SIGNAL_UPLOADS.lock().unwrap().clone().expect("queue made");
+            assert_eq!(super::super::real::fence_completed(&f), v);
+            let gate: ID3D12Fence = dev.CreateFence(0, D3D12_FENCE_FLAG_NONE).unwrap();
+            *OWN_UPLOADS.lock().unwrap() = Some((gate.clone(), 1));
+            OWN_WAITED.lock().unwrap().remove(&(q.as_raw() as usize));
+            let opener = std::thread::spawn(move || {
+                std::thread::sleep(std::time::Duration::from_millis(300));
+                own_work(|| gate.Signal(1).unwrap());
+            });
+            let t0 = std::time::Instant::now();
+            before_cpu_signal();
+            let took = t0.elapsed();
+            opener.join().unwrap();
+            assert!(took.as_millis() >= 250, "the signal went on after {took:?}, before the upload");
+            assert!(took.as_millis() < 2_000, "the wait ran into its timeout ({took:?})");
+            assert_eq!(super::super::real::fence_completed(&f), v + 1);
+            OWN_WAITED.lock().unwrap().remove(&(q.as_raw() as usize));
+            *OWN_UPLOADS.lock().unwrap() = was;
+            UPLOAD_ON_CPU_SIGNAL_FORCED.store(false, Ordering::Relaxed);
         }
     }
 
