@@ -921,7 +921,9 @@ pub unsafe fn close(obj: *mut c_void) -> Result<Translation, String> {
                     (Some(g), Some(c), Some(_)) => {
                         let slot = clear_uav_gpu_slot(g, c);
                         // The clear resource and its GPU descriptor must name the same depth twin.
-                        let target = slot.and_then(|s| super::list_x::uav_clear_resource(res as usize, Some(s))).map(|r| r as *mut c_void);
+                        let target = slot
+                            .and_then(|s| super::list_x::uav_clear_resource(res as usize, Some(s)))
+                            .map(|r| super::depth_uav_sync::twin_for_pc_uav(c.pc_uav as usize).unwrap_or(r) as *mut c_void);
                         if let (Some(s), Some(r)) = (slot, target.as_ref().and_then(|t| ID3D12Resource::from_raw_borrowed(t))) {
                             let (gh, ch) = (D3D12_GPU_DESCRIPTOR_HANDLE { ptr: s.pc_gpu_uav }, D3D12_CPU_DESCRIPTOR_HANDLE { ptr: c.pc_uav as usize });
                             if get(1) != 0 {

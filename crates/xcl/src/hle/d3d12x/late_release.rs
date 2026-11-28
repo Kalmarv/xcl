@@ -203,6 +203,17 @@ pub fn hold_heap(heap: ID3D12Heap) {
     start_thread();
 }
 
+/// A descriptor heap XCL owns (`depth_uav_sync`'s, for the passes it records on the title's
+/// lists) is let go: lists in flight may still name it, so it goes as a page heap does (it is not
+/// one of the title's objects, and is released through its own vtable). `XCL_LATE_RELEASE=0`: now.
+pub fn hold_descriptor_heap(heap: ID3D12DescriptorHeap) {
+    if !enabled() {
+        return drop(heap);
+    }
+    HELD.lock().unwrap().get_or_insert_with(Held::default).open.push(Dead::Heap(heap.into_raw() as usize));
+    start_thread();
+}
+
 /// A target superseded by a newer placement over its pages (`placements`) leaves the shared pages
 /// once every queue is past a fence value signalled after this: work submitted before may still
 /// draw to it or read it. `XCL_LATE_RELEASE=0`: now.

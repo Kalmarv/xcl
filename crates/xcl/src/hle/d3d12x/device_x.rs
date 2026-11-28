@@ -1180,6 +1180,7 @@ pub(super) unsafe extern "system" fn create_placed_resource_x(this: *mut c_void,
     note_alias(va as usize, &x);
     // console-only state bits (Unicorn Overlord's 4K display target: 0x100000) are not the
     // PC's: the PC refused the resource (E_INVALIDARG) and the title threw
+    let console_state = state;
     let state = pc_initial_state(u32::from_le_bytes(x[0x30..0x34].try_into().unwrap()), state);
     let mut clear_buf = [0u8; 24];
     let pc_format = u32::from_le_bytes(d[0x20..0x24].try_into().unwrap());
@@ -1213,6 +1214,7 @@ pub(super) unsafe extern "system" fn create_placed_resource_x(this: *mut c_void,
                     }
                     real::note_title_address(*ppv as usize, va as usize);
                     super::depth_uav::note_created(*ppv, &x, Some(va as usize), state);
+                    super::depth_uav_sync::register_if_depth_uav(this, *ppv, &x, state, console_state);
                     super::lut3d::created("CreatePlacedResourceX (GPU-owned: on the title's pages / an arena)", *ppv, Some(&x), Some(va as usize), false, state);
                 }
                 return hr;
@@ -1236,6 +1238,7 @@ pub(super) unsafe extern "system" fn create_placed_resource_x(this: *mut c_void,
             Ok(()) => {
                 real::note_title_address(*ppv as usize, va as usize);
                 super::depth_uav::note_created(*ppv, &x, Some(va as usize), state);
+                super::depth_uav_sync::register_if_depth_uav(this, *ppv, &x, state, console_state);
                 super::lut3d::created(if placed_hr.is_some() { "CreatePlacedResourceX (sampled: on shared pages)" } else if small_hr.is_some() { "CreatePlacedResourceX (sampled: 4 KiB placement)" } else { "CreatePlacedResourceX (sampled: committed)" }, *ppv, Some(&x), Some(va as usize), true, state);
                 return hr;
             }
@@ -1254,6 +1257,7 @@ pub(super) unsafe extern "system" fn create_placed_resource_x(this: *mut c_void,
         real::note_title_address(*ppv as usize, va as usize);
         if !buffer {
             super::depth_uav::note_created(*ppv, &x, Some(va as usize), state);
+            super::depth_uav_sync::register_if_depth_uav(this, *ppv, &x, state, console_state);
             super::lut3d::created("CreatePlacedResourceX (a resource of its own: not kept in step)", *ppv, Some(&x), Some(va as usize), false, state);
         }
     }

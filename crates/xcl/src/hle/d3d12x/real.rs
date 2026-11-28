@@ -2042,6 +2042,7 @@ unsafe extern "system" fn res_release(this: *mut c_void) -> u32 {
             super::small_tex::gone(this as usize);
         }
         super::depth_uav::forget(this as usize);
+        super::depth_uav_sync::forget(this as usize);
         super::title_textures::forget(this as usize);
         super::lut3d::forget(this as usize);
         let gone = UMA_BUFFERS.lock().unwrap().as_mut().and_then(|m| m.remove(&(this as usize)));
@@ -2396,6 +2397,15 @@ unsafe extern "system" fn dev_copy_descriptors_simple_x(this: *mut c_void, n: u3
     }
     let f: unsafe extern "system" fn(*mut c_void, u32, u64, u64, u32) = std::mem::transmute(orig_fn(this, 24));
     f(this, n, dst, src, ty);
+    if ty == D3D12_DESCRIPTOR_HEAP_TYPE_DSV.0 as u32 && n > 0 && super::depth_uav_sync::any() {
+        super::depth_uav_sync::copy_dsv(dst as usize, src as usize, n, dsv_increment(this));
+    }
+}
+
+/// The DSV heap's descriptor size (device #15), for `depth_uav_sync`'s record of copied DSVs.
+unsafe fn dsv_increment(this: *mut c_void) -> usize {
+    let get_inc: unsafe extern "system" fn(*mut c_void, u32) -> u32 = std::mem::transmute(orig_fn(this, 15));
+    get_inc(this, D3D12_DESCRIPTOR_HEAP_TYPE_DSV.0 as u32) as usize
 }
 
 /// #23 CopyDescriptors(dst ranges, src ranges, type): range by range over console slots.
@@ -2416,7 +2426,11 @@ unsafe extern "system" fn dev_copy_descriptors_x(this: *mut c_void, nd: u32, dst
         }
         type F = unsafe extern "system" fn(*mut c_void, u32, *const u64, *const u32, u32, *const u64, *const u32, u32);
         let f: F = std::mem::transmute(orig_fn(this, 23));
-        return f(this, nd, dsts, dsizes, ns, srcs, ssizes, ty);
+        f(this, nd, dsts, dsizes, ns, srcs, ssizes, ty);
+        if ty == D3D12_DESCRIPTOR_HEAP_TYPE_DSV.0 as u32 && super::depth_uav_sync::any() {
+            super::depth_uav_sync::copy_dsv_ranges(dsv_increment(this), nd, dsts, dsizes, ns, srcs, ssizes);
+        }
+        return;
     }
     // every descriptor as (dst, src) handle, ranges walked in step
     let step = if ty == D3D12_DESCRIPTOR_HEAP_TYPE_SAMPLER.0 as u32 { SAMPLER_SLOT } else { SLOT } as u64;
@@ -2584,6 +2598,7 @@ unsafe extern "system" fn dev_create_dsv_x(this: *mut c_void, res: *mut c_void, 
     let flags = copy.as_ref().map_or(0, |c| c.Flags.0 as u32);
     f(this, res, copy.as_ref().map_or(desc, |c| c as *const _), cpu);
     super::depth_uav::note_dsv(cpu as usize, res as usize, flags);
+    super::depth_uav_sync::note_dsv(cpu as usize, res as usize, flags);
 }
 
 /// The view a DSV without a description has, for a depth buffer `pc_resource_desc` made
@@ -2922,6 +2937,7 @@ unsafe extern "system" fn dev_create_uav_at_x(this: *mut c_void, rdesc: *const u
         let raw = b.Flags.0 & D3D12_BUFFER_UAV_FLAG_RAW.0 != 0;
         let (words, at, len) = buffer_words_at(va, v.Format, b.FirstElement, b.NumElements, b.StructureByteStride, raw);
         super::view_want::want(super::view_want::Path::ViewAt, at, len);
+        super::depth_uav_sync::clear_uav_twin(slot.pc_uav as usize);
         return super::console_heap::write(&slot, &words);
     }
     let r = resource_at(this, rdesc, va);
@@ -3134,6 +3150,16 @@ fn uav_companion_srv(
 
 unsafe extern "system" fn dev_create_uav_x(this: *mut c_void, res: *mut c_void, counter: *mut c_void, desc: *const D3D12_UNORDERED_ACCESS_VIEW_DESC, cpu: u64) {
     let rd_opt = ID3D12Resource::from_raw_borrowed(&res).map(|r| r.GetDesc());
+    // (`XCL_DEPTH_UAV_SYNC=1`) a UAV of a depth buffer with unordered access: a view of the
+    // plane's color twin, made as a UAV of any texture is, and known by the PC handle it is at
+    if super::depth_uav_sync::enabled() {
+        let at = super::console_heap::slot(cpu).map_or(cpu, |s| s.pc_uav) as usize;
+        if let Some((twin, view)) = super::depth_uav_sync::resolve_uav(this, res, desc.as_ref()) {
+            dev_create_uav_checked_inner(this, twin, std::ptr::null_mut(), &view, cpu);
+            return super::depth_uav_sync::note_uav_twin(at, twin as usize);
+        }
+        super::depth_uav_sync::clear_uav_twin(at);
+    }
     // a UAV of the stencil plane of a depth buffer with unordered access: a view of its twin
     // (`depth_uav`), made the way a UAV of a texture with unordered access is
     let null_why = match super::depth_uav::resolve_uav(this, res, rd_opt.as_ref(), desc.as_ref()) {
@@ -3363,6 +3389,7 @@ unsafe extern "system" fn dev_create_committed_resource_x(this: *mut c_void, pro
     let hr = dev_create_committed_resource(this, props, flags, desc, st as usize, clear, riid, ppv);
     if hr >= 0 && pc_full.is_some() && !ppv.is_null() && !(*ppv).is_null() {
         super::depth_uav::note_created(*ppv, &(console_desc as *const [u8; 0x38]).read_unaligned(), None, st);
+        super::depth_uav_sync::register_if_depth_uav(this, *ppv, &(console_desc as *const [u8; 0x38]).read_unaligned(), st, state as u32);
         super::lut3d::created("CreateCommittedResource (a PC resource: not in the title's memory)", *ppv, Some(&(console_desc as *const [u8; 0x38]).read_unaligned()), None, false, st);
     }
     if hr < 0 {
@@ -3854,6 +3881,7 @@ unsafe fn placed_in_heap_x(this: *mut c_void, heap: usize, offset: usize, desc: 
     let hr = hr3.unwrap_or(hr2);
     if hr >= 0 && is_texture && !ppv.is_null() && !(*ppv).is_null() {
         super::depth_uav::note_created(*ppv, &x, None, st);
+        super::depth_uav_sync::register_if_depth_uav(this, *ppv, &x, st, state as u32);
     }
     hr
 }
@@ -3894,6 +3922,7 @@ unsafe fn own_memory_if_larger_on_the_pc(this: *mut c_void, heap: usize, offset:
     }
     if hr >= 0 && !ppv.is_null() && !(*ppv).is_null() {
         super::depth_uav::note_created(*ppv, &x, None, made_in);
+        super::depth_uav_sync::register_if_depth_uav(this, *ppv, &x, made_in, state as u32);
     }
     static N: AtomicU64 = AtomicU64::new(0);
     if N.fetch_add(1, Ordering::Relaxed) < 8 {
@@ -9040,6 +9069,10 @@ unsafe extern "system" fn cl_om_set_render_targets(this: *mut c_void, n: u32, rt
     );
     type F = unsafe extern "system" fn(*mut c_void, u32, *const usize, i32, *const usize);
     let f: F = std::mem::transmute(orig_fn(this, pc_slot!("ID3D12GraphicsCommandList", "OMSetRenderTargets")));
+    // (`XCL_DEPTH_UAV_SYNC=1`) a depth buffer whose twin the title wrote: the plane first
+    if !dsv.is_null() {
+        super::depth_uav_sync::before_bind_dsv(this, *dsv);
+    }
     f(this, n, rtvs, single, dsv);
     super::list_x::note_render_targets(this, n, rtvs, single, dsv);
     let _ = super::capture::op(this, || Some(super::capture::targets_op(this)));

@@ -132,6 +132,54 @@ pub(super) unsafe fn transition(list: *mut c_void, res: usize, before: D3D12_RES
     pc::<unsafe extern "system" fn(*mut c_void, u32, *const D3D12_RESOURCE_BARRIER)>(list, PC_RESOURCE_BARRIER)(list, 1, &b);
 }
 
+/// PC ResourceBarrier with `barriers` as they are (`depth_uav_sync`'s own transitions).
+pub(super) unsafe fn pc_resource_barriers(list: *mut c_void, barriers: &[D3D12_RESOURCE_BARRIER]) {
+    if !barriers.is_empty() {
+        pc::<unsafe extern "system" fn(*mut c_void, u32, *const D3D12_RESOURCE_BARRIER)>(list, PC_RESOURCE_BARRIER)(list, barriers.len() as u32, barriers.as_ptr());
+    }
+}
+
+pub(super) unsafe fn pc_copy_resource(list: *mut c_void, dst: usize, src: usize) {
+    pc::<unsafe extern "system" fn(*mut c_void, usize, usize)>(list, PC_COPY_RESOURCE)(list, dst, src);
+}
+
+pub(super) unsafe fn pc_copy_texture_region(list: *mut c_void, dst: *const D3D12_TEXTURE_COPY_LOCATION, x: u32, y: u32, z: u32, src: *const D3D12_TEXTURE_COPY_LOCATION, bx: *const D3D12_BOX) {
+    pc::<unsafe extern "system" fn(*mut c_void, *const D3D12_TEXTURE_COPY_LOCATION, u32, u32, u32, *const D3D12_TEXTURE_COPY_LOCATION, *const D3D12_BOX)>(list, PC_COPY_TEXTURE_REGION)(list, dst, x, y, z, src, bx);
+}
+
+pub(super) unsafe fn device_of_list(list: *mut c_void) -> Option<ID3D12Device> {
+    device_of(list)
+}
+
+/// After a pass of XCL's own on a title's `list` (`depth_uav_sync`: a draw or a dispatch with its
+/// own heaps, pipeline, targets and root signatures): the title's bindings, its pipeline and its
+/// depth bias again. Root signatures and root arguments need nothing: every draw and dispatch
+/// sets its own (`bind`), and the view heaps are bound again by the next one.
+pub(super) unsafe fn restore_after_internal_pass(list: *mut c_void) {
+    let Some((bindings, bound_pso, ty, depth_bias, native_bias)) = recording(list as usize).lock().unwrap().as_mut().and_then(|m| m.get_mut(&(list as usize))).map(|s| {
+        if s.using_fallback_pso {
+            s.using_fallback_pso = false;
+            s.pso_dirty = true;
+        }
+        (s.bindings.clone(), s.bound_pso, s.list_type.unwrap_or(D3D12_COMMAND_LIST_TYPE_DIRECT), s.depth_bias, s.native_bias)
+    }) else {
+        return;
+    };
+    restore_bindings(list, &bindings, ty);
+    super::bind::heaps_changed(list);
+    if bound_pso != 0 {
+        pc::<unsafe extern "system" fn(*mut c_void, usize)>(list, PC_SET_PIPELINE_STATE)(list, super::pso_async::resolve_for_bind(bound_pso));
+        if ty != D3D12_COMMAND_LIST_TYPE_BUNDLE {
+            if let Some((true, static_bias)) = device_x::base_depth_bias_info(bound_pso) {
+                let target = depth_bias.unwrap_or(static_bias);
+                if !target.is_zero() || !native_bias.is_zero() {
+                    let _ = try_native_depth_bias(list, target);
+                }
+            }
+        }
+    }
+}
+
 /// `op` with the window buffer `res` as a copy destination (back to COMMON after it)
 unsafe fn as_copy_dest(list: *mut c_void, res: usize, op: impl FnOnce()) {
     transition(list, res, D3D12_RESOURCE_STATE_COMMON, D3D12_RESOURCE_STATE_COPY_DEST);
@@ -2744,6 +2792,15 @@ unsafe fn copy_scratch(list: *mut c_void, n: u64) -> Option<(usize, u64)> {
     COPY_SCRATCH.lock().unwrap().acquire(list, bytes)
 }
 
+/// The list's scratch buffer (in COMMON) when it holds `n` bytes: `acquire` gives a list the one
+/// it has already recorded with, whatever its size.
+pub(super) unsafe fn acquire_scratch_for_copy(list: *mut c_void, n: u64) -> Option<usize> {
+    if n == 0 {
+        return None;
+    }
+    copy_scratch(list, n).filter(|&(_, bytes)| bytes >= n).map(|(raw, _)| raw)
+}
+
 fn reset_copy_scratch(list: *mut c_void) {
     real::dispatch_chain::list_reset(list as usize);
     if let Some(scratch) = COPY_SCRATCH.lock().unwrap().active.get_mut(&(list as usize)) {
@@ -3620,9 +3677,23 @@ unsafe fn emit_uav_barrier_pc(this: *mut c_void) {
 
 /// command list #146 console compute/UAV barrier (used by `XboxBvhBuilder.dll` between BVH
 /// build passes): emits a global UAV barrier so UMA writes become visible to the next pass
-pub(super) unsafe extern "system" fn uav_barrier_x(this: *mut c_void, _n: u32, _barriers: *const c_void) {
+pub(super) unsafe extern "system" fn uav_barrier_x(this: *mut c_void, n: u32, barriers: *const c_void) {
     let _t = crate::hle::api_cost::time_if(super::look_stats::deep(), crate::hle::api_cost::Call::ListBarrier);
     emit_uav_barrier_pc(this);
+    // (`XCL_DEPTH_UAV_SYNC=1`) the barrier groups' texture barriers of depth buffers with twins:
+    // the twins and the planes brought in step where the title moves one out of or into
+    // unordered access
+    if super::depth_uav_sync::any() {
+        let is_direct = list_type(this) == D3D12_COMMAND_LIST_TYPE_DIRECT;
+        let mut depth_syncs = Vec::new();
+        let had_global_uav = super::depth_uav_sync::filter_enhanced_barriers(n, barriers, is_direct, &mut depth_syncs);
+        if !depth_syncs.is_empty() {
+            super::depth_uav_sync::execute_syncs(this, &depth_syncs);
+        }
+        if had_global_uav {
+            super::depth_uav_sync::on_global_uav_barrier();
+        }
+    }
 }
 
 /// A UAV barrier for all resources on `list`, where a list takes one (a copy list and a bundle
@@ -4789,6 +4860,11 @@ pub(super) unsafe extern "system" fn resource_barrier_x(this: *mut c_void, n: u3
     let mut out: Vec<[u32; 8]> = Vec::with_capacity(n as usize + 1);
     // a UAV barrier for all resources is in `out` / a transition from or to UNORDERED_ACCESS
     let (mut any_uav, mut uav_transition) = (false, false);
+    // (`XCL_DEPTH_UAV_SYNC=1`) depth buffers with twins: what brings twin and plane in step
+    let sync_twins = super::depth_uav_sync::any();
+    let sync_direct = sync_twins && tracked_list_type(this).is_none_or(|t| t == D3D12_COMMAND_LIST_TYPE_DIRECT);
+    let mut depth_syncs: Vec<super::depth_uav_sync::SyncOp> = Vec::new();
+    let mut global_uav_barrier = false;
     for k in 0..n as usize {
         let mut b = barriers.add(k).read_unaligned();
         let (ty, flags) = (b[0], b[1]);
@@ -4822,6 +4898,19 @@ pub(super) unsafe extern "system" fn resource_barrier_x(this: *mut c_void, n: u3
             // window buffers – other resources over the same memory – which a UAV barrier for
             // the title's resource alone does not order (AMD drivers wait and flush for any UAV
             // barrier, NVIDIA's need not): a UAV barrier for all resources, once per batch
+            if sync_twins {
+                // one for a depth buffer with twins: for its twins too (what the title wrote)
+                let res = (b[2] as u64 | (b[3] as u64) << 32) as usize;
+                if res != 0 {
+                    for twin in super::depth_uav_sync::on_uav_barrier(res) {
+                        if twin != 0 {
+                            out.push([2, 0, twin as u32, (twin as u64 >> 32) as u32, 0, 0, 0, 0]);
+                        }
+                    }
+                } else {
+                    global_uav_barrier = true;
+                }
+            }
             b[2..4].fill(0);
             if any_uav {
                 continue;
@@ -4845,6 +4934,14 @@ pub(super) unsafe extern "system" fn resource_barrier_x(this: *mut c_void, n: u3
             }
             if b[5] == b[6] {
                 continue;
+            }
+            if sync_twins {
+                // a depth buffer with twins: no UNORDERED_ACCESS on the PC's depth buffer
+                let (pass, need_uav) = super::depth_uav_sync::filter_transition(&b, sync_direct, &mut depth_syncs);
+                uav_transition |= need_uav;
+                if !pass {
+                    continue;
+                }
             }
             // UAV writes before (or after) the transition: the same holds for the window buffers
             uav_transition |= (b[5] | b[6]) & UNORDERED_ACCESS != 0;
@@ -4889,6 +4986,12 @@ pub(super) unsafe extern "system" fn resource_barrier_x(this: *mut c_void, n: u3
     }
     if let Some(p) = &plane_copies {
         plane_copies_on(this, &p.to_twin, true);
+    }
+    if !depth_syncs.is_empty() {
+        super::depth_uav_sync::execute_syncs(this, &depth_syncs);
+    }
+    if global_uav_barrier && (any_uav || uav_transition) {
+        super::depth_uav_sync::on_global_uav_barrier();
     }
 }
 
@@ -5154,6 +5257,7 @@ pub(super) unsafe extern "system" fn clear_depth_stencil_x(this: *mut c_void, ds
             );
         }
     }
+    super::depth_uav_sync::on_clear_dsv(dsv, flags);
     pc::<unsafe extern "system" fn(*mut c_void, usize, u32, f32, u8, u32, *const windows::Win32::Foundation::RECT)>(this, PC_CLEAR_DEPTH_STENCIL_VIEW)(this, dsv, flags, depth, stencil, n, rects)
 }
 
@@ -5219,6 +5323,8 @@ unsafe fn clear_uav(this: *mut c_void, slot: usize, gpu: u64, cpu: u64, res: usi
         }
     };
     let Some(res) = uav_clear_resource(res, gpu_slot) else { return refused() };
+    // (`XCL_DEPTH_UAV_SYNC=1`) a view of a depth buffer's twin: the twin is what it clears
+    let res = super::depth_uav_sync::twin_for_pc_uav(cpu as usize).unwrap_or(res);
     pc::<unsafe extern "system" fn(*mut c_void, u64, u64, usize, *const c_void, u32, *const windows::Win32::Foundation::RECT)>(this, slot)(this, gpu, cpu, res, values, n, rects)
 }
 
