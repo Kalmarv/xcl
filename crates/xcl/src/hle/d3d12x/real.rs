@@ -9110,12 +9110,32 @@ unsafe extern "system" fn cl_clear_rtv(this: *mut c_void, rtv: usize, color: *co
             super::placements::note_use(r);
         }
     }
+    if let Some(c) = color.as_ref().filter(|c| c.iter().any(|v| v.is_infinite())) {
+        log_infinite_clear(rtv, c);
+    }
     if let Some(c) = color.as_ref().filter(|c| c.iter().any(|v| v.is_nan())) {
         if let Some(fixed) = integer_clear_bits(rtv, c) {
             return f(this, rtv, &fixed, n, rects);
         }
     }
     f(this, rtv, color, n, rects)
+}
+
+/// An infinite channel in a clear (logged once for each target and colour, up to 256): the target's
+/// size and format and the channels' bits, to tell what a title means by them.
+unsafe fn log_infinite_clear(rtv: usize, c: &[f32; 4]) {
+    static SEEN: Mutex<Option<HashSet<(usize, [u32; 4])>>> = Mutex::new(None);
+    let r = super::present::rtv_resource(rtv);
+    let bits = c.map(f32::to_bits);
+    {
+        let mut g = SEEN.lock().unwrap();
+        let seen = g.get_or_insert_with(HashSet::new);
+        if seen.len() >= 256 || !seen.insert((r.unwrap_or(0), bits)) {
+            return;
+        }
+    }
+    let d = r.and_then(|r| ID3D12Resource::from_raw_borrowed(&(r as *mut c_void)).map(|x| x.GetDesc()));
+    crate::xlog_info!("D3D12.X: ClearRenderTargetView with infinite channels {bits:08x?} of resource {r:?}: {:?}", d.map(|d| (d.Width, d.Height, d.DepthOrArraySize, d.Format.0)));
 }
 
 /// A NaN channel in a clear of an integer target (`XCL_CLEAR_NAN_BITS=0`: off): the PC converts
