@@ -7382,7 +7382,23 @@ fn known_subobjects(buf: &[u8]) -> Vec<(u32, &[u8])> {
         out.push((ty, p));
         off += (poff + psize + 7) & !7;
     }
+    note_stream_types(&out, off, buf.len());
     out
+}
+
+/// Each new sequence of subobject types a stream was read as (the first 48), with how far the
+/// read got: a stream numbered another way than the PC's shows as a read that stops short, or
+/// as types that make no pipeline together. With each type, whether its payload is all zero.
+fn note_stream_types(subs: &[(u32, &[u8])], read: usize, len: usize) {
+    static SEEN: Mutex<Vec<(Vec<u32>, usize, usize)>> = Mutex::new(Vec::new());
+    let types: Vec<u32> = subs.iter().map(|(ty, _)| *ty).collect();
+    let mut seen = SEEN.lock().unwrap();
+    if seen.len() >= 48 || seen.iter().any(|(t, r, l)| *t == types && *r == read && *l == len) {
+        return;
+    }
+    let text: Vec<String> = subs.iter().map(|(ty, p)| format!("{ty}{}", if p.iter().all(|&b| b == 0) { "z" } else { "" })).collect();
+    crate::xlog_info!("D3D12.X: pipeline stream read as types [{}] ({read:#x} of {len:#x} bytes read; z = an all-zero payload; sequence {} so far)", text.join(" "), seen.len() + 1);
+    seen.push((types, read, len));
 }
 
 unsafe fn payload_shader<'a>(p: &[u8]) -> Option<&'a [u8]> {
