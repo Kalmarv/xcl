@@ -1570,6 +1570,7 @@ mod tests {
             max_vertices: 64,
             max_primitives: 64,
             outputs: vec![],
+            params: None,
         };
         let o = KernelOptions { wave64: true, split: true, mem_windows: 1, sampler_base: 0 };
         let k = super::mesh_with(&bytes, &ms, o).unwrap_or_else(|e| panic!("mesh_with failed: {e}"));

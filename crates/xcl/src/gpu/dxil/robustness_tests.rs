@@ -118,7 +118,7 @@ fn a_group_barrier_of_several_hardware_waves_is_left_to_the_hlsl_path() {
     // (the kernel form of the tests is no thread group of a title's: its barrier stays)
     kernel::translate(&code, o(true, true)).expect("kernel");
     // a mesh program's compute pass: two console waves a group, as a retail title's
-    let ms = |threads| crate::gpu::recomp::MsInterface { outputs: vec![el("SV_Position", 0, 1, 3, 0, 0xF)], threads, max_vertices: 64, max_primitives: 64 };
+    let ms = |threads| crate::gpu::recomp::MsInterface { outputs: vec![el("SV_Position", 0, 1, 3, 0, 0xF)], threads, max_vertices: 64, max_primitives: 64, params: None };
     for split in [true, false] {
         let e = kernel::translate_mesh(&code, o(true, split), &ms(128)).err().unwrap_or_else(|| panic!("a mesh pass translated (split {split})"));
         assert!(e.contains("s_barrier in a group of several hardware waves"), "{e}");
