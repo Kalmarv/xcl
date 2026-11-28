@@ -3809,6 +3809,25 @@ fn no_source() -> usize {
     })
 }
 
+/// `XCL_VIEW_ASK_MAPPED=1` (diagnostic, off by default): the GPU-view tiles the title's page
+/// mappings change are asked for (`map_mirror`) whether or not an address there reached the GPU.
+/// Without it only tiles asked for before follow a mapping: one the GPU reaches only by an
+/// address stored in memory (a pointer in a buffer) never gets video memory and reads zeros.
+fn ask_mapped() -> bool {
+    #[cfg(test)]
+    if let Some(on) = tests::ASK_MAPPED_FOR_TEST.with(|c| c.get()) {
+        return on;
+    }
+    static ON: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
+    *ON.get_or_init(|| {
+        let on = std::env::var("XCL_VIEW_ASK_MAPPED").is_ok_and(|v| v.trim() == "1");
+        if on {
+            crate::xlog_info!("XCL_VIEW_ASK_MAPPED: GPU-view tiles the title maps are asked for whether or not an address there reached the GPU");
+        }
+        on
+    })
+}
+
 /// Window tiles whose page the queue's page mappings changed (`remapped`), for the next submit to
 /// link again (`State::remap_mirrors`). A lock of its own, as `MIRROR_ASKS`.
 static REMAPS: Mutex<Vec<usize>> = Mutex::new(Vec::new());
@@ -3818,6 +3837,13 @@ static REMAPPING: AtomicBool = AtomicBool::new(false);
 /// page, a page that got or lost its place): those asked for (`map_mirror`) are linked again at
 /// the next submit. Any thread; no state's lock.
 pub fn remapped(tiles: &[usize]) {
+    // (`XCL_VIEW_ASK_MAPPED`: a tile the title maps is asked for as if an address there had
+    // reached the GPU; the next submit links it, or leaves it when nothing shows there)
+    if ask_mapped() {
+        for &t in tiles {
+            map_mirror(t, TILE);
+        }
+    }
     let asked: Vec<usize> = tiles.iter().copied().filter(|&t| MIRROR_ASKED.contains(t)).collect();
     if asked.is_empty() {
         return;
@@ -5427,6 +5453,21 @@ fn forget_in(s: &mut State, res: usize) {
 mod tests {
     use super::*;
 
+    /// A tile the title maps is asked for only with `XCL_VIEW_ASK_MAPPED`; without it, a tile
+    /// not asked for before stays so.
+    #[test]
+    fn mapped_tiles_are_asked_for_only_with_the_switch() {
+        let (off, on) = (0x7f12_3450_0000usize, 0x7f12_3460_0000usize);
+        ASK_MAPPED_FOR_TEST.with(|c| c.set(Some(false)));
+        remapped(&[off]);
+        assert!(!MIRROR_ASKED.contains(off), "asked for without the switch");
+        ASK_MAPPED_FOR_TEST.with(|c| c.set(Some(true)));
+        remapped(&[on]);
+        assert!(MIRROR_ASKED.contains(on), "not asked for with the switch");
+        ASK_MAPPED_FOR_TEST.with(|c| c.set(None));
+        MIRROR_ASKED.remove(on);
+    }
+
     /// `XCL_TRACE_UPLOAD_RANGE`'s ranges: by window index and offset, widened to whole tiles, the
     /// ones that do not parse or name no window left out; a range counts only the bytes of runs
     /// inside it, and the runs' calls that met it.
@@ -5457,6 +5498,8 @@ mod tests {
         /// `lazy_commits` for the test on this thread (`LazyCommits`; None: as the environment
         /// says). A thread's own: the other tests' states run beside it in this process.
         pub(super) static LAZY_COMMITS_FOR_TEST: std::cell::Cell<Option<bool>> = const { std::cell::Cell::new(None) };
+        /// `ask_mapped` for the test on this thread (None: as the environment says)
+        pub(super) static ASK_MAPPED_FOR_TEST: std::cell::Cell<Option<bool>> = const { std::cell::Cell::new(None) };
         /// `take_tile` finds no video memory on this thread
         pub(super) static NO_TILES: std::cell::Cell<bool> = const { std::cell::Cell::new(false) };
     }
