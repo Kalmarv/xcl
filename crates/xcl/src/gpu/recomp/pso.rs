@@ -217,6 +217,8 @@ pub fn console_to_dxil_in(blob: &[u8], stage: Stage, sampler_base: u32, split_wa
 /// each at every start. Keyed by two hashes and the length of the bytes, the stage and the
 /// translation parameters; translator sources and the DXC toolchain identify compatible builds.
 /// `XCL_TRANSLATED_CACHE=0` turns it off.
+pub(crate) fn translation_cache_identity() -> u64 { translated::identity() }
+
 mod translated {
     use super::{Compiled, Stage};
     use std::path::{Path, PathBuf};
@@ -284,7 +286,7 @@ mod translated {
 
     /// Translation semantics and the DXC DLLs, independent of link metadata and build profile.
     /// Zero means the disk cache is disabled.
-    fn identity() -> u64 {
+    pub(super) fn identity() -> u64 {
         static I: OnceLock<u64> = OnceLock::new();
         *I.get_or_init(|| {
             if std::env::var("XCL_TRANSLATED_CACHE").is_ok_and(|v| v == "0") {
