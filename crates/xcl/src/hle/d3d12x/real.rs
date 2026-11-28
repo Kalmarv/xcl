@@ -9190,6 +9190,82 @@ mod integer_clear_tests {
         let sint = clear_bits_as_integers(&c, true).map(|v| v as i32);
         assert_eq!(sint, [0x7f80_0000, 0xff80_0000u32 as i32, -1, 5]);
     }
+
+    /// The first texel of an R32G32B32A32_UINT target cleared with `colour` on the tests' device.
+    unsafe fn cleared_texel(colour: [f32; 4]) -> Result<[u32; 4], String> {
+        use windows::Win32::Graphics::Direct3D12::*;
+        use windows::Win32::Graphics::Dxgi::Common::*;
+        let e = |x: windows::core::Error| x.to_string();
+        let dev = crate::gpu::recomp::runner::device()?;
+        let tex = D3D12_RESOURCE_DESC {
+            Dimension: D3D12_RESOURCE_DIMENSION_TEXTURE2D,
+            Width: 4,
+            Height: 4,
+            DepthOrArraySize: 1,
+            MipLevels: 1,
+            Format: DXGI_FORMAT_R32G32B32A32_UINT,
+            SampleDesc: DXGI_SAMPLE_DESC { Count: 1, Quality: 0 },
+            Flags: D3D12_RESOURCE_FLAG_ALLOW_RENDER_TARGET,
+            ..Default::default()
+        };
+        let mut rt: Option<ID3D12Resource> = None;
+        dev.CreateCommittedResource(&D3D12_HEAP_PROPERTIES { Type: D3D12_HEAP_TYPE_DEFAULT, ..Default::default() }, D3D12_HEAP_FLAG_NONE, &tex, D3D12_RESOURCE_STATE_RENDER_TARGET, None, &mut rt).map_err(e)?;
+        let rt = rt.ok_or("render target")?;
+        let heap: ID3D12DescriptorHeap = dev.CreateDescriptorHeap(&D3D12_DESCRIPTOR_HEAP_DESC { Type: D3D12_DESCRIPTOR_HEAP_TYPE_RTV, NumDescriptors: 1, ..Default::default() }).map_err(e)?;
+        let rtv = heap.GetCPUDescriptorHandleForHeapStart();
+        dev.CreateRenderTargetView(&rt, None, rtv);
+        let mut fp = D3D12_PLACED_SUBRESOURCE_FOOTPRINT::default();
+        let mut total = 0u64;
+        dev.GetCopyableFootprints(&tex, 0, 1, 0, Some(&mut fp), None, None, Some(&mut total));
+        let buf = D3D12_RESOURCE_DESC { Dimension: D3D12_RESOURCE_DIMENSION_BUFFER, Width: total, Height: 1, DepthOrArraySize: 1, MipLevels: 1, SampleDesc: DXGI_SAMPLE_DESC { Count: 1, Quality: 0 }, Layout: D3D12_TEXTURE_LAYOUT_ROW_MAJOR, ..Default::default() };
+        let mut rb: Option<ID3D12Resource> = None;
+        dev.CreateCommittedResource(&D3D12_HEAP_PROPERTIES { Type: D3D12_HEAP_TYPE_READBACK, ..Default::default() }, D3D12_HEAP_FLAG_NONE, &buf, D3D12_RESOURCE_STATE_COPY_DEST, None, &mut rb).map_err(e)?;
+        let rb = rb.ok_or("readback")?;
+        let alloc: ID3D12CommandAllocator = dev.CreateCommandAllocator(D3D12_COMMAND_LIST_TYPE_DIRECT).map_err(e)?;
+        let list: ID3D12GraphicsCommandList = dev.CreateCommandList(0, D3D12_COMMAND_LIST_TYPE_DIRECT, &alloc, None).map_err(e)?;
+        list.ClearRenderTargetView(rtv, &colour, None);
+        list.ResourceBarrier(&[D3D12_RESOURCE_BARRIER {
+            Type: D3D12_RESOURCE_BARRIER_TYPE_TRANSITION,
+            Flags: D3D12_RESOURCE_BARRIER_FLAG_NONE,
+            Anonymous: D3D12_RESOURCE_BARRIER_0 {
+                Transition: std::mem::ManuallyDrop::new(D3D12_RESOURCE_TRANSITION_BARRIER {
+                    pResource: std::mem::transmute_copy(&rt),
+                    Subresource: D3D12_RESOURCE_BARRIER_ALL_SUBRESOURCES,
+                    StateBefore: D3D12_RESOURCE_STATE_RENDER_TARGET,
+                    StateAfter: D3D12_RESOURCE_STATE_COPY_SOURCE,
+                }),
+            },
+        }]);
+        let dst = D3D12_TEXTURE_COPY_LOCATION { pResource: std::mem::transmute_copy(&rb), Type: D3D12_TEXTURE_COPY_TYPE_PLACED_FOOTPRINT, Anonymous: D3D12_TEXTURE_COPY_LOCATION_0 { PlacedFootprint: fp } };
+        let src = D3D12_TEXTURE_COPY_LOCATION { pResource: std::mem::transmute_copy(&rt), Type: D3D12_TEXTURE_COPY_TYPE_SUBRESOURCE_INDEX, Anonymous: D3D12_TEXTURE_COPY_LOCATION_0 { SubresourceIndex: 0 } };
+        list.CopyTextureRegion(&dst, 0, 0, 0, &src, None);
+        list.Close().map_err(e)?;
+        let queue: ID3D12CommandQueue = dev.CreateCommandQueue(&D3D12_COMMAND_QUEUE_DESC { Type: D3D12_COMMAND_LIST_TYPE_DIRECT, ..Default::default() }).map_err(e)?;
+        queue.ExecuteCommandLists(&[Some(windows::core::Interface::cast(&list).map_err(e)?)]);
+        let fence: ID3D12Fence = dev.CreateFence(0, D3D12_FENCE_FLAG_NONE).map_err(e)?;
+        queue.Signal(&fence, 1).map_err(e)?;
+        crate::gpu::fence::wait(&fence, 1, &dev, None, 10_000).map_err(|x| format!("{x}"))?;
+        let mut p = std::ptr::null_mut();
+        rb.Map(0, None, Some(&mut p)).map_err(e)?;
+        let t = std::ptr::read(p as *const [u32; 4]);
+        rb.Unmap(0, None);
+        Ok(t)
+    }
+
+    /// On the tests' device: the colour `integer_clear_bits` gives an integer target leaves its
+    /// infinite channels' bits in it, where the title's own colour does not.
+    #[test]
+    fn integer_target_cleared_with_infinities_holds_their_bits_on_the_gpu() {
+        let c = [f32::INFINITY, f32::NEG_INFINITY, f32::INFINITY, 5.0];
+        let raw = match unsafe { cleared_texel(c) } {
+            Ok(t) => t,
+            Err(why) => return crate::gpu::recomp::runner::skip_test(&format!("no GPU: {why}")),
+        };
+        eprintln!("an R32G32B32A32_UINT target cleared with [+inf, -inf, +inf, 5.0]: {raw:08x?}");
+        assert_ne!(raw[0], 0x7f80_0000, "this device already keeps +inf's bits");
+        let fixed = unsafe { cleared_texel(clear_bits_as_integers(&c, false)) }.unwrap();
+        assert_eq!(fixed, [0x7f80_0000, 0xff80_0000, 0x7f80_0000, 5]);
+    }
 }
 
 unsafe extern "system" fn cl_om_set_render_targets(this: *mut c_void, n: u32, rtvs: *const usize, single: i32, dsv: *const usize) {
