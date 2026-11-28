@@ -346,6 +346,8 @@ Fill the reusable DXIL cache ahead of a run with the read-only package wrapper. 
   translator's compact form (programs of 20 000 instructions and more) and `XCL_PER_LANE` keep
   only the thread's 65 536 passes in all. `XCL_DISPATCH_LOOP_BUDGET=0` leaves every loop the
   thread's 65 536 passes, as before (to compare).
+- With `XCL_DIRECT_DXIL=1` and `XCL_PER_LANE=1`, eligible wave32 compute loops can use
+  per-lane control flow even when the next iteration reads the preceding iteration's scalar counter.
 - With `XCL_DRED=1`, a D3D12 device removal logs GPU breadcrumbs in `xcl.log`.
   XCL examines up to 4,096 command lists and reports up to 64 unfinished lists, starting with
   those on which the GPU completed at least one operation. For each, it names the translated
