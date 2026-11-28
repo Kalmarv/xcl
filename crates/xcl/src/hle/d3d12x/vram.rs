@@ -1405,6 +1405,7 @@ unsafe fn place_on_pages(
     let kind = if gpu_owned(desc.Flags.0 as u32) { super::placements::Kind::Target } else { super::placements::Kind::Sampled };
     // (the older targets it supersedes leave the shared pages once the work before is done)
     for r in super::placements::placed(raw as usize, va, (first, first + own * PAGE), super::placements::Backing::Pages(dev_key), kind, desc) {
+        SUPERSEDED_BY.lock().unwrap().get_or_insert_with(std::collections::HashMap::new).insert(r.as_raw() as usize, (raw as usize, va));
         super::late_release::hold_unmap(r);
     }
     Some(hr)
@@ -1502,6 +1503,28 @@ static EVICTED_UNVIEWED: super::sharded::Sharded<u8> = super::sharded::Sharded::
 static EVICTED_COUNT: std::sync::atomic::AtomicUsize = std::sync::atomic::AtomicUsize::new(0);
 static EVICTED_TOTAL: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
 static REVIVED_TOTAL: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
+/// The newer placement that superseded each placed texture (`placements::placed`), for
+/// `unpaged_write`'s log.
+static SUPERSEDED_BY: Mutex<Option<std::collections::HashMap<usize, (usize, usize)>>> = Mutex::new(None);
+/// GPU writes into a texture that is not mapped and has no pages (`unpaged_write`).
+static UNPAGED_WRITES: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
+
+/// A GPU write into texture `res` after `map_levels`: when it is not mapped and has no pages (its
+/// bytes go to unmapped tiles), counted, and Some((console address, bytes, the placement that
+/// superseded it and its console address ((0, 0): none known), evicted unviewed)).
+pub(super) fn unpaged_write(res: usize) -> Option<(usize, u64, (usize, usize), bool)> {
+    let (va, bytes) = {
+        let g = PAGES.lock().unwrap();
+        let t = g.values().flatten().find_map(|p| p.targets.get(&res))?;
+        if t.mapped || !t.used.is_empty() || !t.used_extra.is_empty() {
+            return None;
+        }
+        (t.va, t.console_bytes.unwrap_or(t.total as u64 * PAGE as u64))
+    };
+    UNPAGED_WRITES.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+    let by = SUPERSEDED_BY.lock().unwrap().as_ref().and_then(|m| m.get(&res).copied()).unwrap_or((0, 0));
+    Some((va, bytes, by, EVICTED_UNVIEWED.contains(res)))
+}
 
 pub(super) fn has_evicted_unviewed() -> bool {
     EVICTED_COUNT.load(std::sync::atomic::Ordering::Relaxed) != 0
@@ -1701,8 +1724,8 @@ pub(super) unsafe fn before_execute(queue: &ID3D12CommandQueue) {
             let tot = EVICTED_TOTAL.load(std::sync::atomic::Ordering::Relaxed);
             let rev = REVIVED_TOTAL.load(std::sync::atomic::Ordering::Relaxed);
             crate::xlog_info!(
-                "D3D12.X: evict unviewed: -{evicted_now} sampled textures ({cur} evicted now, {tot} total, {rev} revived; skipped: missing={}, shadowed={}, gpu_written={}, target={}, pending={}, unmapped={})",
-                skip[0], skip[1], skip[2], skip[3], skip[4], skip[5]
+                "D3D12.X: evict unviewed: -{evicted_now} sampled textures ({cur} evicted now, {tot} total, {rev} revived; skipped: missing={}, shadowed={}, gpu_written={}, target={}, pending={}, unmapped={}); GPU writes into unmapped textures with no pages: {}",
+                skip[0], skip[1], skip[2], skip[3], skip[4], skip[5], UNPAGED_WRITES.load(std::sync::atomic::Ordering::Relaxed)
             );
         }
     }

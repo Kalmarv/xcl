@@ -757,6 +757,25 @@ fn recheck_source(e: &mut Entry) -> bool {
     true
 }
 
+/// The GPU writes into each texture with no pages so far (`note_gpu_write`).
+static UNPAGED_WRITES: Mutex<Option<std::collections::HashMap<usize, u64>>> = Mutex::new(None);
+
+/// The count of this GPU write into texture `res` with no pages when it is logged: its first
+/// `UNPAGED_LOG_EACH`, then each power of two; at most `UNPAGED_LOG_TEXTURES` textures get lines
+/// (the periodic evict line counts them all).
+fn unpaged_write_logged(res: usize) -> Option<u64> {
+    const UNPAGED_LOG_EACH: u64 = 3;
+    const UNPAGED_LOG_TEXTURES: usize = 256;
+    let mut g = UNPAGED_WRITES.lock().unwrap();
+    let m = g.get_or_insert_with(std::collections::HashMap::new);
+    if !m.contains_key(&res) && m.len() >= UNPAGED_LOG_TEXTURES {
+        return None;
+    }
+    let n = m.entry(res).or_insert(0);
+    *n += 1;
+    (*n <= UNPAGED_LOG_EACH || n.is_power_of_two()).then_some(*n)
+}
+
 /// The title's GPU work writes texture `res` (a copy into it): on the console the memory then
 /// holds what the GPU wrote; here the CPU's view of it is stale, so it is not uploaded again
 /// (a CPU write elsewhere on its pages – a neighbour, an allocator's header – would upload the
@@ -772,6 +791,15 @@ pub fn note_gpu_write(list: usize, res: usize) {
             super::vram::note_viewed(res);
             if let Some(r) = ID3D12Resource::from_raw_borrowed(&p) {
                 super::vram::map_levels(r, None);
+            }
+        }
+        if let Some((va, bytes, by, evicted)) = super::vram::unpaged_write(res) {
+            if let Some(n) = unpaged_write_logged(res) {
+                crate::xlog_info!(
+                    "D3D12.X: GPU write #{n} into texture {res:#x} with no pages, not mapped (console {va:#x}, {bytes:#x} bytes): superseded by {:#x} (console {:#x}){}; its texels go to unmapped tiles",
+                    by.0, by.1,
+                    if evicted { ", evicted unviewed" } else { "" }
+                );
             }
         }
     }
@@ -2983,6 +3011,16 @@ pub(super) mod tests {
             readback.Unmap(0, None);
             out
         })
+    }
+
+    /// A texture's GPU writes with no pages are logged the first three times, then at each power
+    /// of two.
+    #[test]
+    fn gpu_writes_into_a_texture_with_no_pages_are_logged_first_then_at_powers_of_two() {
+        let res = 0x7e57_0000_1000;
+        let logged: Vec<u64> = (0..20).filter_map(|_| unpaged_write_logged(res)).collect();
+        assert_eq!(logged, vec![1, 2, 3, 4, 8, 16]);
+        assert_eq!(unpaged_write_logged(res + 0x1000), Some(1), "another texture is counted apart");
     }
 
     #[test]
