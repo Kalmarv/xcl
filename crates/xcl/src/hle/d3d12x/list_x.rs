@@ -2764,6 +2764,15 @@ pub(super) unsafe extern "system" fn copy_memory_x(this: *mut c_void, dst: u64, 
 /// Process-wide committed scratch budget, including buffers awaiting GPU completion.
 const MAX_COPY_SCRATCH: u64 = 64 << 20;
 
+/// What the copies between format-aliased textures may take above `MAX_COPY_SCRATCH`. A list keeps
+/// its scratch for as long as it lives, so lists that copied once can hold the whole budget, and a
+/// sync that then finds no scratch leaves its reader with stale texels.
+const SYNC_SCRATCH_RESERVE: u64 = 32 << 20;
+
+/// The most a copy between format-aliased textures asks for: a larger subresource goes in bands
+/// of rows.
+const SYNC_SCRATCH_BAND: u64 = 1 << 20;
+
 struct CopyScratch {
     buffer: ID3D12Resource,
     bytes: u64,
@@ -2814,23 +2823,60 @@ impl CopyScratchCache {
             if !scratch.recorded && !scratch.idle() {
                 return None;
             }
-            if scratch.recorded || scratch.bytes >= bytes || bytes > MAX_COPY_SCRATCH - self.bytes + scratch.bytes {
+            if scratch.recorded || scratch.bytes >= bytes || bytes > (MAX_COPY_SCRATCH + scratch.bytes).saturating_sub(self.bytes) {
                 scratch.recorded = true;
                 return Some((scratch.buffer.as_raw() as usize, scratch.bytes));
             }
             // Drop the old allocation before growing so the peak stays within the budget.
             self.bytes -= self.active.remove(&key).unwrap().bytes;
         }
-        if bytes > MAX_COPY_SCRATCH - self.bytes {
+        if bytes > MAX_COPY_SCRATCH.saturating_sub(self.bytes) {
             return None;
         }
+        self.insert(list, bytes)
+    }
+
+    unsafe fn insert(&mut self, list: *mut c_void, bytes: u64) -> Option<(usize, u64)> {
         let buffer = make_copy_scratch(list, bytes)?;
         let raw = buffer.as_raw() as usize;
-        self.active.insert(key, CopyScratch {
+        self.active.insert(list as usize, CopyScratch {
             buffer, bytes, recorded: true, untracked_submission: false, marks: HashMap::new(),
         });
         self.bytes += bytes;
         Some((raw, bytes))
+    }
+
+    /// A scratch for a copy that must not be left out: `want` bytes when the list has recorded
+    /// with none yet, at least `min` otherwise. Where `acquire` gives up, this one goes on: a
+    /// scratch still executing from the list's last submission is set aside for the GPU to finish
+    /// and replaced, and a new one may reach into `SYNC_SCRATCH_RESERVE`.
+    unsafe fn acquire_for_sync(&mut self, list: *mut c_void, want: u64, min: u64) -> Option<(usize, u64)> {
+        self.collect_released();
+        let key = list as usize;
+        let limit = MAX_COPY_SCRATCH + SYNC_SCRATCH_RESERVE;
+        if let Some(scratch) = self.active.get_mut(&key) {
+            if scratch.recorded {
+                return (scratch.bytes >= min).then(|| (scratch.buffer.as_raw() as usize, scratch.bytes));
+            }
+            let busy = !scratch.idle();
+            if !busy && (scratch.bytes >= want || (scratch.bytes >= min && want > (limit + scratch.bytes).saturating_sub(self.bytes))) {
+                scratch.recorded = true;
+                return Some((scratch.buffer.as_raw() as usize, scratch.bytes));
+            }
+            let old = self.active.remove(&key).unwrap();
+            if busy {
+                // still counted in `bytes` until the GPU is done with it
+                self.released.push(old);
+            } else {
+                self.bytes -= old.bytes;
+            }
+        }
+        let room = limit.saturating_sub(self.bytes);
+        let bytes = if want <= room { want } else { min };
+        if bytes > room {
+            return None;
+        }
+        self.insert(list, bytes)
     }
 }
 
@@ -2872,6 +2918,18 @@ pub(super) unsafe fn acquire_scratch_for_copy(list: *mut c_void, n: u64) -> Opti
         return None;
     }
     copy_scratch(list, n).filter(|&(_, bytes)| bytes >= n).map(|(raw, _)| raw)
+}
+
+/// The list's scratch buffer (in COMMON) and its size for a copy of `needed` bytes that can go in
+/// pieces of `min` bytes or more (`min == needed`: only whole). It holds `min` bytes at least, and
+/// `needed` or `SYNC_SCRATCH_BAND` when the list has recorded with none before.
+pub(super) unsafe fn acquire_scratch_for_sync(list: *mut c_void, needed: u64, min: u64) -> Option<(usize, u64)> {
+    if min == 0 || min > needed || list_type(list) == D3D12_COMMAND_LIST_TYPE_BUNDLE {
+        return None;
+    }
+    let min = min.next_power_of_two().max(D3D12_DEFAULT_RESOURCE_PLACEMENT_ALIGNMENT as u64);
+    let want = needed.min(SYNC_SCRATCH_BAND).next_power_of_two().max(min);
+    COPY_SCRATCH.lock().unwrap().acquire_for_sync(list, want, min)
 }
 
 fn reset_copy_scratch(list: *mut c_void) {
@@ -5756,6 +5814,74 @@ mod tests {
             assert!(cache.acquire(second_raw, small).is_some());
             assert_eq!(cache.bytes, small);
             cache.release(second_raw as usize);
+            assert_eq!(cache.bytes, 0);
+        }
+    }
+
+    /// A copy that must not be left out gets a scratch where `acquire` gives none: with the budget
+    /// held by another list, and with the list's own scratch still executing.
+    #[test]
+    fn sync_scratch_is_given_where_the_budget_or_the_gpu_refuse() {
+        use windows::Win32::Graphics::Direct3D::D3D_FEATURE_LEVEL_11_0;
+
+        unsafe {
+            let mut dev: Option<ID3D12Device> = None;
+            if D3D12CreateDevice(None, D3D_FEATURE_LEVEL_11_0, &mut dev).is_err() {
+                crate::gpu::recomp::runner::skip_test("no GPU");
+                return;
+            }
+            let dev = dev.unwrap();
+            let ty = D3D12_COMMAND_LIST_TYPE_DIRECT;
+            let alloc: ID3D12CommandAllocator = dev.CreateCommandAllocator(ty).unwrap();
+            let first: ID3D12GraphicsCommandList = dev.CreateCommandList(0, ty, &alloc, None).unwrap();
+            first.Close().unwrap();
+            let second: ID3D12GraphicsCommandList = dev.CreateCommandList(0, ty, &alloc, None).unwrap();
+            let fence: ID3D12Fence = dev.CreateFence(0, D3D12_FENCE_FLAG_NONE).unwrap();
+            let mut cache = CopyScratchCache::default();
+            let small = D3D12_DEFAULT_RESOURCE_PLACEMENT_ALIGNMENT as u64;
+            let band = SYNC_SCRATCH_BAND;
+            let (first_raw, second_raw) = (first.as_raw(), second.as_raw());
+
+            // the budget is with another list for as long as that one lives
+            assert_eq!(cache.acquire(first_raw, MAX_COPY_SCRATCH).unwrap().1, MAX_COPY_SCRATCH);
+            assert!(cache.acquire(second_raw, small).is_none());
+            let given = cache.acquire_for_sync(second_raw, band, small).unwrap();
+            assert_eq!(given.1, band);
+            assert_eq!(cache.bytes, MAX_COPY_SCRATCH + band);
+            // the same one for the rest of the recording, whatever is asked for
+            assert_eq!(cache.acquire_for_sync(second_raw, 2 * band, small), Some(given));
+            assert!(cache.acquire_for_sync(second_raw, 2 * band, 2 * band).is_none(), "one a recording already uses is not replaced");
+
+            // submitted and reset while the GPU still executes it: set aside, and a new one given
+            let scratch = cache.active.get_mut(&(second_raw as usize)).unwrap();
+            scratch.recorded = false;
+            scratch.marks.insert(fence.as_raw() as usize, (fence.clone(), 1));
+            assert!(cache.acquire(second_raw, small).is_none());
+            let next = cache.acquire_for_sync(second_raw, band, small).unwrap();
+            assert_eq!(next.1, band);
+            assert_eq!(cache.released.len(), 1);
+            assert_eq!(cache.bytes, MAX_COPY_SCRATCH + 2 * band, "the one set aside counts until the GPU is done");
+            fence.Signal(1).unwrap();
+            cache.collect_released();
+            assert!(cache.released.is_empty());
+            assert_eq!(cache.bytes, MAX_COPY_SCRATCH + band);
+
+            // an idle one that is large enough is kept; one that is too small grows
+            cache.active.get_mut(&(second_raw as usize)).unwrap().recorded = false;
+            assert_eq!(cache.acquire_for_sync(second_raw, band, small), Some(next));
+            cache.active.get_mut(&(second_raw as usize)).unwrap().recorded = false;
+            assert_eq!(cache.acquire_for_sync(second_raw, 2 * band, small).unwrap().1, 2 * band);
+            assert_eq!(cache.bytes, MAX_COPY_SCRATCH + 2 * band);
+
+            // the reserve has an end: the smallest that serves is given, then none
+            cache.active.get_mut(&(second_raw as usize)).unwrap().recorded = false;
+            assert_eq!(cache.acquire_for_sync(second_raw, 2 * SYNC_SCRATCH_RESERVE, small).unwrap().1, 2 * band, "the idle one serves when the larger one has no room");
+            cache.release(second_raw as usize);
+            assert_eq!(cache.bytes, MAX_COPY_SCRATCH);
+            assert_eq!(cache.acquire_for_sync(second_raw, 2 * SYNC_SCRATCH_RESERVE, small).unwrap().1, small);
+            cache.release(second_raw as usize);
+            assert!(cache.acquire_for_sync(second_raw, 2 * SYNC_SCRATCH_RESERVE, 2 * SYNC_SCRATCH_RESERVE).is_none());
+            cache.release(first_raw as usize);
             assert_eq!(cache.bytes, 0);
         }
     }
