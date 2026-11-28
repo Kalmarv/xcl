@@ -9113,7 +9113,7 @@ unsafe extern "system" fn cl_clear_rtv(this: *mut c_void, rtv: usize, color: *co
     if let Some(c) = color.as_ref().filter(|c| c.iter().any(|v| v.is_infinite())) {
         log_infinite_clear(rtv, c);
     }
-    if let Some(c) = color.as_ref().filter(|c| c.iter().any(|v| v.is_nan())) {
+    if let Some(c) = color.as_ref().filter(|c| c.iter().any(|v| !v.is_finite())) {
         if let Some(fixed) = integer_clear_bits(rtv, c) {
             return f(this, rtv, &fixed, n, rects);
         }
@@ -9138,10 +9138,11 @@ unsafe fn log_infinite_clear(rtv: usize, c: &[f32; 4]) {
     crate::xlog_info!("D3D12.X: ClearRenderTargetView with infinite channels {bits:08x?} of resource {r:?}: {:?}", d.map(|d| (d.Width, d.Height, d.DepthOrArraySize, d.Format.0)));
 }
 
-/// A NaN channel in a clear of an integer target (`XCL_CLEAR_NAN_BITS=0`: off): the PC converts
-/// each float to the integer it stands for, and a NaN to 0. A title passing a NaN there means its
-/// bits (an all-ones R32_UINT marker comes out as NaN), so that channel gets a float the PC
-/// converts back to them. Other channels stay as given.
+/// A NaN or infinite channel in a clear of an integer target (`XCL_CLEAR_NAN_BITS=0`: off): the PC
+/// converts each float to the integer it stands for, a NaN to 0 and an infinity to the format's
+/// limit. A title passing one there means its bits (an all-ones R32_UINT marker comes out as NaN,
+/// a float +inf kept in an R32_UINT as 0x7f800000), so that channel gets a float the PC converts
+/// back to them. Other channels stay as given.
 unsafe fn integer_clear_bits(rtv: usize, c: &[f32; 4]) -> Option<[f32; 4]> {
     use windows::Win32::Graphics::Dxgi::Common::*;
     static ON: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
@@ -9161,13 +9162,34 @@ unsafe fn integer_clear_bits(rtv: usize, c: &[f32; 4]) -> Option<[f32; 4]> {
     };
     static N: AtomicU64 = AtomicU64::new(0);
     if N.fetch_add(1, Ordering::Relaxed) < 4 {
-        crate::xlog_info!("D3D12.X: ClearRenderTargetView of an integer target (format {}) with NaN channels {:08x?}: cleared to their bits", format.0, c.map(f32::to_bits));
+        crate::xlog_info!("D3D12.X: ClearRenderTargetView of an integer target (format {}) with NaN or infinite channels {:08x?}: cleared to their bits", format.0, c.map(f32::to_bits));
     }
-    Some(c.map(|v| match (v.is_nan(), signed) {
-        (false, _) => v,
-        (true, false) => v.to_bits() as f32,
-        (true, true) => v.to_bits() as i32 as f32,
-    }))
+    Some(clear_bits_as_integers(c, signed))
+}
+
+/// `integer_clear_bits`' colour: each NaN or infinite channel as the float whose conversion to the
+/// (unsigned or signed) integer target gives back its bits.
+fn clear_bits_as_integers(c: &[f32; 4], signed: bool) -> [f32; 4] {
+    c.map(|v| match (v.is_finite(), signed) {
+        (true, _) => v,
+        (false, false) => v.to_bits() as f32,
+        (false, true) => v.to_bits() as i32 as f32,
+    })
+}
+
+#[cfg(test)]
+mod integer_clear_tests {
+    use super::clear_bits_as_integers;
+
+    #[test]
+    fn non_finite_channels_of_an_integer_clear_keep_their_bits() {
+        let c = [f32::INFINITY, f32::NEG_INFINITY, f32::from_bits(u32::MAX), 5.0];
+        // what the PC writes for each channel of an R32_UINT / R32_SINT target
+        let uint = clear_bits_as_integers(&c, false).map(|v| v as u32);
+        assert_eq!(uint, [0x7f80_0000, 0xff80_0000, u32::MAX, 5]);
+        let sint = clear_bits_as_integers(&c, true).map(|v| v as i32);
+        assert_eq!(sint, [0x7f80_0000, 0xff80_0000u32 as i32, -1, 5]);
+    }
 }
 
 unsafe extern "system" fn cl_om_set_render_targets(this: *mut c_void, n: u32, rtvs: *const usize, single: i32, dsv: *const usize) {
