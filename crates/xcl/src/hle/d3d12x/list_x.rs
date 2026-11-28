@@ -2897,8 +2897,9 @@ impl CopyScratchCache {
     /// A scratch for a copy that must not be left out: `want` bytes when the list has recorded
     /// with none yet, at least `min` otherwise. Where `acquire` gives up, this one goes on: a
     /// scratch still executing from the list's last submission is set aside for the GPU to finish
-    /// and replaced, and a new one may reach into `SYNC_SCRATCH_RESERVE`. A list keeps its scratch
-    /// while it lives and a title records with more lists than the reserve has scratches for, so
+    /// and replaced, and a new one may reach into `SYNC_SCRATCH_RESERVE` (past it, one of `min` bytes
+    /// where that is one band or less). A list keeps its scratch while it lives and a title
+    /// records with more lists than the reserve has scratches for, so
     /// one made here for a list that has since been reset, and whose work the GPU has done, is
     /// taken over before a new one is made.
     unsafe fn acquire_for_sync(&mut self, list: *mut c_void, want: u64, min: u64) -> Option<(usize, u64)> {
@@ -2932,7 +2933,9 @@ impl CopyScratchCache {
             return Some(given);
         }
         let bytes = if want <= room { want } else { min };
-        if bytes > room {
+        // (a sync that fits one band goes past the reserve: closed lists not yet reset hold their
+        // scratch, and with the reserve theirs a retail title left 8,193 readers stale by 323 s)
+        if bytes > room && min > SYNC_SCRATCH_BAND {
             return None;
         }
         self.insert(list, bytes, device)
@@ -5965,11 +5968,17 @@ mod tests {
             let alloc2: ID3D12CommandAllocator = dev.CreateCommandAllocator(ty).unwrap();
             let third: ID3D12GraphicsCommandList = dev.CreateCommandList(0, ty, &alloc2, None).unwrap();
             let third_raw = third.as_raw();
-            assert!(cache.acquire_for_sync(third_raw, band, small).is_none(), "one a recording uses stays with its list");
+            // (past the reserve, a sync of one band still gets one of its own)
+            let own = cache.acquire_for_sync(third_raw, band, small).unwrap();
+            assert_ne!(own, held, "one a recording uses stays with its list");
+            assert_eq!((own.1, cache.bytes), (small, MAX_COPY_SCRATCH + SYNC_SCRATCH_RESERVE + small));
+            cache.release(third_raw as usize);
             let scratch = cache.active.get_mut(&(second_raw as usize)).unwrap();
             scratch.recorded = false;
             scratch.marks.insert(fence.as_raw() as usize, (fence.clone(), 2));
-            assert!(cache.acquire_for_sync(third_raw, band, small).is_none(), "nor one the GPU still works with");
+            let own = cache.acquire_for_sync(third_raw, band, small).unwrap();
+            assert_ne!(own, held, "nor one the GPU still works with");
+            cache.release(third_raw as usize);
             fence.Signal(2).unwrap();
             assert_eq!(cache.acquire_for_sync(third_raw, band, small), Some(held));
             assert!(!cache.active.contains_key(&(second_raw as usize)));
