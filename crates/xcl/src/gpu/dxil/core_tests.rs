@@ -280,6 +280,7 @@ fn direct_and_hlsl_graphics_stages_link() {
         outputs: vec![el("SV_Target", 0, 64, 3, 0, 0xF)],
         input_ena: 0x302,
         attrs: None,
+        early_depth: false,
     };
     let (vo, po) = (Options { mode: Mode::Vertex(vsi.clone()), wave64: true, ..Default::default() }, Options { mode: Mode::Pixel(psi.clone()), wave64: true, ..Default::default() });
     let hvs = crate::gpu::recomp::dxc::compile(&translate(&vs_code, &vo).unwrap().hlsl, "main", "vs_6_6", &[]).unwrap();
@@ -328,7 +329,7 @@ fn branchy_graphics_stages_validate() {
     }
     // v2 = front face (SPI_PS_INPUT_ENA bit 12 after the two I/J pairs of 0x3)
     let ps_code = body(("EXP", "ENC_EXP", &[("TGT", 0), ("EN", 0xF), ("VSRC0", 4), ("VSRC1", 5), ("VSRC2", 2), ("VSRC3", 5), ("DONE", 1), ("VM", 1)], None));
-    let psi = PsInterface { inputs: vec![sig("SV_Position", 0, 1, 3, 0, 0xF)], outputs: vec![sig("SV_Target", 0, 64, 3, 0, 0xF)], input_ena: 0x1002, attrs: None };
+    let psi = PsInterface { inputs: vec![sig("SV_Position", 0, 1, 3, 0, 0xF)], outputs: vec![sig("SV_Target", 0, 64, 3, 0, 0xF)], input_ena: 0x1002, attrs: None, early_depth: false };
     for wave64 in [true, false] {
         super::kernel::translate_pixel(&ps_code, KernelOptions { wave64, ..ko }, &psi).unwrap_or_else(|e| panic!("PS wave64 {wave64}: {}", &e[..e.len().min(800)]));
     }
@@ -351,7 +352,7 @@ fn long_pixel_shader_translates_fast() {
     list.push(("EXP", "ENC_EXP", vec![("TGT", 0), ("EN", 0xF), ("VSRC0", 4), ("VSRC1", 5), ("VSRC2", 6), ("VSRC3", 7), ("DONE", 1), ("VM", 1)], None));
     let refs: Vec<(&str, &str, &[(&str, u64)], Option<u32>)> = list.iter().map(|(a, b, c, d)| (*a, *b, c.as_slice(), *d)).collect();
     let code = prog(&refs);
-    let psi = PsInterface { inputs: vec![sig("SV_Position", 0, 1, 3, 0, 0xF)], outputs: vec![sig("SV_Target", 0, 64, 3, 0, 0xF)], input_ena: 0x2, attrs: None };
+    let psi = PsInterface { inputs: vec![sig("SV_Position", 0, 1, 3, 0, 0xF)], outputs: vec![sig("SV_Target", 0, 64, 3, 0, 0xF)], input_ena: 0x2, attrs: None, early_depth: false };
     let t = std::time::Instant::now();
     let k = super::kernel::translate_pixel(&code, KernelOptions { wave64: true, split: false, mem_windows: 1, sampler_base: 0 }, &psi).unwrap_or_else(|e| panic!("{}", &e[..e.len().min(800)]));
     println!("3000 instructions: {:?}, {} B", t.elapsed(), k.dxil.len());
@@ -401,6 +402,7 @@ fn graphics_stages_with_a_branch_before_their_exports() {
         outputs: vec![el("SV_Target", 0, 64, 3, 0, 0xF)],
         input_ena: 0x302,
         attrs: None,
+        early_depth: false,
     };
     let ko = KernelOptions { wave64: true, split: false, mem_windows: 1, sampler_base: 0 };
     let dvs = super::kernel::translate_vertex(&vs_code, ko, &vsi).unwrap_or_else(|e| panic!("VS: {}", &e[..e.len().min(600)])).dxil;
@@ -588,7 +590,7 @@ fn ps_get_lod_with_a_static_sampler() {
     list.push(("EXP", "ENC_EXP", vec![("TGT", 0), ("EN", 0xF), ("VSRC0", 4), ("VSRC1", 5), ("VSRC2", 6), ("VSRC3", 7), ("DONE", 1), ("VM", 1)], None));
     let refs: Vec<(&str, &str, &[(&str, u64)], Option<u32>)> = list.iter().map(|(a, b, c, d)| (*a, *b, c.as_slice(), *d)).collect();
     let code = prog(&refs);
-    let psi = PsInterface { inputs: vec![sig("SV_Position", 0, 1, 3, 0, 0xF)], outputs: vec![sig("SV_Target", 0, 64, 3, 0, 0xF)], input_ena: 0x2, attrs: None };
+    let psi = PsInterface { inputs: vec![sig("SV_Position", 0, 1, 3, 0, 0xF)], outputs: vec![sig("SV_Target", 0, 64, 3, 0, 0xF)], input_ena: 0x2, attrs: None, early_depth: false };
     let ko = KernelOptions { wave64: true, split: false, mem_windows: 1, sampler_base: 0 };
     let k = super::kernel::translate_pixel(&code, ko, &psi).unwrap_or_else(|e| panic!("{}", &e[..e.len().min(800)]));
     assert_eq!(k.static_samplers, vec![(linear, false)], "one static sampler, shared by get_lod and sample");
@@ -1223,6 +1225,7 @@ fn raw_loads_in_root_windows_are_branchless() {
         outputs: vec![sig("SV_Target", 0, 64, 3, 0, 0xF)],
         input_ena: 0x2,
         attrs: None,
+        early_depth: false,
     };
     let ps_k = super::kernel::translate_pixel(&ps_code, KernelOptions { wave64: false, split: false, mem_windows: 4, sampler_base: 0 }, &psi)
         .expect("pixel shader multi-window load translates");
@@ -1410,5 +1413,49 @@ fn compute_lds_reservation_matches_descriptor_and_lane_storage() {
         let dis = super::validate::disassemble(&dxil).unwrap();
         let words = if super::kernel::declared_lds_enabled() { expected } else { 8192 };
         assert!(dis.contains(&format!("@xcl_lds = external addrspace(3) global [{words} x i32]")), "{threads:?}, {blocks}, split={split}");
+    }
+}
+/// A console PS with DB_SHADER_CONTROL.DEPTH_BEFORE_SHADER (`PsInterface::early_depth`) gets
+/// `[earlydepthstencil]` on the HLSL path and the ForceEarlyDepthStencil shader flag (bit 3) on
+/// both paths, also when it exports depth; without it, neither.
+#[test]
+fn early_depth_pixel_shaders_test_depth_first_on_both_paths() {
+    use crate::gpu::recomp::{dxc, runner, translate, Mode, Options, PsInterface};
+    if dxc::location().is_err() {
+        return runner::skip_test("no DXC");
+    }
+    // the shader flags of the entry (`!{i32 0, i64 <flags>, ...}`)
+    let early_flag = |c: &[u8]| {
+        let dis = super::validate::disassemble(c).unwrap_or_else(|e| panic!("{e}"));
+        dis.match_indices("!{i32 0, i64 ").any(|(i, m)| {
+            let n: String = dis[i + m.len()..].chars().take_while(char::is_ascii_digit).collect();
+            n.parse::<u64>().is_ok_and(|f| f & 8 != 0)
+        })
+    };
+    let color = ("EXP", "ENC_EXP", &[("TGT", 0), ("EN", 0xF), ("VSRC0", 4), ("VSRC1", 4), ("VSRC2", 4), ("VSRC3", 4), ("DONE", 1), ("VM", 1)][..], None);
+    let target = sig("SV_Target", 0, 64, 3, 0, 0xF);
+    let cases = [
+        ("color", prog(&[("V_MOV_B32", "ENC_VOP1", &[("VDST", 4), ("SRC0", 242)], None), color]), vec![target.clone()]),
+        (
+            "color and depth",
+            prog(&[
+                ("V_MOV_B32", "ENC_VOP1", &[("VDST", 4), ("SRC0", 240)], None),
+                ("EXP", "ENC_EXP", &[("TGT", 8), ("EN", 0x1), ("VSRC0", 4), ("VSRC1", 4), ("VSRC2", 4), ("VSRC3", 4)], None),
+                color,
+            ]),
+            vec![target, sig("SV_Depth", 0, 65, 3, u32::MAX, 0x1)],
+        ),
+    ];
+    let ko = KernelOptions { wave64: true, split: false, mem_windows: 1, sampler_base: 0 };
+    for (name, code, outputs) in &cases {
+        for early_depth in [false, true] {
+            let psi = PsInterface { inputs: vec![sig("SV_Position", 0, 1, 3, 0, 0xF)], outputs: outputs.clone(), input_ena: 0x2, attrs: None, early_depth };
+            let t = translate(code, &Options { mode: Mode::Pixel(psi.clone()), wave64: true, ..Default::default() }).unwrap();
+            assert_eq!(t.hlsl.contains("[earlydepthstencil]\nXclOut main("), early_depth, "{name}, early {early_depth}: HLSL\n{}", t.hlsl);
+            let hlsl = dxc::compile(&t.hlsl, "main", "ps_6_6", &[]).unwrap_or_else(|e| panic!("{name}, early {early_depth}: {e}\n{}", t.hlsl));
+            assert_eq!(early_flag(&hlsl), early_depth, "{name}, early {early_depth}: HLSL path's shader flags");
+            let direct = super::kernel::translate_pixel(code, ko, &psi).unwrap_or_else(|e| panic!("{name}, early {early_depth}: {}", &e[..e.len().min(800)]));
+            assert_eq!(early_flag(&direct.dxil), early_depth, "{name}, early {early_depth}: direct path's shader flags");
+        }
     }
 }
