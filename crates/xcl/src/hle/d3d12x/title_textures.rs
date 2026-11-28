@@ -885,14 +885,26 @@ pub fn note_gpu_write(list: usize, res: usize) {
                 super::vram::map_levels(r, None);
             }
         }
-        if let Some((va, bytes, by, evicted)) = super::vram::unpaged_write(res) {
-            if let Some(n) = unpaged_write_logged(res) {
-                crate::xlog_info!(
-                    "D3D12.X: GPU write #{n} into texture {res:#x} with no pages, not mapped (console {va:#x}, {bytes:#x} bytes): superseded by {:#x} (console {:#x}){}; its texels go to unmapped tiles",
-                    by.0, by.1,
-                    if evicted { ", evicted unviewed" } else { "" }
-                );
+        match super::vram::unpaged_write(res) {
+            Some(super::vram::UnpagedWrite::NoPages { va, bytes, mapped, groups, gpu_owned, by, evicted }) => {
+                if let Some(n) = unpaged_write_logged(res) {
+                    crate::xlog_info!(
+                        "D3D12.X: GPU write #{n} into texture {res:#x} with no pages, {} (console {va:#x}, {bytes:#x} bytes; {}{}): superseded by {:#x} (console {:#x}){}; its texels go to unmapped tiles",
+                        if mapped { "mapped" } else { "not mapped" },
+                        groups.map_or("all its pages at once".to_string(), |(k, n)| format!("lazy levels, {k} of {n} groups with pages")),
+                        if gpu_owned { ", GPU-owned" } else { "" },
+                        by.0, by.1,
+                        if evicted { ", evicted unviewed" } else { "" }
+                    );
+                }
             }
+            Some(super::vram::UnpagedWrite::NotTracked) => {
+                if let Some(n) = unpaged_write_logged(res) {
+                    let at = super::real::title_address(res);
+                    crate::xlog_info!("D3D12.X: GPU write #{n} into resource {res:#x}, which the level table does not hold (console {})", at.map_or("unknown".to_string(), |a| format!("{a:#x}")));
+                }
+            }
+            None => {}
         }
     }
     let (mut marked, mut kept) = (false, false);

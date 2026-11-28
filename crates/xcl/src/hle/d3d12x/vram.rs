@@ -1541,24 +1541,49 @@ static REVIVED_TOTAL: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU6
 /// The newer placement that superseded each placed texture (`placements::placed`), for
 /// `unpaged_write`'s log.
 static SUPERSEDED_BY: Mutex<Option<std::collections::HashMap<usize, (usize, usize)>>> = Mutex::new(None);
-/// GPU writes into a texture that is not mapped and has no pages (`unpaged_write`).
-static UNPAGED_WRITES: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
+/// GPU writes into a texture with no pages that is not mapped / mapped, and into a resource the
+/// level table does not hold (`unpaged_write`).
+static UNPAGED_WRITES: [std::sync::atomic::AtomicU64; 3] = [const { std::sync::atomic::AtomicU64::new(0) }; 3];
 
-/// A GPU write into texture `res` after `map_levels`: when it is not mapped and has no pages (its
-/// bytes go to unmapped tiles), counted, and Some((console address, bytes, the placement that
-/// superseded it and its console address ((0, 0): none known), evicted unviewed)).
-pub(super) fn unpaged_write(res: usize) -> Option<(usize, u64, (usize, usize), bool)> {
-    let (va, bytes) = {
+/// What `unpaged_write` found for a GPU write.
+pub(super) enum UnpagedWrite {
+    /// the level table holds no target for the resource
+    NotTracked,
+    /// a target with no pages after `map_levels`: its texels go to unmapped tiles
+    NoPages {
+        va: usize,
+        bytes: u64,
+        mapped: bool,
+        /// lazy level groups with pages, of all (None: it gets all its pages at once)
+        groups: Option<(usize, usize)>,
+        gpu_owned: bool,
+        /// the placement that superseded it and its console address ((0, 0): none known)
+        by: (usize, usize),
+        evicted: bool,
+    },
+}
+
+/// A GPU write into texture `res` after `map_levels`: None when its target has pages; else
+/// counted, and what it is.
+pub(super) fn unpaged_write(res: usize) -> Option<UnpagedWrite> {
+    let found = {
         let g = PAGES.lock().unwrap();
-        let t = g.values().flatten().find_map(|p| p.targets.get(&res))?;
-        if t.mapped || !t.used.is_empty() || !t.used_extra.is_empty() {
-            return None;
-        }
-        (t.va, t.console_bytes.unwrap_or(t.total as u64 * PAGE as u64))
+        g.values().flatten().find_map(|p| p.targets.get(&res)).map(|t| {
+            let empty = t.used.is_empty() && t.used_extra.is_empty();
+            let groups = t.levels.as_ref().map(|l| (l.groups.iter().filter(|g| g.3).count(), l.groups.len()));
+            (empty, t.va, t.console_bytes.unwrap_or(t.total as u64 * PAGE as u64), t.mapped, groups, t.gpu_owned)
+        })
     };
-    UNPAGED_WRITES.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+    let Some((empty, va, bytes, mapped, groups, gpu_owned)) = found else {
+        UNPAGED_WRITES[2].fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+        return Some(UnpagedWrite::NotTracked);
+    };
+    if !empty {
+        return None;
+    }
+    UNPAGED_WRITES[mapped as usize].fetch_add(1, std::sync::atomic::Ordering::Relaxed);
     let by = SUPERSEDED_BY.lock().unwrap().as_ref().and_then(|m| m.get(&res).copied()).unwrap_or((0, 0));
-    Some((va, bytes, by, EVICTED_UNVIEWED.contains(res)))
+    Some(UnpagedWrite::NoPages { va, bytes, mapped, groups, gpu_owned, by, evicted: EVICTED_UNVIEWED.contains(res) })
 }
 
 pub(super) fn has_evicted_unviewed() -> bool {
@@ -1759,8 +1784,11 @@ pub(super) unsafe fn before_execute(queue: &ID3D12CommandQueue) {
             let tot = EVICTED_TOTAL.load(std::sync::atomic::Ordering::Relaxed);
             let rev = REVIVED_TOTAL.load(std::sync::atomic::Ordering::Relaxed);
             crate::xlog_info!(
-                "D3D12.X: evict unviewed: -{evicted_now} sampled textures ({cur} evicted now, {tot} total, {rev} revived; skipped: missing={}, shadowed={}, gpu_written={}, target={}, pending={}, unmapped={}); GPU writes into unmapped textures with no pages: {}",
-                skip[0], skip[1], skip[2], skip[3], skip[4], skip[5], UNPAGED_WRITES.load(std::sync::atomic::Ordering::Relaxed)
+                "D3D12.X: evict unviewed: -{evicted_now} sampled textures ({cur} evicted now, {tot} total, {rev} revived; skipped: missing={}, shadowed={}, gpu_written={}, target={}, pending={}, unmapped={}); GPU writes into textures with no pages: {} not mapped, {} mapped; into resources not in the level table: {}",
+                skip[0], skip[1], skip[2], skip[3], skip[4], skip[5],
+                UNPAGED_WRITES[0].load(std::sync::atomic::Ordering::Relaxed),
+                UNPAGED_WRITES[1].load(std::sync::atomic::Ordering::Relaxed),
+                UNPAGED_WRITES[2].load(std::sync::atomic::Ordering::Relaxed)
             );
         }
     }
@@ -2166,6 +2194,14 @@ mod tests {
     use std::time::{Duration, Instant};
 
     const MIB: usize = 1 << 20;
+
+    /// A GPU write into a resource the level table holds no target for is told apart and counted.
+    #[test]
+    fn a_gpu_write_into_a_resource_the_level_table_does_not_hold_is_counted() {
+        let before = UNPAGED_WRITES[2].load(std::sync::atomic::Ordering::Relaxed);
+        assert!(matches!(unpaged_write(0x7e57_0000_3000), Some(UnpagedWrite::NotTracked)));
+        assert!(UNPAGED_WRITES[2].load(std::sync::atomic::Ordering::Relaxed) > before);
+    }
 
     /// `remove_once_each` takes one occurrence for each time an item is named, keeps the rest
     /// (duplicates too) and items not named, and leaves the list as it was for nothing to take.
