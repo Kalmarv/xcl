@@ -799,18 +799,24 @@ const ZERO_HASHES: [u64; CHUNKS] = [ZERO_HASH; CHUNKS];
 #[inline(always)]
 fn read_chunk_words(c: &[u8]) -> [u64; 8] {
     debug_assert_eq!(c.len(), CHUNK);
-    let p = c.as_ptr() as *const [u8; 8];
-    unsafe {
-        [
-            u64::from_le_bytes(p.add(0).read_unaligned()),
-            u64::from_le_bytes(p.add(1).read_unaligned()),
-            u64::from_le_bytes(p.add(2).read_unaligned()),
-            u64::from_le_bytes(p.add(3).read_unaligned()),
-            u64::from_le_bytes(p.add(4).read_unaligned()),
-            u64::from_le_bytes(p.add(5).read_unaligned()),
-            u64::from_le_bytes(p.add(6).read_unaligned()),
-            u64::from_le_bytes(p.add(7).read_unaligned()),
-        ]
+    let p = c.as_ptr();
+    if (p as usize) & 7 == 0 {
+        // Fast path for 8-byte aligned chunks (which covers all page-aligned chunks).
+        unsafe { *(p as *const [u64; 8]) }
+    } else {
+        let b = p as *const [u8; 8];
+        unsafe {
+            [
+                u64::from_le_bytes(b.add(0).read_unaligned()),
+                u64::from_le_bytes(b.add(1).read_unaligned()),
+                u64::from_le_bytes(b.add(2).read_unaligned()),
+                u64::from_le_bytes(b.add(3).read_unaligned()),
+                u64::from_le_bytes(b.add(4).read_unaligned()),
+                u64::from_le_bytes(b.add(5).read_unaligned()),
+                u64::from_le_bytes(b.add(6).read_unaligned()),
+                u64::from_le_bytes(b.add(7).read_unaligned()),
+            ]
+        }
     }
 }
 
@@ -872,7 +878,11 @@ pub(super) fn note_look() {
 fn scan_page(page: &[u8], pg: usize, slot: &mut Option<Box<[u64; CHUNKS]>>, out: &mut Vec<(usize, usize)>) {
     if let Some(sent) = slot.as_deref_mut() {
         for (k, c) in page.chunks_exact(CHUNK).enumerate() {
-            let h = chunk_hash(c);
+            let w = read_chunk_words(c);
+            if sent[k] == ZERO_HASH && (w[0] | w[1] | w[2] | w[3] | w[4] | w[5] | w[6] | w[7]) == 0 {
+                continue;
+            }
+            let h = hash_words(w);
             if h == sent[k] {
                 continue;
             }
@@ -897,7 +907,11 @@ fn scan_page(page: &[u8], pg: usize, slot: &mut Option<Box<[u64; CHUNKS]>>, out:
         sent[k] = h;
         push_run(out, pg + k * CHUNK, CHUNK);
         for (k2, c2) in chunks {
-            let h2 = chunk_hash(c2);
+            let w2 = read_chunk_words(c2);
+            if (w2[0] | w2[1] | w2[2] | w2[3] | w2[4] | w2[5] | w2[6] | w2[7]) == 0 {
+                continue;
+            }
+            let h2 = hash_words(w2);
             if h2 == ZERO_HASH {
                 continue;
             }
@@ -4734,12 +4748,21 @@ pub unsafe fn place_buffer(this: *mut c_void, va: usize, desc: &D3D12_RESOURCE_D
     // (`XCL_VIEW_POISON`: its tiles without video memory show the poison tile as the window's do)
     s.poison_all(&res, (delta + bytes).div_ceil(TILE) as u32);
     s.map_tiles(&res, start, &tiles);
+    record_buffer(&mut g, raw as usize, tiles);
+    g.as_mut()?.signal();
+    Some((hr, delta))
+}
+
+/// The tiles a new placed buffer at `raw` pins. A buffer released while the state was held
+/// (`place_buffer` holds it across `CreateReservedResource`) is let go first: its address can be
+/// `raw`, and letting it go later would let the new buffer go with it (#2457).
+fn record_buffer(g: &mut Option<State>, raw: usize, tiles: Vec<(usize, (u32, u32))>) {
+    forget_released(g);
+    let Some(s) = g.as_mut() else { return };
     for &(_, tile) in &tiles {
         *s.pinned.entry(tile).or_default() += 1;
     }
-    s.buffers.insert(raw as usize, tiles);
-    s.signal();
-    Some((hr, delta))
+    s.buffers.insert(raw, tiles);
 }
 
 /// Placed buffers released while `STATE` was held, let go by the next `lock_state`. Held only
@@ -5502,6 +5525,31 @@ mod tests {
         }
     }
 
+    /// A placed buffer released while `place_buffer` held the state (inside its
+    /// `CreateReservedResource`) can leave its address to the new buffer: it is let go before
+    /// the new one is recorded, so the next `lock_state` does not let the new one go (#2457).
+    #[test]
+    fn a_buffer_released_during_a_placement_does_not_take_the_new_one_with_it() {
+        const RES: usize = 0x7ff0_beef_0000;
+        let (old, new) = ((7, 1), (7, 2));
+        let at = |tile| vec![(RES, tile)];
+        let mut g = Some(unsafe { test_state() });
+        record_buffer(&mut g, RES, at(old));
+        // the old buffer's last Release while the state was held, then the new one at its address
+        FORGOTTEN.lock().unwrap().push(RES);
+        record_buffer(&mut g, RES, at(new));
+        // the next `lock_state`
+        forget_released(&mut g);
+        let s = g.as_ref().unwrap();
+        assert_eq!(s.buffers.get(&RES), Some(&at(new)), "the new buffer was let go");
+        assert_eq!(s.pinned.get(&new), Some(&1));
+        assert!(!s.pinned.contains_key(&old), "the old buffer's tile is still pinned");
+    }
+
+    /// A state over the test device, with no windows or pools.
+    unsafe fn test_state() -> State {
+        new_state(&test_device(), Vec::new()).expect("state")
+    }
 
     /// Freeing the last tile in use of a pool and taking a tile again takes the retired pool
     /// back, not a new heap each time (#913: 288 pools of 64 MB, 18 GB asked of a 12 GB card).
