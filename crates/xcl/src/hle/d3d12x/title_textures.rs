@@ -1135,6 +1135,73 @@ pub(super) fn shadow_census() {
         c[5],
         top.join("; ")
     );
+    shadow_dump(now);
+}
+
+/// `XCL_SHADOW_DUMP=<folder>` with `shadow_check`: every 30 s a file `unpaged-<seconds>.txt`
+/// there, a line for each texture on the pages that an SRV of the shared heap names and that has
+/// no page now: its first slot there and how many name it, why it has none (under another
+/// placement and which, evicted, levels that never had texels, an upload still due), and how many
+/// of the first bytes of its source (64 KiB at most) are not zero now.
+fn shadow_dump(now: u64) {
+    static DIR: std::sync::OnceLock<Option<std::path::PathBuf>> = std::sync::OnceLock::new();
+    let Some(dir) = DIR.get_or_init(|| std::env::var_os("XCL_SHADOW_DUMP").filter(|d| !d.is_empty()).map(std::path::PathBuf::from)) else { return };
+    static LAST: AtomicU64 = AtomicU64::new(0);
+    let last = LAST.load(Ordering::Relaxed);
+    if (last != 0 && now < last + 30) || LAST.compare_exchange(last, now, Ordering::Relaxed, Ordering::Relaxed).is_err() {
+        return;
+    }
+    let mut slots: BTreeMap<usize, (u32, u32)> = BTreeMap::new();
+    for (i, r) in super::console_heap::named_srvs() {
+        slots.entry(r).or_insert((i, 0)).1 += 1;
+    }
+    let res: Vec<usize> = slots.keys().copied().collect();
+    let bare = super::vram::without_pages(&res);
+    // (slot, views, resource, address, where its texels are read, bytes to read there or 0, text)
+    let mut rows: Vec<(u32, u32, usize, usize, usize, usize, String)> = Vec::with_capacity(bare.len());
+    {
+        let t = TEXTURES.lock().unwrap();
+        let sup = SUPERSEDED.lock().unwrap();
+        for &(r, va, mapped, gpu_owned, levels, evicted) in &bare {
+            let (slot, views) = slots[&r];
+            let entry = t.by_res.get(&r).map(|e| ("active", e)).or_else(|| t.shadowed.get(&r).map(|e| ("shadowed", e)));
+            let (state, shape, src, size) = match entry {
+                Some((what, e)) => (
+                    format!("{what}{}{}{}{}{}", if e.pending { ", upload due" } else { "" }, if e.gpu_written { ", GPU-written" } else { "" }, if e.unmapped { ", unmapped" } else { "" }, if e.target { ", target" } else { "" }, if e.paged { ", source on kept pages" } else { "" }),
+                    shadow_shape(&e.tex),
+                    e.src,
+                    if e.paged { 0 } else { e.tex.size() as usize },
+                ),
+                None => ("not a title texture".to_string(), String::new(), 0, 0),
+            };
+            let pages = match levels {
+                Some((n, with)) => format!("lazy levels, {with} of {n} groups with pages"),
+                None => "all its pages at once".to_string(),
+            };
+            let under = sup.get(&r).map_or(String::new(), |s| format!("; under {} at {:#x}..{:#x}", s.by.as_deref().unwrap_or("a GPU-owned placement"), s.by_va, s.by_end));
+            let text = format!("{shape}; {state}; {pages}; {}{}{}{under}", if mapped { "mapped" } else { "not mapped" }, if gpu_owned { ", GPU-owned" } else { "" }, if evicted { ", evicted" } else { "" });
+            rows.push((slot, views, r, va, src, size.min(0x10000), text));
+        }
+    }
+    rows.sort_unstable_by_key(|r| r.0);
+    let mut out = String::with_capacity(rows.len() * 160);
+    // what one file reads of the title's memory at most
+    let mut budget = 64usize << 20;
+    for (slot, views, r, va, src, size, text) in rows {
+        let source = if size == 0 || size > budget {
+            String::new()
+        } else {
+            budget -= size;
+            // SAFETY: `read_committed` copies the readable pages and gives zeros for the rest
+            let b = unsafe { read_committed(src, size) };
+            format!("; source at {src:#x} now: {} of its first {size} bytes not zero", b.iter().filter(|&&x| x != 0).count())
+        };
+        out.push_str(&format!("slot {slot} ({views} views) res {r:#x} at {va:#x}: {text}{source}\n"));
+    }
+    let path = dir.join(format!("unpaged-{now}.txt"));
+    if let Err(e) = std::fs::write(&path, out) {
+        crate::xlog_warn!("D3D12.X: XCL_SHADOW_DUMP: {}: {e}", path.display());
+    }
 }
 
 /// The PC texture was released for good.

@@ -220,6 +220,16 @@ fn names() -> &'static Names {
     NAMES.get_or_init(|| Names::new(GLOBAL_MAX as usize))
 }
 
+/// The SRVs of the shared heap that name a resource now, as (index, resource): for a diagnostic.
+pub fn named_srvs() -> Vec<(u32, usize)> {
+    let Some(n) = NAMES.get() else { return Vec::new() };
+    let named = |(i, s): (usize, &AtomicUsize)| {
+        let r = s.load(Relaxed);
+        (r != 0 && r != GONE).then_some((i as u32, r))
+    };
+    n.slots.iter().enumerate().step_by(2).filter_map(named).collect()
+}
+
 /// Whether any live slot in the shared shader-visible descriptor heap currently names `res`.
 pub fn has_live_view(res: usize) -> bool {
     NAMES.get().is_some_and(|n| n.has_live(res))

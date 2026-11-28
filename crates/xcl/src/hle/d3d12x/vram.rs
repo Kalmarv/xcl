@@ -2031,6 +2031,24 @@ pub(super) fn has_lazy_levels(resource: usize) -> bool {
     PAGES.lock().unwrap().values().flatten().any(|p| p.targets.get(&resource).is_some_and(|t| t.levels.is_some()))
 }
 
+/// Of the textures `res` the ones here that have no page now (`title_textures::shadow_dump`):
+/// the resource, its address, whether it counts as mapped, whether it is GPU-owned, its
+/// lazy levels as (groups, groups with pages) when it has them, and whether it was evicted
+/// while unviewed.
+pub(super) fn without_pages(res: &[usize]) -> Vec<(usize, usize, bool, bool, Option<(u32, u32)>, bool)> {
+    let g = PAGES.lock().unwrap();
+    let mut out = Vec::new();
+    for &r in res {
+        let Some(t) = g.values().flatten().find_map(|p| p.targets.get(&r)) else { continue };
+        if !t.used.is_empty() || !t.used_extra.is_empty() {
+            continue;
+        }
+        let levels = t.levels.as_ref().map(|l| (l.groups.len() as u32, l.groups.iter().filter(|g| g.3).count() as u32));
+        out.push((r, t.va, t.mapped, t.gpu_owned, levels, EVICTED_UNVIEWED.contains(r)));
+    }
+    out
+}
+
 /// Whether `resource` is a texture with lazy levels of which some have no pages yet.
 pub(super) fn has_unmapped_levels(resource: usize) -> bool {
     PAGES.lock().unwrap().values().flatten().any(|p| p.targets.get(&resource).and_then(|t| t.levels.as_ref()).is_some_and(|l| l.groups.iter().any(|g| !g.3)))
