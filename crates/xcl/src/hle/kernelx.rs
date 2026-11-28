@@ -538,6 +538,8 @@ pub mod mirrors {
         let mut out = Mapped::default();
         // (the GPU-view pages that show something else now)
         let mut changed: Vec<usize> = Vec::new();
+        // (the GPU-view pages now mapped to a tile-backed physical page)
+        let mut mapped_tiles: Vec<usize> = Vec::new();
         for (g, to) in changes {
             if !in_view(g) {
                 out.elsewhere += 1;
@@ -554,6 +556,9 @@ pub mod mirrors {
                 }
                 Some((page, at, tile)) => {
                     out.mapped += 1;
+                    if tile {
+                        mapped_tiles.push(g);
+                    }
                     pages.set(g, page, at, tile, call)
                 }
             };
@@ -566,6 +571,7 @@ pub mod mirrors {
         // (the tiles over them are linked again at the next submit)
         crate::hle::d3d12x::sparse::remapped(&changed);
         drop(away);
+        crate::hle::d3d12x::sparse::ask_mapped_tiles(&mapped_tiles);
         Some(out)
     }
 

@@ -900,11 +900,14 @@ struct MirrorCounts {
 /// Diagnostics of the GPU-view tiles, all off unless set: `XCL_VIEW_KEEP=1` (a tile over a CPU
 /// view keeps its video memory once filled, within `mirror_cap`), `XCL_VIEW_POISON=1` (or a
 /// 32-bit pattern, `0x…`: what a tile of the windows without video memory reads instead of zeros,
-/// `State::poison_windows`) and `XCL_VIEW_STATS=1`. Any of them logs `view_stats_line` every 2 s.
+/// `State::poison_windows`), `XCL_VIEW_ASK_MAPPED=1` (GPU-view pages mapped by
+/// `CopyPageMappingsBatchX` are asked for even without a D3D12 API view naming them) and
+/// `XCL_VIEW_STATS=1`. Keep/poison/stats log `view_stats_line` every 2 s.
 struct ViewSwitches {
     keep: bool,
     poison: Option<u32>,
     stats: bool,
+    ask_mapped: bool,
 }
 
 fn view_switches() -> &'static ViewSwitches {
@@ -912,7 +915,8 @@ fn view_switches() -> &'static ViewSwitches {
     ON.get_or_init(|| {
         let var = |k: &str| std::env::var(k).ok().map(|v| v.trim().to_string()).filter(|v| !v.is_empty() && v != "0");
         let (keep, poison) = (var("XCL_VIEW_KEEP").is_some(), poison_pattern(var("XCL_VIEW_POISON").as_deref()));
-        ViewSwitches { keep, poison, stats: keep || poison.is_some() || var("XCL_VIEW_STATS").is_some() }
+        let ask_mapped = var("XCL_VIEW_ASK_MAPPED").is_some();
+        ViewSwitches { keep, poison, stats: keep || poison.is_some() || var("XCL_VIEW_STATS").is_some(), ask_mapped }
     })
 }
 
@@ -3762,6 +3766,26 @@ pub fn remapped(tiles: &[usize]) {
     }
     REMAPS.lock().unwrap().extend(asked);
     REMAPPING.store(true, Ordering::Release);
+}
+
+/// (`XCL_VIEW_ASK_MAPPED=1`): GPU-view tiles explicitly mapped to a physical page by
+/// `CopyPageMappingsBatchX` are asked for (`map_mirror`) even if no D3D12 API call named their
+/// address (bindless GPU pointers into view windows). Off by default.
+pub fn ask_mapped_tiles(tiles: &[usize]) -> usize {
+    if tiles.is_empty() || !view_switches().ask_mapped {
+        return 0;
+    }
+    static ONCE: std::sync::Once = std::sync::Once::new();
+    ONCE.call_once(|| crate::xlog_info!("D3D12.X: XCL_VIEW_ASK_MAPPED=1: asking for GPU-view tiles mapped by CopyPageMappingsBatchX"));
+    ask_mapped_tiles_now(tiles)
+}
+
+fn ask_mapped_tiles_now(tiles: &[usize]) -> usize {
+    let mut queued = 0;
+    for &t in tiles {
+        queued += map_mirror(t, TILE);
+    }
+    queued
 }
 
 /// The tiles of `q` (`REMAPS`) join those waiting to be linked again (`State::remaps`). Past
@@ -7139,6 +7163,23 @@ mod tests {
         forget_mirrors(AT, 4 * TILE);
         assert!(!MIRROR_ASKED.contains(AT) && !MIRROR_ASKS.lock().unwrap().contains(&AT), "forgotten tiles may be asked for again");
         assert!(mirror_asks_forgotten() >= before + 4, "whoever remembers having asked for them is told");
+    }
+
+    #[test]
+    fn ask_mapped_tiles_queues_unasked_view_pages_once() {
+        const AT: usize = 0x7ff5_0000_0000;
+        let pages = [AT, AT + TILE, AT + 3 * TILE];
+        let asked = returns_while_the_state_is_held(move || {
+            assert_eq!(ask_mapped_tiles_now(&pages), 3, "three unasked mapped tiles queued");
+            assert_eq!(ask_mapped_tiles_now(&pages), 0, "already-asked tiles are not queued twice");
+            let asks = MIRROR_ASKS.lock().unwrap();
+            for &p in &pages {
+                assert!(MIRROR_ASKED.contains(p), "tile {p:#x} recorded in MIRROR_ASKED");
+                assert_eq!(asks.iter().filter(|&&t| t == p).count(), 1, "tile {p:#x} queued once");
+            }
+        });
+        assert!(asked, "ask_mapped_tiles_now waited for the sparse state's lock");
+        forget_mirrors(AT, 4 * TILE);
     }
 
     /// A thread asks for a tile while `forget_mirrors` forgets it: once the forget is done the
