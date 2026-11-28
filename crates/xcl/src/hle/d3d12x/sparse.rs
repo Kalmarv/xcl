@@ -4165,8 +4165,8 @@ impl State {
         true
     }
 
-    /// `XCL_VIEW_STALE_CHECK=1`: once a second, up to `STALE_PAGES` committed pages of the GPU-view
-    /// tiles with video memory (in turn, from where the last check stopped) are compared with what
+    /// `XCL_VIEW_STALE_CHECK=1`: once a second, up to `STALE_PAGES` committed pages of the tiles
+    /// with video memory (the windows' own and those of GPU views) (in turn, from where the last check stopped) are compared with what
     /// was sent for them. A page whose CPU bytes differ at two checks in a row is logged: its tile
     /// shows old bytes (or zeros: none sent while the CPU page has data) that no look sends. A page
     /// written between two checks and sent at the submit between them differs at one only.
@@ -4180,7 +4180,7 @@ impl State {
         }
         st.at = Some(std::time::Instant::now());
         if st.order.is_empty() {
-            st.order = self.mapped.iter().filter(|(_, e)| e.src != 0).map(|(&w, _)| w).collect();
+            st.order = self.mapped.keys().copied().collect();
             st.order.sort_unstable();
             st.next = 0;
         }
@@ -4189,13 +4189,15 @@ impl State {
         while pages < STALE_PAGES && st.next < st.order.len() {
             let w = st.order[st.next];
             st.next += 1;
-            let Some(e) = self.mapped.get(&w).filter(|e| e.src != 0 && e.pool != LAZY) else { continue };
+            let Some(e) = self.mapped.get(&w).filter(|e| e.pool != LAZY) else { continue };
+            // (a tile of a GPU view reads its CPU view; one of the windows' own, its own address)
+            let cpu = if e.src != 0 { e.src } else { w };
             for idx in 0..PAGES_PER_TILE {
                 if e.holes & (1 << idx) != 0 {
                     continue;
                 }
                 pages += 1;
-                let bytes = std::slice::from_raw_parts((e.src + idx * PAGE) as *const u8, PAGE);
+                let bytes = std::slice::from_raw_parts((cpu + idx * PAGE) as *const u8, PAGE);
                 let (d, none_sent) = page_differs(bytes, e.sent[idx].as_deref());
                 if d {
                     let pg = w + idx * PAGE;
@@ -4219,7 +4221,7 @@ impl State {
         };
         let shown: Vec<String> = again.iter().take(8).map(|&(pg, z)| format!("{}{}", at(pg), if z { " (none sent)" } else { "" })).collect();
         crate::xlog_info!(
-            "XCL_VIEW_STALE_CHECK: {pages} GPU-view pages checked, {differ} differ from what was sent ({unsent} with none sent while the CPU page has data), {} at two checks in a row{}{}",
+            "XCL_VIEW_STALE_CHECK: {pages} window pages checked, {differ} differ from what was sent ({unsent} with none sent while the CPU page has data), {} at two checks in a row{}{}",
             again.len(),
             if shown.is_empty() { "" } else { ": " },
             shown.join(", ")
