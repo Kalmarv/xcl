@@ -339,7 +339,7 @@ fn geometry_msg_gs_done_emit_and_cut_codegen_and_validate() {
     for (done_simm, emits, cuts) in [(0x33u64, 4usize, 1usize), (0x23, 4, 0), (0x03, 3, 0)] {
         let (code, g) = gs_done_emit_cut_program(done_simm);
         for split in [false, true] {
-            let k = translate_geometry(&code, opts(split, 1), &g)
+            let k = translate_geometry_unrefused(&code, opts(split, 1), &g)
                 .unwrap_or_else(|e| panic!("direct done=0x{done_simm:x} split={split}: {e}"));
             if dxc_ok {
                 super::validate::validate(&k.dxil)
@@ -406,7 +406,7 @@ fn gpu_geometry_msg_gs_done_emit_and_cut() {
         forms.push(false);
     }
     for split in forms {
-        let direct = translate_geometry(&code, opts(split, 1), &g).unwrap().dxil;
+        let direct = translate_geometry_unrefused(&code, opts(split, 1), &g).unwrap().dxil;
         let (_, got) = runner::mesh_draw(&direct, &msb, &ps, 2, rd, &io, &mem, 32, [0.0; 4]).unwrap();
         check(&format!("direct, split {split}"), &got);
         let t = hlsl_geometry(&code, g.clone(), split, 1).unwrap();
