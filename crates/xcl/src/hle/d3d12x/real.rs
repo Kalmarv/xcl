@@ -9103,7 +9103,44 @@ unsafe extern "system" fn cl_clear_rtv(this: *mut c_void, rtv: usize, color: *co
             super::lut3d::wrote(r, false, || format!("ClearRenderTargetView {rtv:#x} to {:?}, {n} rects", color.as_ref()));
         }
     }
+    if let Some(c) = color.as_ref().filter(|c| c.iter().any(|v| v.is_nan())) {
+        if let Some(fixed) = integer_clear_bits(rtv, c) {
+            return f(this, rtv, &fixed, n, rects);
+        }
+    }
     f(this, rtv, color, n, rects)
+}
+
+/// A NaN channel in a clear of an integer target (`XCL_CLEAR_NAN_BITS=0`: off): the PC converts
+/// each float to the integer it stands for, and a NaN to 0. A title passing a NaN there means its
+/// bits (an all-ones R32_UINT marker comes out as NaN), so that channel gets a float the PC
+/// converts back to them. Other channels stay as given.
+unsafe fn integer_clear_bits(rtv: usize, c: &[f32; 4]) -> Option<[f32; 4]> {
+    use windows::Win32::Graphics::Dxgi::Common::*;
+    static ON: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
+    if !*ON.get_or_init(|| std::env::var("XCL_CLEAR_NAN_BITS").map_or(true, |v| v.trim() != "0")) {
+        return None;
+    }
+    let r = super::present::rtv_resource(rtv)?;
+    let format = ID3D12Resource::from_raw_borrowed(&(r as *mut c_void))?.GetDesc().Format;
+    let signed = match format {
+        DXGI_FORMAT_R32G32B32A32_UINT | DXGI_FORMAT_R32G32B32_UINT | DXGI_FORMAT_R32G32_UINT | DXGI_FORMAT_R32_UINT
+        | DXGI_FORMAT_R16G16B16A16_UINT | DXGI_FORMAT_R16G16_UINT | DXGI_FORMAT_R16_UINT | DXGI_FORMAT_R8G8B8A8_UINT
+        | DXGI_FORMAT_R8G8_UINT | DXGI_FORMAT_R8_UINT | DXGI_FORMAT_R10G10B10A2_UINT => false,
+        DXGI_FORMAT_R32G32B32A32_SINT | DXGI_FORMAT_R32G32B32_SINT | DXGI_FORMAT_R32G32_SINT | DXGI_FORMAT_R32_SINT
+        | DXGI_FORMAT_R16G16B16A16_SINT | DXGI_FORMAT_R16G16_SINT | DXGI_FORMAT_R16_SINT | DXGI_FORMAT_R8G8B8A8_SINT
+        | DXGI_FORMAT_R8G8_SINT | DXGI_FORMAT_R8_SINT => true,
+        _ => return None,
+    };
+    static N: AtomicU64 = AtomicU64::new(0);
+    if N.fetch_add(1, Ordering::Relaxed) < 4 {
+        crate::xlog_info!("D3D12.X: ClearRenderTargetView of an integer target (format {}) with NaN channels {:08x?}: cleared to their bits", format.0, c.map(f32::to_bits));
+    }
+    Some(c.map(|v| match (v.is_nan(), signed) {
+        (false, _) => v,
+        (true, false) => v.to_bits() as f32,
+        (true, true) => v.to_bits() as i32 as f32,
+    }))
 }
 
 unsafe extern "system" fn cl_om_set_render_targets(this: *mut c_void, n: u32, rtvs: *const usize, single: i32, dsv: *const usize) {
