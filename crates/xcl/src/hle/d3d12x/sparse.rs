@@ -4224,6 +4224,67 @@ impl State {
         }
     }
 
+    /// `XCL_VIEW_STALE_CHECK=1`: once a second, up to `STALE_PAGES` committed pages of the GPU-view
+    /// tiles with video memory (in turn, from where the last check stopped) are compared with what
+    /// was sent for them. A page whose CPU bytes differ at two checks in a row is logged: its tile
+    /// shows old bytes (or zeros: none sent while the CPU page has data) that no look sends. A page
+    /// written between two checks and sent at the submit between them differs at one only.
+    unsafe fn stale_check(&mut self) {
+        if !stale_check_on() {
+            return;
+        }
+        let mut st = STALE.lock().unwrap_or_else(|e| e.into_inner());
+        if st.at.is_some_and(|t| t.elapsed() < std::time::Duration::from_secs(1)) {
+            return;
+        }
+        st.at = Some(std::time::Instant::now());
+        if st.order.is_empty() {
+            st.order = self.mapped.iter().filter(|(_, e)| e.src != 0).map(|(&w, _)| w).collect();
+            st.order.sort_unstable();
+            st.next = 0;
+        }
+        let (mut pages, mut differ, mut unsent, mut again) = (0usize, 0usize, 0usize, Vec::new());
+        let mut now = FxHashSet::default();
+        while pages < STALE_PAGES && st.next < st.order.len() {
+            let w = st.order[st.next];
+            st.next += 1;
+            let Some(e) = self.mapped.get(&w).filter(|e| e.src != 0 && e.pool != LAZY) else { continue };
+            for idx in 0..PAGES_PER_TILE {
+                if e.holes & (1 << idx) != 0 {
+                    continue;
+                }
+                pages += 1;
+                let bytes = std::slice::from_raw_parts((e.src + idx * PAGE) as *const u8, PAGE);
+                let (d, none_sent) = page_differs(bytes, e.sent[idx].as_deref());
+                if d {
+                    let pg = w + idx * PAGE;
+                    differ += 1;
+                    unsent += none_sent as usize;
+                    now.insert(pg);
+                    if st.before.contains(&pg) {
+                        again.push((pg, none_sent));
+                    }
+                }
+            }
+        }
+        if st.next >= st.order.len() {
+            st.order.clear();
+        }
+        st.before = now;
+        let u = crate::gpu::uma::get();
+        let at = |pg: usize| match u.and_then(|u| (0..u.shader_windows()).map(|k| (k, u.window(k))).find(|&(_, (b, n))| pg >= b && pg < b + n)) {
+            Some((k, (b, _))) => format!("w{k}+{:#x}", pg - b),
+            None => format!("{pg:#x}"),
+        };
+        let shown: Vec<String> = again.iter().take(8).map(|&(pg, z)| format!("{}{}", at(pg), if z { " (none sent)" } else { "" })).collect();
+        crate::xlog_info!(
+            "XCL_VIEW_STALE_CHECK: {pages} GPU-view pages checked, {differ} differ from what was sent ({unsent} with none sent while the CPU page has data), {} at two checks in a row{}{}",
+            again.len(),
+            if shown.is_empty() { "" } else { ": " },
+            shown.join(", ")
+        );
+    }
+
     /// A tile over a CPU view found no video memory a moment ago (`no_memory`, 1 s)
     fn short_of_memory(&self) -> bool {
         self.no_memory.is_some_and(|t| t.elapsed() < std::time::Duration::from_secs(1))
@@ -4846,6 +4907,41 @@ pub(super) fn will_write(va: usize, len: usize) {
     WRITE_ASKING.store(true, Ordering::Release);
 }
 
+/// `XCL_VIEW_STALE_CHECK=1` (diagnostic, off by default): `State::stale_check`.
+fn stale_check_on() -> bool {
+    static ON: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
+    *ON.get_or_init(|| std::env::var("XCL_VIEW_STALE_CHECK").is_ok_and(|v| v.trim() == "1"))
+}
+
+/// GPU-view pages `stale_check` compares at a time (16 MiB of CPU bytes)
+const STALE_PAGES: usize = 4096;
+
+/// Where `stale_check` is: the GPU-view tiles of the pass under way and the next of them, the
+/// pages that differed at the check before, and when it ran last.
+struct Stale {
+    order: Vec<usize>,
+    next: usize,
+    before: FxHashSet<usize>,
+    at: Option<std::time::Instant>,
+}
+
+static STALE: Mutex<Stale> = Mutex::new(Stale { order: Vec::new(), next: 0, before: FxHashSet::with_hasher(BuildHasherDefault::new()), at: None });
+
+/// Whether the CPU bytes `page` differ from the chunk hashes `sent` (None: none sent, all zero),
+/// and whether they do with none sent (the tile holds zeros where the CPU page has data).
+fn page_differs(page: &[u8], sent: Option<&[u64; CHUNKS]>) -> (bool, bool) {
+    for (k, c) in page.chunks_exact(CHUNK).enumerate() {
+        let w = read_chunk_words(c);
+        let zero = (w[0] | w[1] | w[2] | w[3] | w[4] | w[5] | w[6] | w[7]) == 0;
+        let was = sent.map_or(ZERO_HASH, |s| s[k]);
+        if (zero && was == ZERO_HASH) || (!zero && hash_words(w) == was) {
+            continue;
+        }
+        return (true, sent.is_none());
+    }
+    (false, false)
+}
+
 /// A range of `XCL_TRACE_UPLOAD_RANGE` (addresses, end excluded) and what went up into it since
 /// its last line: [bytes uploaded, bytes cleared, submits with either].
 struct TraceRange {
@@ -5047,6 +5143,7 @@ impl State {
         let t0 = std::time::Instant::now();
         let s = self;
         s.trace_line(queue);
+        s.stale_check();
         // (`XCL_LOOK_STATS=2`: the time after each step, and the work counted so far)
         let split = super::look_stats::deep();
         let stamp = || split.then(std::time::Instant::now);
@@ -5452,6 +5549,21 @@ fn forget_in(s: &mut State, res: usize) {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// A page differs from what was sent when one of its chunks does; with none sent it differs
+    /// once it holds data (and says so), and not while it is all zero.
+    #[test]
+    fn a_page_differs_from_what_was_sent_by_any_chunk() {
+        let mut page = vec![0u8; PAGE];
+        assert_eq!(page_differs(&page, None), (false, false));
+        page[CHUNK * 3 + 5] = 7;
+        assert_eq!(page_differs(&page, None), (true, true));
+        let mut sent = ZERO_HASHES;
+        sent[3] = hash_words(read_chunk_words(&page[CHUNK * 3..CHUNK * 4]));
+        assert_eq!(page_differs(&page, Some(&sent)), (false, false));
+        page[CHUNK * 9] = 1;
+        assert_eq!(page_differs(&page, Some(&sent)), (true, false));
+    }
 
     /// A tile the title maps is asked for only with `XCL_VIEW_ASK_MAPPED`; without it, a tile
     /// not asked for before stays so.
