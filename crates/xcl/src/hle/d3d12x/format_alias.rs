@@ -976,13 +976,63 @@ unsafe fn copy_one_subresource_through_buffer(
     dst_fp.Footprint.RowPitch = row_pitch;
     let slices = (src_fp.Footprint.Depth as u64).max(1);
     let needed = (row_pitch as u64).saturating_mul(src_rows as u64).saturating_mul(slices).max(src_total).max(dst_total);
-    let Some(scratch_raw) = list_x::acquire_scratch_for_copy(list, needed) else {
+    // (not in amd-dev's) Rows of plain texels can go in bands, so the scratch a list already has
+    // serves a subresource of any size; a block-compressed side goes whole.
+    let plain = |fmt: u32| matches!(format_element_bytes(fmt), Some((_, false)));
+    let in_bands = plain(src_desc.Format.0 as u32) && plain(dst_desc.Format.0 as u32);
+    let Some((scratch_raw, capacity)) = list_x::acquire_scratch_for_sync(list, needed, if in_bands { row_pitch as u64 } else { needed }) else {
         return false;
     };
     let scratch_ptr = scratch_raw as *mut c_void;
     let Some(scratch) = ID3D12Resource::from_raw_borrowed(&scratch_ptr) else {
         return false;
     };
+
+    if capacity < needed {
+        let band_rows = (capacity / row_pitch as u64) as u32;
+        for z in 0..src_fp.Footprint.Depth.max(1) {
+            for top in (0..src_rows).step_by(band_rows as usize) {
+                let bottom = (top + band_rows).min(src_rows);
+                let band = |mut fp: D3D12_PLACED_SUBRESOURCE_FOOTPRINT| {
+                    fp.Offset = 0;
+                    fp.Footprint.Height = bottom - top;
+                    fp.Footprint.Depth = 1;
+                    fp
+                };
+                let bx = D3D12_BOX { left: 0, top, front: z, right: src_fp.Footprint.Width, bottom, back: z + 1 };
+                list_x::transition(list, scratch_raw, D3D12_RESOURCE_STATE_COMMON, D3D12_RESOURCE_STATE_COPY_DEST);
+                {
+                    let src_loc = OwnedCopyLoc(D3D12_TEXTURE_COPY_LOCATION {
+                        pResource: ManuallyDrop::new(Some(src.clone())),
+                        Type: D3D12_TEXTURE_COPY_TYPE_SUBRESOURCE_INDEX,
+                        Anonymous: D3D12_TEXTURE_COPY_LOCATION_0 { SubresourceIndex: src_sub },
+                    });
+                    let buf_dst_loc = OwnedCopyLoc(D3D12_TEXTURE_COPY_LOCATION {
+                        pResource: ManuallyDrop::new(Some(scratch.clone())),
+                        Type: D3D12_TEXTURE_COPY_TYPE_PLACED_FOOTPRINT,
+                        Anonymous: D3D12_TEXTURE_COPY_LOCATION_0 { PlacedFootprint: band(src_fp) },
+                    });
+                    list_x::pc_copy_texture_region(list, &buf_dst_loc.0, 0, 0, 0, &src_loc.0, &bx);
+                }
+                list_x::transition(list, scratch_raw, D3D12_RESOURCE_STATE_COPY_DEST, D3D12_RESOURCE_STATE_COPY_SOURCE);
+                {
+                    let buf_src_loc = OwnedCopyLoc(D3D12_TEXTURE_COPY_LOCATION {
+                        pResource: ManuallyDrop::new(Some(scratch.clone())),
+                        Type: D3D12_TEXTURE_COPY_TYPE_PLACED_FOOTPRINT,
+                        Anonymous: D3D12_TEXTURE_COPY_LOCATION_0 { PlacedFootprint: band(dst_fp) },
+                    });
+                    let dst_loc = OwnedCopyLoc(D3D12_TEXTURE_COPY_LOCATION {
+                        pResource: ManuallyDrop::new(Some(dst.clone())),
+                        Type: D3D12_TEXTURE_COPY_TYPE_SUBRESOURCE_INDEX,
+                        Anonymous: D3D12_TEXTURE_COPY_LOCATION_0 { SubresourceIndex: dst_sub },
+                    });
+                    list_x::pc_copy_texture_region(list, &dst_loc.0, 0, top, z, &buf_src_loc.0, std::ptr::null());
+                }
+                list_x::transition(list, scratch_raw, D3D12_RESOURCE_STATE_COPY_SOURCE, D3D12_RESOURCE_STATE_COMMON);
+            }
+        }
+        return true;
+    }
 
     list_x::transition(list, scratch_raw, D3D12_RESOURCE_STATE_COMMON, D3D12_RESOURCE_STATE_COPY_DEST);
     {
@@ -1095,6 +1145,18 @@ unsafe fn sync_pair(list: *mut c_void, dev: &ID3D12Device, ty: D3D12_COMMAND_LIS
                 pair.writer,
                 pair.reader,
                 if pair.buffer_through { "buffer-through" } else { "direct copy" },
+                n + 1
+            );
+        }
+    } else {
+        // (not in amd-dev's) the reader keeps what it had: say so
+        static LEFT_OUT: AtomicU64 = AtomicU64::new(0);
+        let n = LEFT_OUT.fetch_add(1, Ordering::Relaxed);
+        if n < 8 || n.is_power_of_two() {
+            crate::xlog_warn!(
+                "D3D12.X: format-aliased texture {:#x} -> {:#x} was not synced: its copy could not be recorded ({} so far)",
+                pair.writer,
+                pair.reader,
                 n + 1
             );
         }
@@ -1642,6 +1704,23 @@ mod tests {
     /// writer's texels are in the reader bit for bit, through a buffer, on the title's list.
     #[test]
     fn gpu_reader_barrier_copies_the_writers_texels_into_the_reader() {
+        gpu_reader_gets_the_writers_texels(16, 16, 1);
+    }
+
+    /// (not in amd-dev's) A subresource larger than the scratch a sync asks for goes in bands of
+    /// rows, the last one short.
+    #[test]
+    fn gpu_reader_gets_a_large_texture_in_bands() {
+        gpu_reader_gets_the_writers_texels(1000, 1100, 1);
+    }
+
+    /// (not in amd-dev's) A volume larger than the scratch goes slice by slice.
+    #[test]
+    fn gpu_reader_gets_a_large_volume_in_bands() {
+        gpu_reader_gets_the_writers_texels(256, 256, 16);
+    }
+
+    fn gpu_reader_gets_the_writers_texels(tw: u32, th: u32, depth: u32) {
         use windows::Win32::Graphics::Dxgi::Common::*;
         unsafe {
             let dev: ID3D12Device = {
@@ -1671,12 +1750,11 @@ mod tests {
             let list: ID3D12GraphicsCommandList = dev.CreateCommandList(0, D3D12_COMMAND_LIST_TYPE_DIRECT, &alloc, None).unwrap();
             let fence: ID3D12Fence = dev.CreateFence(0, D3D12_FENCE_FLAG_NONE).unwrap();
 
-            const N: u32 = 16;
             let tex_desc = |format: DXGI_FORMAT, flags: D3D12_RESOURCE_FLAGS| D3D12_RESOURCE_DESC {
-                Dimension: D3D12_RESOURCE_DIMENSION_TEXTURE2D,
-                Width: N as u64,
-                Height: N,
-                DepthOrArraySize: 1,
+                Dimension: if depth > 1 { D3D12_RESOURCE_DIMENSION_TEXTURE3D } else { D3D12_RESOURCE_DIMENSION_TEXTURE2D },
+                Width: tw as u64,
+                Height: th,
+                DepthOrArraySize: depth as u16,
                 MipLevels: 1,
                 Format: format,
                 SampleDesc: DXGI_SAMPLE_DESC { Count: 1, Quality: 0 },
@@ -1699,7 +1777,7 @@ mod tests {
             let pitch = fp.Footprint.RowPitch as usize;
             let buf_desc = D3D12_RESOURCE_DESC {
                 Dimension: D3D12_RESOURCE_DIMENSION_BUFFER,
-                Width: (pitch * N as usize) as u64,
+                Width: (pitch * th as usize * depth as usize) as u64,
                 Height: 1,
                 DepthOrArraySize: 1,
                 MipLevels: 1,
@@ -1711,12 +1789,15 @@ mod tests {
             let upload = make(D3D12_HEAP_TYPE_UPLOAD, &buf_desc, D3D12_RESOURCE_STATE_GENERIC_READ);
             let readback = make(D3D12_HEAP_TYPE_READBACK, &buf_desc, D3D12_RESOURCE_STATE_COPY_DEST);
             // every bit of a texel is used, so a copy that goes through the formats' values shows
-            let texel = |x: u32, y: u32| (y * N + x + 1).wrapping_mul(0x9E37_79B9);
+            let texel = |x: u32, y: u32, z: u32| ((z * th + y) * tw + x + 1).wrapping_mul(0x9E37_79B9);
+            let at = |x: u32, y: u32, z: u32| (z * th + y) as usize * pitch + x as usize * 4;
             let mut mapped = std::ptr::null_mut();
             upload.Map(0, None, Some(&mut mapped)).unwrap();
-            for y in 0..N {
-                for x in 0..N {
-                    ((mapped as *mut u8).add(y as usize * pitch + x as usize * 4) as *mut u32).write_unaligned(texel(x, y));
+            for z in 0..depth {
+                for y in 0..th {
+                    for x in 0..tw {
+                        ((mapped as *mut u8).add(at(x, y, z)) as *mut u32).write_unaligned(texel(x, y, z));
+                    }
                 }
             }
             upload.Unmap(0, None);
@@ -1738,7 +1819,7 @@ mod tests {
             list_x::transition(list.as_raw(), w, D3D12_RESOURCE_STATE_COPY_DEST, D3D12_RESOURCE_STATE_UNORDERED_ACCESS);
 
             // the pair: two textures the title placed at one address (not a 64 KiB boundary)
-            let va = 0x7B00_0000_4000usize;
+            let va = 0x7B00_0000_4000usize + ((tw as usize) << 24);
             {
                 let mut g = TABLE.lock().unwrap();
                 let t = g.get_or_insert_with(AliasTable::new);
@@ -1795,10 +1876,12 @@ mod tests {
 
             let mut mapped = std::ptr::null_mut();
             readback.Map(0, None, Some(&mut mapped)).unwrap();
-            for y in 0..N {
-                for x in 0..N {
-                    let got = ((mapped as *const u8).add(y as usize * pitch + x as usize * 4) as *const u32).read_unaligned();
-                    assert_eq!(got, texel(x, y), "reader texel ({x},{y})");
+            for z in 0..depth {
+                for y in 0..th {
+                    for x in 0..tw {
+                        let got = ((mapped as *const u8).add(at(x, y, z)) as *const u32).read_unaligned();
+                        assert_eq!(got, texel(x, y, z), "reader texel ({x},{y},{z})");
+                    }
                 }
             }
             readback.Unmap(0, None);
