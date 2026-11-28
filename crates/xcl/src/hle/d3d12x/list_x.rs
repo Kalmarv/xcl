@@ -2779,6 +2779,8 @@ struct CopyScratch {
     recorded: bool,
     untracked_submission: bool,
     marks: HashMap<usize, (ID3D12Fence, u64)>,
+    /// the device of one made by `acquire_for_sync`, which another list may take over (else 0)
+    sync_device: usize,
 }
 
 impl CopyScratch {
@@ -2833,14 +2835,14 @@ impl CopyScratchCache {
         if bytes > MAX_COPY_SCRATCH.saturating_sub(self.bytes) {
             return None;
         }
-        self.insert(list, bytes)
+        self.insert(list, bytes, 0)
     }
 
-    unsafe fn insert(&mut self, list: *mut c_void, bytes: u64) -> Option<(usize, u64)> {
+    unsafe fn insert(&mut self, list: *mut c_void, bytes: u64, sync_device: usize) -> Option<(usize, u64)> {
         let buffer = make_copy_scratch(list, bytes)?;
         let raw = buffer.as_raw() as usize;
         self.active.insert(list as usize, CopyScratch {
-            buffer, bytes, recorded: true, untracked_submission: false, marks: HashMap::new(),
+            buffer, bytes, recorded: true, untracked_submission: false, marks: HashMap::new(), sync_device,
         });
         self.bytes += bytes;
         Some((raw, bytes))
@@ -2849,7 +2851,10 @@ impl CopyScratchCache {
     /// A scratch for a copy that must not be left out: `want` bytes when the list has recorded
     /// with none yet, at least `min` otherwise. Where `acquire` gives up, this one goes on: a
     /// scratch still executing from the list's last submission is set aside for the GPU to finish
-    /// and replaced, and a new one may reach into `SYNC_SCRATCH_RESERVE`.
+    /// and replaced, and a new one may reach into `SYNC_SCRATCH_RESERVE`. A list keeps its scratch
+    /// while it lives and a title records with more lists than the reserve has scratches for, so
+    /// one made here for a list that has since been reset, and whose work the GPU has done, is
+    /// taken over before a new one is made.
     unsafe fn acquire_for_sync(&mut self, list: *mut c_void, want: u64, min: u64) -> Option<(usize, u64)> {
         self.collect_released();
         let key = list as usize;
@@ -2872,11 +2877,34 @@ impl CopyScratchCache {
             }
         }
         let room = limit.saturating_sub(self.bytes);
+        let device = device_of(list).map_or(0, |d| d.as_raw() as usize);
+        let spare = self.take_spare(device, want, true).or_else(|| if want > room { self.take_spare(device, min, false) } else { None });
+        if let Some(mut scratch) = spare {
+            scratch.recorded = true;
+            let given = (scratch.buffer.as_raw() as usize, scratch.bytes);
+            self.active.insert(key, scratch);
+            return Some(given);
+        }
         let bytes = if want <= room { want } else { min };
         if bytes > room {
             return None;
         }
-        self.insert(list, bytes)
+        self.insert(list, bytes, device)
+    }
+
+    /// Another list's scratch of `acquire_for_sync` on `device` with `bytes` or more that no
+    /// recording uses and the GPU is done with: the smallest such, or the largest.
+    fn take_spare(&mut self, device: usize, bytes: u64, smallest: bool) -> Option<CopyScratch> {
+        let mut best: Option<(usize, u64)> = None;
+        for (&key, scratch) in self.active.iter_mut() {
+            if device == 0 || scratch.sync_device != device || scratch.recorded || scratch.bytes < bytes || !scratch.idle() {
+                continue;
+            }
+            if best.is_none_or(|(_, b)| if smallest { scratch.bytes < b } else { scratch.bytes > b }) {
+                best = Some((key, scratch.bytes));
+            }
+        }
+        self.active.remove(&best?.0)
     }
 }
 
@@ -5881,6 +5909,31 @@ mod tests {
             assert_eq!(cache.acquire_for_sync(second_raw, 2 * SYNC_SCRATCH_RESERVE, small).unwrap().1, small);
             cache.release(second_raw as usize);
             assert!(cache.acquire_for_sync(second_raw, 2 * SYNC_SCRATCH_RESERVE, 2 * SYNC_SCRATCH_RESERVE).is_none());
+            cache.release(first_raw as usize);
+            assert_eq!(cache.bytes, 0);
+
+            // a reserve that lists no longer recording hold serves the next list: theirs are taken over
+            assert_eq!(cache.acquire(first_raw, MAX_COPY_SCRATCH).unwrap().1, MAX_COPY_SCRATCH);
+            let held = cache.acquire_for_sync(second_raw, SYNC_SCRATCH_RESERVE, small).unwrap();
+            assert_eq!((held.1, cache.bytes), (SYNC_SCRATCH_RESERVE, MAX_COPY_SCRATCH + SYNC_SCRATCH_RESERVE));
+            let alloc2: ID3D12CommandAllocator = dev.CreateCommandAllocator(ty).unwrap();
+            let third: ID3D12GraphicsCommandList = dev.CreateCommandList(0, ty, &alloc2, None).unwrap();
+            let third_raw = third.as_raw();
+            assert!(cache.acquire_for_sync(third_raw, band, small).is_none(), "one a recording uses stays with its list");
+            let scratch = cache.active.get_mut(&(second_raw as usize)).unwrap();
+            scratch.recorded = false;
+            scratch.marks.insert(fence.as_raw() as usize, (fence.clone(), 2));
+            assert!(cache.acquire_for_sync(third_raw, band, small).is_none(), "nor one the GPU still works with");
+            fence.Signal(2).unwrap();
+            assert_eq!(cache.acquire_for_sync(third_raw, band, small), Some(held));
+            assert!(!cache.active.contains_key(&(second_raw as usize)));
+            assert_eq!(cache.bytes, MAX_COPY_SCRATCH + SYNC_SCRATCH_RESERVE);
+            // the other copies' scratch is no spare
+            cache.active.get_mut(&(first_raw as usize)).unwrap().recorded = false;
+            cache.release(third_raw as usize);
+            assert_eq!(cache.acquire_for_sync(third_raw, band, small).unwrap().1, band);
+            assert!(cache.active.contains_key(&(first_raw as usize)));
+            cache.release(third_raw as usize);
             cache.release(first_raw as usize);
             assert_eq!(cache.bytes, 0);
         }
