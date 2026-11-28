@@ -30,6 +30,11 @@
 //! In this tree a GPU-owned texture and a sampled one at one address share video memory only
 //! where the address is a 64 KiB page boundary (`vram`); elsewhere the writer is a resource of
 //! its own and the reader was fed from the title's memory, which the GPU's writes never reach.
+//! With the switch on, a sampled texture placed where a writer of another format family is
+//! tracked is a resource of its own at a page boundary too (`sampled_texture_is_copied`), so
+//! the copy is every such reader's one source: on the shared pages its tiles were the writer's
+//! in the other format, and where its description takes more pages of the title's memory than
+//! the writer's, its last tiles were the next textures', which a copy into it overwrote.
 
 use std::collections::{HashMap, HashSet};
 use std::ffi::c_void;
@@ -347,6 +352,21 @@ impl AliasTable {
         })
     }
 
+    /// Whether a sampled texture of `shape` at `va` on `device` would be linked as the reader of
+    /// a writer tracked there (the rule of `insert`): its texels then come by copy.
+    fn copied_reader_at(&self, device: usize, va: usize, shape: &TexShape) -> bool {
+        self.by_va.get(&va).is_some_and(|list| {
+            list.iter().any(|r| {
+                self.by_res.get(r).is_some_and(|w| {
+                    w.is_writer
+                        && w.device == device
+                        && can_copy_through_buffer(shape, &w.shape)
+                        && (w.owner == Owner::PlacedUav || needs_buffer_through(shape.format, w.shape.format))
+                })
+            })
+        })
+    }
+
     /// Register `res` at `va` and link any compatible `(writer -> reader)` pairs at the same VA.
     /// Returns any existing reader resources that should be marked `gpu_written` in `title_textures`.
     fn insert(&mut self, res: usize, tex: TrackedTex) -> Vec<usize> {
@@ -629,6 +649,20 @@ unsafe fn create_internal_texture(dev: *mut c_void, pc_desc: &[u8; 0x38], initia
         return None;
     }
     Some(ID3D12Resource::from_raw(out))
+}
+
+/// Whether a sampled texture the title is about to place at `va` will be the reader of a GPU
+/// writer tracked there (`register_title_texture` then links the two): `device_x::
+/// create_placed_resource_x` makes it a resource of its own instead of one on the title's pages.
+pub(super) fn sampled_texture_is_copied(dev: usize, va: usize, pc_desc: &D3D12_RESOURCE_DESC, flags: u32) -> bool {
+    if !enabled() || va == 0 || pc_desc.Dimension == D3D12_RESOURCE_DIMENSION_BUFFER || flags & (FLAG_RENDER_TARGET | FLAG_UAV) != 0 {
+        return false;
+    }
+    let shape = TexShape::from_pc_desc(pc_desc);
+    if format_element_bytes(shape.format).is_none() || shape.samples > 1 {
+        return false;
+    }
+    TABLE.lock().unwrap().as_ref().is_some_and(|t| t.copied_reader_at(dev, va, &shape))
 }
 
 /// Register a title-created placed texture from `device_x::create_placed_resource_x`.
@@ -1575,6 +1609,28 @@ mod tests {
         assert!(subresource_footprints_compatible(67, &fp(32, 32, 1), 42, &fp(32, 32, 1)));
         assert!(!subresource_footprints_compatible(10, &fp(32, 32, 1), 42, &fp(32, 32, 1)), "8 Bpp vs 4 Bpp must be rejected");
         assert!(subresource_footprints_compatible(98, &fp(64, 64, 1), 3, &fp(16, 16, 1)), "BC7 64x64 == R32G32B32A32 16x16");
+    }
+
+    #[test]
+    fn sampled_texture_at_a_writer_of_another_family_is_a_copied_reader() {
+        let mut t = AliasTable::new();
+        let va = 0x3_0000_0000usize;
+        let srv_shape = shape(67, 1280, 720, 1, 1);
+        assert!(!t.copied_reader_at(1, va, &srv_shape), "no writer there yet");
+        t.insert(0x200, TrackedTex::new(1, va, shape(42, 1280, 720, 1, 1), Owner::TitlePlaced, STATE_UAV, true));
+        assert!(t.copied_reader_at(1, va, &srv_shape));
+        assert!(!t.copied_reader_at(2, va, &srv_shape), "another device");
+        assert!(!t.copied_reader_at(1, va + 0x1_0000, &srv_shape), "another address");
+        assert!(!t.copied_reader_at(1, va, &shape(41, 1280, 720, 1, 1)), "one format family: the title's writer is not copied into it");
+        assert!(!t.copied_reader_at(1, va, &shape(67, 640, 360, 1, 1)), "another size");
+
+        // what it says is what `insert` links
+        assert_eq!(t.insert(0x300, TrackedTex::new(1, va, srv_shape, Owner::TitlePlaced, 0, false)), vec![0x300]);
+        assert!(t.insert(0x400, TrackedTex::new(1, va, shape(41, 1280, 720, 1, 1), Owner::TitlePlaced, 0, false)).is_empty());
+
+        // a sampled texture there is no writer
+        t.remove(0x200);
+        assert!(!t.copied_reader_at(1, va, &srv_shape));
     }
 
     #[test]
