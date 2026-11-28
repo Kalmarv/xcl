@@ -696,6 +696,17 @@ unsafe extern "system" fn copy_into(p: *mut c_void, dst: *mut u8, plane: u32, su
 
 /// the level's place in `src` (the whole resource) → rows of `dst` (`row_pitch` apart)
 unsafe extern "system" fn copy_from(p: *mut c_void, dst: *mut u8, plane: u32, sub: u32, src: *const u8, row_pitch: u32, slice_pitch: u32) -> HRESULT {
+    // (diagnostic: does the title reach this, and with which slots; #684 / #1435 read a 7th argument)
+    static CALLS: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
+    let hr = copy_from_inner(p, dst, plane, sub, src, row_pitch, slice_pitch);
+    let n = CALLS.fetch_add(1, std::sync::atomic::Ordering::Relaxed) + 1;
+    if n <= 4 || n.is_power_of_two() {
+        crate::xlog_info!("XG: CopyFromSubresource #{n}: dst {:#x} plane {plane:#x} sub {sub:#x} src {:#x} row pitch {row_pitch:#x} slice pitch {slice_pitch:#x} -> {:#x}", dst as usize, src as usize, hr as u32);
+    }
+    hr
+}
+
+unsafe fn copy_from_inner(p: *mut c_void, dst: *mut u8, plane: u32, sub: u32, src: *const u8, row_pitch: u32, slice_pitch: u32) -> HRESULT {
     let Some((t, at, i, k)) = subresource(tex(p), plane, sub).filter(|_| !dst.is_null() && !src.is_null()) else { return E_INVALIDARG };
     let m = t.chain.levels[i];
     let row = m.width * t.bpe as usize;
