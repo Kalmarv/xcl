@@ -177,12 +177,14 @@ fn probe_headers() {
     }
     for va in tops {
         let mut cpu = [0u8; 256];
-        let cpu_line = if read_title(va, &mut cpu) { words(&cpu) } else { "not readable".to_string() };
+        let readable = read_title(va, &mut cpu);
+        let cpu_line = if readable { words(&cpu) } else { "not readable".to_string() };
+        // (read at this present: the title's queues are not waited for, so a build of this frame may be in flight)
         let gpu_line = match unsafe { super::sparse::peek_gpu(va as usize, 256) } {
-            Ok(b) => format!("{}{}", words(&b), if b[..] == cpu[..] { " (same 256 B)" } else { " (differs)" }),
+            Ok(b) => format!("{}{}", words(&b), if !readable { "" } else if b[..] == cpu[..] { " (same 256 B)" } else { " (differs)" }),
             Err(e) => e.to_string(),
         };
-        crate::xlog_info!("D3D12.X: BVH probe frame {frame}: top level {va:#x}: title {cpu_line}; GPU {gpu_line}");
+        crate::xlog_info!("D3D12.X: BVH probe at present {frame} (title queues not waited for): top level {va:#x}: title {cpu_line}; GPU {gpu_line}");
     }
 }
 

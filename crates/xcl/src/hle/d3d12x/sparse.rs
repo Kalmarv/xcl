@@ -2258,20 +2258,30 @@ impl State {
         let (rb, p) = self.readback_buf().ok_or("no readback buffer")?;
         let b = self.windows[wi].0;
         self.wait_for(self.rb_last_fence);
-        let _ = self.rb_alloc.Reset();
-        let _ = self.rb_list.Reset(&self.rb_alloc, None);
+        if super::real::fence_completed(&self.fence) < self.rb_last_fence {
+            return Err("the last copy back is not done");
+        }
+        if self.rb_alloc.Reset().is_err() || self.rb_list.Reset(&self.rb_alloc, None).is_err() {
+            return Err("the copy list did not reset");
+        }
         self.rb_list.CopyBufferRegion(&rb, 0, &self.windows[wi].1, (va - b) as u64, len as u64);
         if self.rb_list.Close().is_err() {
             return Err("the copy list did not close");
         }
-        if let Ok(l) = self.rb_list.cast::<ID3D12CommandList>() {
-            super::title_textures::own_work(|| {
-                self.queue.ExecuteCommandLists(&[Some(l)]);
-            });
-        }
+        let Ok(l) = self.rb_list.cast::<ID3D12CommandList>() else { return Err("the copy list is not a command list") };
+        super::title_textures::own_work(|| {
+            self.queue.ExecuteCommandLists(&[Some(l)]);
+        });
         self.signal();
         self.rb_last_fence = self.value;
         self.wait_for(self.value);
+        let done = super::real::fence_completed(&self.fence);
+        if done == u64::MAX {
+            return Err("device removed");
+        }
+        if done < self.value {
+            return Err("the copy did not finish within 5 s");
+        }
         self.reclaim_ring();
         Ok(std::slice::from_raw_parts(p, len).to_vec())
     }
