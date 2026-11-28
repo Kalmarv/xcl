@@ -256,6 +256,9 @@ struct Target {
     unviewed_since: Option<std::time::Instant>,
     /// placed as GPU-owned: its pages are keyed by the physical page under them (`page_key`)
     gpu_owned: bool,
+    /// (lazy levels) a newer placement lies over it at another address and it stays live
+    /// (`keep_tail`): only its last group of levels gets pages, of its own
+    tail: bool,
 }
 
 /// The tiles of a texture whose levels get video memory when an upload first has texels for
@@ -353,6 +356,42 @@ static LEVEL_STATS: [std::sync::atomic::AtomicU64; 4] = [const { std::sync::atom
 /// groups given pages so far)
 fn level_stats() -> (u64, u64, u64, u64) {
     let l = |k: usize| LEVEL_STATS[k].load(std::sync::atomic::Ordering::Relaxed);
+    (l(0), l(1), l(2), l(3))
+}
+
+/// `XCL_KEEP_TAILS=<MiB>` (off by default, with `level_pages`): the tiles the textures kept under
+/// a newer placement (`keep_tail`) may have pages for at a time; None: they are not kept.
+fn tail_tiles_cap() -> Option<u64> {
+    #[cfg(test)]
+    if let Some(cap) = TAIL_CAP_FOR_TEST.with(|c| c.get()) {
+        return Some(cap);
+    }
+    static CAP: std::sync::OnceLock<Option<u64>> = std::sync::OnceLock::new();
+    *CAP.get_or_init(|| {
+        let mb = std::env::var("XCL_KEEP_TAILS").ok().and_then(|v| v.trim().parse::<u64>().ok()).filter(|&n| n > 0)?;
+        crate::xlog_info!("D3D12.X: XCL_KEEP_TAILS={mb} - a sampled texture with lazy levels under a newer placement at another address keeps its smallest levels on pages of its own, {mb} MB of them at most");
+        Some(mb << 4)
+    })
+}
+
+#[cfg(test)]
+thread_local! {
+    pub(super) static TAIL_CAP_FOR_TEST: std::cell::Cell<Option<u64>> = const { std::cell::Cell::new(None) };
+}
+
+/// Whether `keep_tail` is on (`XCL_KEEP_TAILS`).
+pub(super) fn keep_tails() -> bool {
+    level_pages() && tail_tiles_cap().is_some()
+}
+
+/// Of the textures kept under a newer placement (`keep_tail`): how many there are now, the tiles
+/// of them that have pages now, how many were kept so far, and how often a tail got no pages
+/// because the others had `tail_tiles_cap`.
+static TAIL_STATS: [std::sync::atomic::AtomicU64; 4] = [const { std::sync::atomic::AtomicU64::new(0) }; 4];
+
+/// (kept textures now, their tiles with pages now, kept so far, refused at the cap so far)
+pub(super) fn tail_stats() -> (u64, u64, u64, u64) {
+    let l = |k: usize| TAIL_STATS[k].load(std::sync::atomic::Ordering::Relaxed);
     (l(0), l(1), l(2), l(3))
 }
 
@@ -1383,10 +1422,10 @@ unsafe fn place_on_pages(
                 // nothing mapped yet: a level gets its pages with its first texels (`map_levels`)
                 LEVEL_STATS[0].fetch_add(1, std::sync::atomic::Ordering::Relaxed);
                 LEVEL_STATS[1].fetch_add(total as u64, std::sync::atomic::Ordering::Relaxed);
-                pages.targets.insert(raw as usize, Target { va, console_bytes, total, mapped: true, used: Vec::new(), used_extra: Vec::new(), levels, unviewed_since: None, gpu_owned: require_aligned });
+                pages.targets.insert(raw as usize, Target { va, console_bytes, total, mapped: true, used: Vec::new(), used_extra: Vec::new(), levels, unviewed_since: None, gpu_owned: require_aligned, tail: false });
                 true
             } else if let Some((used, used_extra)) = pages.bind(dev, res, va, console_bytes, total, &phys) {
-                pages.targets.insert(raw as usize, Target { va, console_bytes, total, mapped: true, used, used_extra, levels: None, unviewed_since: None, gpu_owned: require_aligned });
+                pages.targets.insert(raw as usize, Target { va, console_bytes, total, mapped: true, used, used_extra, levels: None, unviewed_since: None, gpu_owned: require_aligned, tail: false });
                 true
             } else {
                 false
@@ -1439,6 +1478,9 @@ unsafe fn unmap_placed(res: &ID3D12Resource, immediate_cool: bool) {
         t.mapped = false;
         if let Some(l) = t.levels.as_mut() {
             LEVEL_STATS[2].fetch_sub(l.mapped_tiles(), std::sync::atomic::Ordering::Relaxed);
+            if t.tail {
+                TAIL_STATS[1].fetch_sub(l.mapped_tiles(), std::sync::atomic::Ordering::Relaxed);
+            }
             l.groups.iter_mut().for_each(|g| g.3 = false);
         }
         pages.unmap(res, total);
@@ -1480,6 +1522,51 @@ pub(super) unsafe fn rebind_private(res: &ID3D12Resource) -> bool {
         t.mapped = true;
     }
     true
+}
+
+/// A sampled texture with lazy levels stays live under a newer placement at another address
+/// (`title_textures::keep_on_own_pages`, `XCL_KEEP_TAILS`). A streaming title describes each
+/// texture at full size where only its smallest levels have memory and packs those closer than
+/// the full sizes, so a newer neighbour's range lies over this one's levels without taking
+/// them; what lies under this one's larger levels is the neighbours'. Its tiles keyed by the
+/// title's pages are the newer one's too: it gives them all back, and from here on only its
+/// last group of levels gets pages (`map_levels`), keyed by its address. True: it is kept so
+/// (now or before); its levels get their pages again with its next upload.
+pub(super) unsafe fn keep_tail(res: &ID3D12Resource) -> bool {
+    if tail_tiles_cap().is_none() {
+        return false;
+    }
+    let key = res.as_raw() as usize;
+    let mut g = PAGES.lock().unwrap();
+    for pages in g.values_mut().flatten() {
+        let Some(t) = pages.targets.get_mut(&key) else { continue };
+        if t.tail {
+            return true;
+        }
+        if t.gpu_owned {
+            return false;
+        }
+        let Some(l) = t.levels.as_mut() else { return false };
+        LEVEL_STATS[2].fetch_sub(l.mapped_tiles(), std::sync::atomic::Ordering::Relaxed);
+        l.groups.iter_mut().for_each(|g| g.3 = false);
+        t.tail = true;
+        t.console_bytes = Some(0);
+        let total = t.total;
+        let used = std::mem::take(&mut t.used);
+        let used_extra = std::mem::take(&mut t.used_extra);
+        if !used.is_empty() || !used_extra.is_empty() {
+            pages.unmap(res, total);
+            pages.release_tiles(used, used_extra, std::time::Instant::now(), true);
+        }
+        let now = TAIL_STATS[0].fetch_add(1, std::sync::atomic::Ordering::Relaxed) + 1;
+        let n = TAIL_STATS[2].fetch_add(1, std::sync::atomic::Ordering::Relaxed) + 1;
+        if n <= 4 || n.is_power_of_two() {
+            let (_, tiles, _, refused) = tail_stats();
+            crate::xlog_info!("D3D12.X: XCL_KEEP_TAILS: {now} textures under a newer placement keep their smallest levels, on {} MB of pages of their own ({n} kept so far, {refused} times no pages at the cap)", tiles >> 4);
+        }
+        return true;
+    }
+    false
 }
 
 /// Re-map a previously unmapped placed texture when the newer placement shadowing it is released.
@@ -1591,6 +1678,10 @@ fn forget_pages(resource: usize) {
             LEVEL_STATS[0].fetch_sub(1, std::sync::atomic::Ordering::Relaxed);
             LEVEL_STATS[1].fetch_sub(t.total as u64, std::sync::atomic::Ordering::Relaxed);
             LEVEL_STATS[2].fetch_sub(l.mapped_tiles(), std::sync::atomic::Ordering::Relaxed);
+            if t.tail {
+                TAIL_STATS[0].fetch_sub(1, std::sync::atomic::Ordering::Relaxed);
+                TAIL_STATS[1].fetch_sub(l.mapped_tiles(), std::sync::atomic::Ordering::Relaxed);
+            }
         }
         if t.mapped {
             pages.release_tiles(t.used, t.used_extra, now, false);
@@ -1912,6 +2003,20 @@ pub(super) unsafe fn map_levels(res: &ID3D12Resource, levels: Option<&[u32]>) ->
         };
         wanted.sort_unstable();
         wanted.dedup();
+        let tail = t.tail;
+        if tail {
+            // (kept under a newer placement: what its larger levels' memory holds is not its)
+            let last = lv.groups.len() - 1;
+            wanted.retain(|&k| k == last && !lv.groups[k].3);
+            let held = TAIL_STATS[1].load(std::sync::atomic::Ordering::Relaxed);
+            if wanted.first().is_some_and(|&k| tail_tiles_cap().is_none_or(|cap| held + lv.groups[k].2 as u64 > cap)) {
+                let n = TAIL_STATS[3].fetch_add(1, std::sync::atomic::Ordering::Relaxed) + 1;
+                if n.is_power_of_two() {
+                    crate::xlog_warn!("D3D12.X: XCL_KEEP_TAILS: a texture kept under a newer placement gets no pages, the kept ones have {} MB ({n} times so far)", held >> 4);
+                }
+                return Vec::new();
+            }
+        }
         // (an upload's levels only: one the GPU writes gets all its pages)
         let cap = if levels.is_some() { level_tiles_cap() } else { u32::MAX };
         let todo: Vec<(usize, u32, u32, u32, std::ops::Range<u32>)> =
@@ -1932,6 +2037,9 @@ pub(super) unsafe fn map_levels(res: &ID3D12Resource, levels: Option<&[u32]>) ->
                 l.groups[k].3 = true;
             }
             LEVEL_STATS[2].fetch_add(n as u64, std::sync::atomic::Ordering::Relaxed);
+            if tail {
+                TAIL_STATS[1].fetch_add(n as u64, std::sync::atomic::Ordering::Relaxed);
+            }
             let groups = LEVEL_STATS[3].fetch_add(1, std::sync::atomic::Ordering::Relaxed) + 1;
             if groups >= 1024 && groups.is_power_of_two() {
                 let (textures, stand, mapped, _) = level_stats();
@@ -1956,7 +2064,7 @@ pub(super) unsafe fn unmap_levels(res: &ID3D12Resource, zero: &[u32]) -> u64 {
     let mut g = PAGES.lock().unwrap();
     for pages in g.values_mut().flatten() {
         let Some(t) = pages.targets.get_mut(&key) else { continue };
-        let (va, console_bytes, total) = (t.va, t.console_bytes, t.total);
+        let (va, console_bytes, total, tail) = (t.va, t.console_bytes, t.total, t.tail);
         let Some(lv) = t.levels.as_mut().filter(|_| t.mapped) else { return 0 };
         let Some((first_page, own)) = owned_pages(va, console_bytes, total as usize) else { return 0 };
         let mut ranges = Vec::new();
@@ -1988,6 +2096,9 @@ pub(super) unsafe fn unmap_levels(res: &ID3D12Resource, zero: &[u32]) -> u64 {
         }
         pages.release_tiles(gone, gone_extra, std::time::Instant::now(), false);
         LEVEL_STATS[2].fetch_sub(freed, std::sync::atomic::Ordering::Relaxed);
+        if tail {
+            TAIL_STATS[1].fetch_sub(freed, std::sync::atomic::Ordering::Relaxed);
+        }
         let n = LEVELS_GIVEN_BACK.fetch_add(1, std::sync::atomic::Ordering::Relaxed) + 1;
         if n.is_power_of_two() && n >= 64 {
             let (textures, stand, mapped, _) = level_stats();
@@ -2033,9 +2144,9 @@ pub(super) fn has_lazy_levels(resource: usize) -> bool {
 
 /// Of the textures `res` the ones here that have no page now (`title_textures::shadow_dump`):
 /// the resource, its address, whether it counts as mapped, whether it is GPU-owned, its
-/// lazy levels as (groups, groups with pages) when it has them, and whether it was evicted
-/// while unviewed.
-pub(super) fn without_pages(res: &[usize]) -> Vec<(usize, usize, bool, bool, Option<(u32, u32)>, bool)> {
+/// lazy levels as (groups, groups with pages) when it has them, whether it was evicted
+/// while unviewed, and whether it is kept under a newer placement (`keep_tail`).
+pub(super) fn without_pages(res: &[usize]) -> Vec<(usize, usize, bool, bool, Option<(u32, u32)>, bool, bool)> {
     let g = PAGES.lock().unwrap();
     let mut out = Vec::new();
     for &r in res {
@@ -2044,9 +2155,17 @@ pub(super) fn without_pages(res: &[usize]) -> Vec<(usize, usize, bool, bool, Opt
             continue;
         }
         let levels = t.levels.as_ref().map(|l| (l.groups.len() as u32, l.groups.iter().filter(|g| g.3).count() as u32));
-        out.push((r, t.va, t.mapped, t.gpu_owned, levels, EVICTED_UNVIEWED.contains(r)));
+        out.push((r, t.va, t.mapped, t.gpu_owned, levels, EVICTED_UNVIEWED.contains(r), t.tail));
     }
     out
+}
+
+/// Of `resource`, a texture kept under a newer placement (`keep_tail`): the first level of its
+/// last group and whether that group has pages. None: any other texture.
+pub(super) fn tail_levels(resource: usize) -> Option<(u32, bool)> {
+    let g = PAGES.lock().unwrap();
+    let t = g.values().flatten().find_map(|p| p.targets.get(&resource)).filter(|t| t.tail)?;
+    t.levels.as_ref()?.groups.last().map(|g| (g.0, g.3))
 }
 
 /// Whether `resource` is a texture with lazy levels of which some have no pages yet.

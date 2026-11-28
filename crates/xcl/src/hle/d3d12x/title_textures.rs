@@ -122,6 +122,8 @@ struct Table {
     newly_kept: Vec<usize>,
     /// `XCL_KEEP_SUPERSEDED=1` for this table (a test sets it)
     keep_arrays: bool,
+    /// `XCL_KEEP_TAILS` for this table (a test sets it)
+    keep_tails: bool,
     /// Largest byte span currently in `shadowed` (bounds range queries)
     max_shadowed_size: usize,
     next_seq: u64,
@@ -161,6 +163,7 @@ impl Table {
             kept_by_va: BTreeMap::new(),
             newly_kept: Vec::new(),
             keep_arrays: false,
+            keep_tails: false,
             max_shadowed_size: 0,
             next_seq: 0,
             src_pieces: BTreeMap::new(),
@@ -245,14 +248,16 @@ impl Table {
     /// address (`XCL_KEEP_SUPERSEDED=1`): a placed array, cube or 3D texture the CPU fills. Such
     /// a texture gets all its pages at once, so a title that places a larger texture's
     /// description over its memory has not given that memory up; unmapped, the views the title
-    /// made of it read zero until the newer one is released.
+    /// made of it read zero until the newer one is released. With `XCL_KEEP_TAILS` a texture of
+    /// one slice too: a streamed one is described at full size where only its smallest levels,
+    /// the first bytes of it, have memory, and the next one's description starts inside its
+    /// larger levels or ends over its smallest ones without taking them (`vram::keep_tail`).
     fn keeps_under_newer(&self, e: &Entry) -> bool {
-        (self.keep_arrays || keep_superseded())
-            && e.placed
+        e.placed
             && !e.unmapped
             && !e.gpu_written
             && !e.target
-            && e.tex.texels().is_some_and(|s| s.array > 1 || s.depth > 0)
+            && e.tex.texels().is_some_and(|s| if s.array > 1 || s.depth > 0 { self.keep_arrays || keep_superseded() } else { self.keep_tails || super::vram::keep_tails() })
     }
 
     fn active_overlaps(&self, va: usize, end: usize) -> Vec<(usize, usize, usize)> {
@@ -617,7 +622,7 @@ fn keep_superseded() -> bool {
 unsafe fn keep_on_own_pages(res: &ID3D12Resource) {
     static N: AtomicU64 = AtomicU64::new(0);
     let key = res.as_raw() as usize;
-    let moved = super::vram::rebind_private(res);
+    let moved = super::vram::rebind_private(res) || super::vram::keep_tail(res);
     if moved {
         let mut t = TEXTURES.lock().unwrap();
         if let Some(e) = t.by_res.get_mut(&key) {
@@ -632,7 +637,7 @@ unsafe fn keep_on_own_pages(res: &ID3D12Resource) {
     if n <= 64 || n.is_power_of_two() {
         let at = TEXTURES.lock().unwrap().by_res.get(&key).map(|e| (e.va, shadow_shape(&e.tex)));
         crate::xlog_info!(
-            "D3D12.X: an array texture under a newer placement stays live{}: {at:x?} ({n} so far)",
+            "D3D12.X: a texture under a newer placement stays live{}: {at:x?} ({n} so far)",
             if moved { " on pages of its own" } else { " on the pages it has (no move)" }
         );
     }
@@ -1162,7 +1167,7 @@ fn shadow_dump(now: u64) {
     {
         let t = TEXTURES.lock().unwrap();
         let sup = SUPERSEDED.lock().unwrap();
-        for &(r, va, mapped, gpu_owned, levels, evicted) in &bare {
+        for &(r, va, mapped, gpu_owned, levels, evicted, kept) in &bare {
             let (slot, views) = slots[&r];
             let entry = t.by_res.get(&r).map(|e| ("active", e)).or_else(|| t.shadowed.get(&r).map(|e| ("shadowed", e)));
             let (state, shape, src, size) = match entry {
@@ -1179,7 +1184,7 @@ fn shadow_dump(now: u64) {
                 None => "all its pages at once".to_string(),
             };
             let under = sup.get(&r).map_or(String::new(), |s| format!("; under {} at {:#x}..{:#x}", s.by.as_deref().unwrap_or("a GPU-owned placement"), s.by_va, s.by_end));
-            let text = format!("{shape}; {state}; {pages}; {}{}{}{under}", if mapped { "mapped" } else { "not mapped" }, if gpu_owned { ", GPU-owned" } else { "" }, if evicted { ", evicted" } else { "" });
+            let text = format!("{shape}; {state}; {pages}; {}{}{}{}{under}", if mapped { "mapped" } else { "not mapped" }, if gpu_owned { ", GPU-owned" } else { "" }, if evicted { ", evicted" } else { "" }, if kept { ", kept under a newer placement" } else { "" });
             rows.push((slot, views, r, va, src, size.min(0x10000), text));
         }
     }
@@ -2800,6 +2805,25 @@ unsafe fn upload_all(todo: Vec<Due>, dirty: &[usize], page: usize, title: Option
                     changed = None;
                 }
                 unmapped = super::vram::has_unmapped_levels(d.res.as_raw() as usize);
+                // (kept under a newer placement, `vram::keep_tail`: the levels of its last group
+                // are its, the first bytes of it; what the rest of its memory holds is not)
+                if let Some((first, mapped)) = super::vram::tail_levels(d.res.as_raw() as usize) {
+                    let own = d.tex.texels().map_or(0, |s| s.chain.level_bytes(first as usize).end);
+                    let whole = changed.is_none();
+                    let parts = first_bytes(changed.take(), own);
+                    if !mapped {
+                        texture_upload::unknown(&d.known);
+                        continue;
+                    }
+                    if parts.is_empty() {
+                        continue;
+                    }
+                    if whole {
+                        texture_upload::all_sent(&d.known, d.src, d.tex.size() as usize);
+                    }
+                    changed = Some(parts);
+                    unmapped = false;
+                }
             }
             if unmapped {
                 // A level left without pages (zeros when looked at above) may get its texels
@@ -2817,6 +2841,9 @@ unsafe fn upload_all(todo: Vec<Due>, dirty: &[usize], page: usize, title: Option
             }
             items.push(texture_upload::Item { res: d.res, src: d.src, tex: d.tex, states: d.states, changed, known: Some(Arc::clone(&d.known)), pages: d.pages });
             known.push(d.known);
+        }
+        if items.is_empty() {
+            continue;
         }
         let p = device as *mut c_void;
         let Some(dev) = ID3D12Device::from_raw_borrowed(&p) else { continue };
@@ -2931,6 +2958,15 @@ unsafe fn map_levels_with_texels(r: &ID3D12Resource, subs: &[Subresource]) -> Ve
     let zero: Vec<u32> = (0..subs.len() as u32).filter(|l| !present.contains(l)).collect();
     super::vram::unmap_levels(r, &zero);
     super::vram::map_levels(r, Some(&present))
+}
+
+/// `changed` of a texture (from, to; None: all of it) within its first `end` bytes.
+fn first_bytes(changed: Option<Vec<(usize, usize)>>, end: usize) -> Vec<(usize, usize)> {
+    match changed {
+        None if end > 0 => vec![(0, end)],
+        None => Vec::new(),
+        Some(parts) => parts.into_iter().filter(|p| p.0 < end).map(|p| (p.0, p.1.min(end))).collect(),
+    }
 }
 
 /// Whether every byte of `b` is zero (eight at a time: gigabytes a second where it is).
@@ -4456,6 +4492,61 @@ pub(super) mod tests {
         assert!(tbl.kept_by_va.is_empty() && tbl.by_res.contains_key(&6));
     }
 
+    /// `XCL_KEEP_TAILS`: a placed texture of one slice a newer one is placed over at another
+    /// address stays active and is named once for pages of its own, whichever of the two starts
+    /// first; a cube needs `XCL_KEEP_SUPERSEDED`, and a texture placed at its own address
+    /// retires it as before.
+    #[test]
+    fn a_texture_of_one_slice_under_a_newer_placement_at_another_address_stays_active() {
+        let cube = Arc::new(xg::Texture::new(&console_desc(3, 64, 64, 6, 1, 28, 0x105)).unwrap());
+        let tex_16k = Arc::new(xg::Texture::new(&console_desc(3, 64, 64, 1, 1, 28, 0x105)).unwrap());
+        let tex_1m = Arc::new(xg::Texture::new(&console_desc(3, 512, 512, 1, 1, 28, 0x105)).unwrap());
+        assert!(tex_16k.size() == 0x4000 && tex_1m.size() == 0x10_0000);
+        let entry = |va: usize, tex: &Arc<xg::Texture>| Entry {
+            device: 0,
+            va,
+            src: va,
+            in_gpu_view: false,
+            paged: false,
+            tex: Arc::clone(tex),
+            states: vec![D3D12_RESOURCE_STATE_COMMON],
+            pending: false,
+            gpu_written: false,
+            written_call: 0,
+            placed: true,
+            unmapped: false,
+            seq: 0,
+            known: Default::default(),
+            target: false,
+        };
+        // without the switch it is shadowed and loses its tiles
+        let mut tbl = Table::new();
+        tbl.insert(1, entry(0x10_8000, &tex_16k));
+        assert_eq!(tbl.insert(2, entry(0x10_0000, &tex_1m)), (0, vec![1]));
+        assert!(tbl.shadowed.contains_key(&1) && tbl.newly_kept.is_empty());
+        // with it: under a newer one that starts before it
+        let mut tbl = Table::new();
+        tbl.keep_tails = true;
+        tbl.insert(1, entry(0x10_8000, &tex_16k));
+        assert_eq!(tbl.insert(2, entry(0x10_0000, &tex_1m)), (0, vec![]));
+        assert!(tbl.by_res.contains_key(&1) && tbl.by_res.contains_key(&2) && tbl.shadowed.is_empty());
+        assert_eq!(std::mem::take(&mut tbl.newly_kept), vec![1]);
+        assert_eq!(tbl.kept_by_va.get(&(0x10_8000, 1)), Some(&0x10_c000));
+        assert!(tbl.touched_by(&[0x10_8000]).contains(&1));
+        // and under one that starts inside it
+        assert_eq!(tbl.insert(3, entry(0x10_4000, &tex_16k)), (0, vec![]));
+        assert_eq!(std::mem::take(&mut tbl.newly_kept), vec![2]);
+        assert!(tbl.kept_by_va.contains_key(&(0x10_0000, 2)) && tbl.shadowed.is_empty());
+        // another texture placed at its own address retires it
+        assert_eq!(tbl.insert(4, entry(0x10_8000, &tex_1m)).1, vec![1]);
+        assert!(tbl.shadowed.contains_key(&1) && tbl.by_res.contains_key(&2) && tbl.by_res.contains_key(&3));
+        // a cube is not kept by this switch
+        let mut tbl = Table::new();
+        tbl.keep_tails = true;
+        tbl.insert(1, entry(0x10_8000, &cube));
+        assert_eq!(tbl.insert(2, entry(0x10_0000, &tex_1m)), (0, vec![1]));
+    }
+
     /// Real GPU: render targets at two addresses of one physical page (mapped at the second after
     /// the first, as a retail game aliases its targets) share one page of video memory, as on the
     /// console; a target on another physical page gets its own.
@@ -5395,6 +5486,158 @@ pub(super) mod tests {
             assert!(read_sub(&full, 0) == want[0].data, "mip 0 on the pages the other texture kept");
             super::super::vram::LEVEL_PAGES_FOR_TEST.store(false, Ordering::Relaxed);
             drop((small, full));
+            VirtualFree(at as *mut c_void, 0, MEM_RELEASE);
+        }
+    }
+
+    /// Real GPU, `XCL_KEEP_TAILS` with `XCL_TEXTURE_LEVEL_PAGES=1`: three textures described at
+    /// full size, each with memory under everything below mip 0 only and placed where the one
+    /// before has its mip 0, as a title packs streamed textures. The older one stays live under
+    /// the newer: the levels of its last group of tiles keep their texels, on pages of its own,
+    /// and the newer one holds its own. With no room left under the cap the next one kept gets
+    /// no pages and reads zeros, as a superseded texture does.
+    #[test]
+    fn a_streamed_texture_under_the_next_ones_description_keeps_its_smallest_levels() {
+        let _vram_guard = super::super::vram::VRAM_TEST_LOCK.lock().unwrap();
+        let _guard = TEST_LOCK.lock().unwrap();
+        use windows::Win32::Graphics::Direct3D::D3D_FEATURE_LEVEL_11_0;
+        use windows::Win32::Graphics::Dxgi::Common::DXGI_SAMPLE_DESC;
+        use windows::Win32::Graphics::Dxgi::*;
+        use windows_sys::Win32::System::Memory::{VirtualAlloc, VirtualFree, MEM_COMMIT, MEM_RELEASE, MEM_RESERVE, PAGE_READWRITE};
+        const NAME: &str = "a_streamed_texture_under_the_next_ones_description_keeps_its_smallest_levels";
+        unsafe {
+            let factory: IDXGIFactory4 = CreateDXGIFactory1().expect("DXGI factory");
+            let Ok(adapter) = factory.EnumAdapters1(0) else { return println!("SKIPPED {NAME}: no adapter") };
+            if adapter.GetDesc1().is_ok_and(|d| d.Flags & DXGI_ADAPTER_FLAG_SOFTWARE.0 as u32 != 0) {
+                return println!("SKIPPED {NAME}: software adapter");
+            }
+            let mut dev: Option<ID3D12Device> = None;
+            let _ = D3D12CreateDevice(&adapter, D3D_FEATURE_LEVEL_11_0, &mut dev);
+            let Some(dev) = dev else { return println!("SKIPPED {NAME}: no D3D12 device") };
+            let mut opts = D3D12_FEATURE_DATA_D3D12_OPTIONS::default();
+            if dev.CheckFeatureSupport(D3D12_FEATURE_D3D12_OPTIONS, &mut opts as *mut _ as *mut c_void, std::mem::size_of_val(&opts) as u32).is_err()
+                || opts.ResourceHeapTier.0 < 2
+                || opts.TiledResourcesTier.0 < D3D12_TILED_RESOURCES_TIER_2.0
+            {
+                return println!("SKIPPED {NAME}: tiled tier < 2");
+            }
+            super::super::real::adopt(dev.as_raw(), super::super::real::Kind::Device);
+            let queue: ID3D12CommandQueue = dev.CreateCommandQueue(&D3D12_COMMAND_QUEUE_DESC::default()).unwrap();
+            let riid = &ID3D12Resource::IID as *const windows::core::GUID as *const windows_sys::core::GUID;
+            // 1024x1024 RGBA8, 11 levels, 64 KiB blocks: 5.4 MiB on the console
+            let d = console_desc(3, 1024, 1024, 1, 11, 28, 0x109);
+            let place_tex = |va: usize| -> ID3D12Resource {
+                let mut p = std::ptr::null_mut();
+                let hr = super::super::device_x::create_placed_resource_x(dev.as_raw(), va as u64, d.as_ptr(), D3D12_RESOURCE_STATE_COMMON.0 as u32, std::ptr::null(), riid, &mut p);
+                assert!(hr >= 0 && !p.is_null(), "CreatePlacedResourceX failed: {hr:#x}");
+                ID3D12Resource::from_raw(p)
+            };
+            let read_sub = |r: &ID3D12Resource, sub: u32| -> Vec<u8> {
+                let rd = r.GetDesc();
+                let mut fp = D3D12_PLACED_SUBRESOURCE_FOOTPRINT::default();
+                let (mut rows, mut row_bytes, mut total) = (0u32, 0u64, 0u64);
+                dev.GetCopyableFootprints(&rd, sub, 1, 0, Some(&mut fp), Some(&mut rows), Some(&mut row_bytes), Some(&mut total));
+                let mut rb: Option<ID3D12Resource> = None;
+                let buffer = D3D12_RESOURCE_DESC { Dimension: D3D12_RESOURCE_DIMENSION_BUFFER, Width: total, Height: 1, DepthOrArraySize: 1, MipLevels: 1, SampleDesc: DXGI_SAMPLE_DESC { Count: 1, Quality: 0 }, Layout: D3D12_TEXTURE_LAYOUT_ROW_MAJOR, ..Default::default() };
+                dev.CreateCommittedResource(&D3D12_HEAP_PROPERTIES { Type: D3D12_HEAP_TYPE_READBACK, ..Default::default() }, D3D12_HEAP_FLAG_NONE, &buffer, D3D12_RESOURCE_STATE_COPY_DEST, None, &mut rb).unwrap();
+                let rb = rb.unwrap();
+                let alloc: ID3D12CommandAllocator = dev.CreateCommandAllocator(D3D12_COMMAND_LIST_TYPE_DIRECT).unwrap();
+                let list: ID3D12GraphicsCommandList = dev.CreateCommandList(0, D3D12_COMMAND_LIST_TYPE_DIRECT, &alloc, None).unwrap();
+                let dst = D3D12_TEXTURE_COPY_LOCATION { pResource: std::mem::transmute_copy(&rb), Type: D3D12_TEXTURE_COPY_TYPE_PLACED_FOOTPRINT, Anonymous: D3D12_TEXTURE_COPY_LOCATION_0 { PlacedFootprint: fp } };
+                let src = D3D12_TEXTURE_COPY_LOCATION { pResource: std::mem::transmute_copy(r), Type: D3D12_TEXTURE_COPY_TYPE_SUBRESOURCE_INDEX, Anonymous: D3D12_TEXTURE_COPY_LOCATION_0 { SubresourceIndex: sub } };
+                list.CopyTextureRegion(&dst, 0, 0, 0, &src, None);
+                list.Close().unwrap();
+                own_work(|| {
+                    super::super::vram::before_execute(&queue);
+                    queue.ExecuteCommandLists(&[Some(list.cast().unwrap())]);
+                    texture::wait(&dev, &queue).unwrap();
+                });
+                let mut p = std::ptr::null_mut();
+                rb.Map(0, None, Some(&mut p)).unwrap();
+                let mut out = Vec::with_capacity(rows as usize * row_bytes as usize);
+                for y in 0..rows as usize {
+                    out.extend_from_slice(std::slice::from_raw_parts((p as *const u8).add(y * fp.Footprint.RowPitch as usize), row_bytes as usize));
+                }
+                rb.Unmap(0, None);
+                out
+            };
+            let tex = xg::Texture::new(&d).unwrap();
+            let surface = tex.texels().unwrap();
+            let (size, chain) = (tex.size() as usize, &surface.chain);
+            // everything below mip 0 is the first part of a texture (`tiling::Chain`); the next
+            // texture starts where that ends
+            let top = chain.levels[0].offset;
+            assert!(top > 0 && top % 0x1000 == 0 && 3 * top <= size, "three of them fit under the first one's mip 0: {top:#x} of {size:#x}");
+            let at = VirtualAlloc(std::ptr::null(), (2 * top + size).next_multiple_of(0x1_0000), MEM_RESERVE, PAGE_READWRITE) as usize;
+            assert_ne!(at, 0);
+            assert!(!VirtualAlloc(at as *const c_void, 3 * top, MEM_COMMIT, PAGE_READWRITE).is_null());
+            // what the levels of each hold, and those bytes at its place (no byte of them zero)
+            let mut want: Vec<Vec<Subresource>> = Vec::new();
+            for k in 0..3usize {
+                let mut whole = vec![0u8; size];
+                for (m, l) in chain.levels.iter().enumerate() {
+                    let pat: Vec<u8> = (0..l.width * l.height * surface.bpe as usize).map(|i| 1 + ((k * 31 + m * 7 + i * 13) % 251) as u8).collect();
+                    chain.tile_level(&mut whole[..chain.slice_bytes], m, 0, &pat);
+                }
+                std::ptr::copy_nonoverlapping(whole.as_ptr(), (at + k * top) as *mut u8, top);
+                want.push(subresources(whole.as_ptr() as usize, &tex));
+            }
+
+            super::super::vram::LEVEL_PAGES_FOR_TEST.store(true, Ordering::Relaxed);
+            let off = || {
+                super::super::vram::LEVEL_PAGES_FOR_TEST.store(false, Ordering::Relaxed);
+                super::super::vram::TAIL_CAP_FOR_TEST.with(|c| c.set(None));
+            };
+            let a = place_tex(at);
+            let a_key = a.as_raw() as usize;
+            if !super::super::vram::has_lazy_levels(a_key) {
+                off();
+                drop(a);
+                VirtualFree(at as *mut c_void, 0, MEM_RELEASE);
+                return println!("SKIPPED {NAME}: this adapter's texture was not placed with lazy levels");
+            }
+            refresh(queue.as_raw());
+            for sub in 1..11u32 {
+                assert!(read_sub(&a, sub) == want[0][sub as usize].data, "level {sub} of the first one after its upload");
+            }
+            // the second one is placed over the first one's mip 0: the first one stays live
+            let (_, _, kept0, refused0) = super::super::vram::tail_stats();
+            super::super::vram::TAIL_CAP_FOR_TEST.with(|c| c.set(Some(1 << 20)));
+            let b = place_tex(at + top);
+            let b_key = b.as_raw() as usize;
+            refresh(queue.as_raw());
+            let Some((first, true)) = super::super::vram::tail_levels(a_key) else { panic!("the first one is kept, and its last group has pages: {:?}", super::super::vram::tail_levels(a_key)) };
+            assert!(first >= 1 && first < 11, "its last group starts at level {first}");
+            let tiles = super::super::vram::mapped_level_tiles(a_key).unwrap();
+            assert!(tiles > 0, "the kept one has pages");
+            assert_eq!(super::super::vram::tail_stats().2, kept0 + 1);
+            for sub in first..11 {
+                assert!(read_sub(&a, sub) == want[0][sub as usize].data, "level {sub} of the kept one");
+            }
+            for sub in 0..first {
+                assert!(read_sub(&a, sub).iter().all(|&x| x == 0), "level {sub} of the kept one has no pages");
+            }
+            for sub in 1..11u32 {
+                assert!(read_sub(&b, sub) == want[1][sub as usize].data, "level {sub} of the second one");
+            }
+            // the third one over the second, and no room under the cap: the second one is kept
+            // and gets no pages; the first one keeps its
+            super::super::vram::TAIL_CAP_FOR_TEST.with(|c| c.set(Some(super::super::vram::tail_stats().1)));
+            let c = place_tex(at + 2 * top);
+            refresh(queue.as_raw());
+            assert_eq!(super::super::vram::tail_levels(b_key).map(|t| t.1), Some(false), "the second one is kept without pages");
+            assert!(super::super::vram::tail_stats().3 > refused0);
+            assert_eq!(super::super::vram::mapped_level_tiles(b_key), Some(0));
+            assert!(read_sub(&b, 10).iter().all(|&x| x == 0), "a kept texture without pages reads zeros");
+            assert_eq!(super::super::vram::mapped_level_tiles(a_key), Some(tiles));
+            for sub in first..11 {
+                assert!(read_sub(&a, sub) == want[0][sub as usize].data, "level {sub} of the first one after the third");
+            }
+            for sub in 1..11u32 {
+                assert!(read_sub(&c, sub) == want[2][sub as usize].data, "level {sub} of the third one");
+            }
+            off();
+            drop((a, b, c));
             VirtualFree(at as *mut c_void, 0, MEM_RELEASE);
         }
     }
