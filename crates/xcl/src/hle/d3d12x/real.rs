@@ -2625,6 +2625,7 @@ unsafe extern "system" fn dev_create_dsv_x(this: *mut c_void, res: *mut c_void, 
     }
     let flags = copy.as_ref().map_or(0, |c| c.Flags.0 as u32);
     f(this, res, copy.as_ref().map_or(desc, |c| c as *const _), cpu);
+    super::placements::note_dsv(cpu as usize, res as usize);
     super::depth_uav::note_dsv(cpu as usize, res as usize, flags);
     super::depth_uav_sync::note_dsv(cpu as usize, res as usize, flags);
 }
@@ -9103,6 +9104,12 @@ unsafe extern "system" fn cl_clear_rtv(this: *mut c_void, rtv: usize, color: *co
             super::lut3d::wrote(r, false, || format!("ClearRenderTargetView {rtv:#x} to {:?}, {n} rects", color.as_ref()));
         }
     }
+    // (a superseded target the title clears is used again: `placements`)
+    if super::placements::any_superseded() {
+        if let Some(r) = super::present::rtv_resource(rtv) {
+            super::placements::note_use(r);
+        }
+    }
     if let Some(c) = color.as_ref().filter(|c| c.iter().any(|v| v.is_nan())) {
         if let Some(fixed) = integer_clear_bits(rtv, c) {
             return f(this, rtv, &fixed, n, rects);
@@ -9156,6 +9163,20 @@ unsafe extern "system" fn cl_om_set_render_targets(this: *mut c_void, n: u32, rt
     if !dsv.is_null() {
         super::depth_uav_sync::before_bind_dsv(this, *dsv);
         super::depth_uav::before_dsv_bind(this, *dsv);
+    }
+    // (a superseded target the title binds is used again: `placements`)
+    if super::placements::any_superseded() {
+        if !dsv.is_null() {
+            super::placements::note_dsv_use(*dsv);
+        }
+        if !rtvs.is_null() {
+            for k in 0..n.min(D3D12_SIMULTANEOUS_RENDER_TARGET_COUNT) as usize {
+                let h = if single != 0 { *rtvs + k * 32 } else { *rtvs.add(k) };
+                if let Some(r) = super::present::rtv_resource(h) {
+                    super::placements::note_use(r);
+                }
+            }
+        }
     }
     f(this, n, rtvs, single, dsv);
     super::list_x::note_render_targets(this, n, rtvs, single, dsv);
