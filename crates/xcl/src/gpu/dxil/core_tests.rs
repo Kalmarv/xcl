@@ -1316,6 +1316,8 @@ fn compute_movrel_uses_program_max_vgpr_and_masks_m0() {
         ("V_MOV_B32", "ENC_VOP1", &[("VDST", 1), ("SRC0", 129)], None),
         ("V_MOVRELS_B32", "ENC_VOP1", &[("VDST", 0), ("SRC0", 256 + 1)], None),
         ("V_MOV_B32", "ENC_VOP1", &[("VDST", 5), ("SRC0", 130)], None),
+        // Keep v0 live across DCE by storing it to global memory.
+        ("GLOBAL_STORE_DWORD", "ENC_FLAT_GLBL", &[("ADDR", 1), ("DATA", 0), ("SADDR", 127)], None),
     ]);
     let cs = CsInterface { threads: [32, 1, 1], user_sgprs: 2, tgid: [false; 3], tg_size: false, tid_components: 1 };
     let k = super::kernel::translate_compute(&code, ko, &cs).expect("compute movrel translates");
@@ -1333,7 +1335,7 @@ fn raw_buffer_oob_check_guards_32bit_wraparound() {
     // (`icmp uge`) for both `voff + OFFSET` and `off + bytes` (#1893).
     let code = prog(&[
         ("BUFFER_LOAD_DWORD", "ENC_MUBUF", &[("VDATA", 3), ("VADDR", 0), ("SRSRC", 0), ("SOFFSET", 128), ("OFFEN", 1), ("OFFSET", 16)], None),
-        ("BUFFER_ATOMIC_ADD", "ENC_MUBUF", &[("VDATA", 4), ("VADDR", 0), ("SRSRC", 0), ("SOFFSET", 128), ("OFFEN", 1), ("OFFSET", 16)], None),
+        ("BUFFER_ATOMIC_ADD", "ENC_MUBUF", &[("VDATA", 4), ("VADDR", 0), ("SRSRC", 0), ("SOFFSET", 128), ("OFFEN", 1), ("OFFSET", 32)], None),
     ]);
     let dxil = translate(&code, ko).expect("mubuf + atomic translates");
     super::validate::validate(&dxil).expect("validates");
