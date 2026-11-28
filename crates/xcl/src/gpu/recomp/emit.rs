@@ -2488,6 +2488,23 @@ impl Em {
 
     // ---------------------------------------------------------------- images (MIMG)
 
+    /// SM 6.6 has no comparison sample with gradients. For each pixel in a quad, build a
+    /// footprint centered at its coordinate and let SampleCmp do its usual filtering.
+    /// Evaluate all four samples before selecting so the texture derivatives see the whole quad.
+    fn sample_cmp_grad(&mut self, t: &str, ty: &str, coord: &str, dx: &str, dy: &str, args: &str) -> String {
+        self.line(&format!("int2 {t}_xy = int2(xi.xcl_pos.x > QuadReadAcrossX(xi.xcl_pos.x), xi.xcl_pos.y > QuadReadAcrossY(xi.xcl_pos.y));"));
+        self.line(&format!("float4 {t}_values; [unroll] for (uint {t}_q = 0; {t}_q < 4; ++{t}_q) {{"));
+        self.line(&format!("    int2 {t}_delta = {t}_xy - int2({t}_q & 1u, {t}_q >> 1);"));
+        self.line(&format!("    {ty} {t}_p = QuadReadLaneAt({coord}, {t}_q);"));
+        self.line(&format!("    {ty} {t}_dx = QuadReadLaneAt({dx}, {t}_q), {t}_dy = QuadReadLaneAt({dy}, {t}_q);"));
+        // Keep the coordinate on each stationary axis even for a nonfinite gradient (0 * inf is NaN).
+        self.line(&format!("    {t}_p = {t}_delta.x == 0 ? {t}_p : {t}_p + {t}_delta.x * {t}_dx;"));
+        self.line(&format!("    {t}_p = {t}_delta.y == 0 ? {t}_p : {t}_p + {t}_delta.y * {t}_dy;"));
+        self.line(&format!("    {t}_values[{t}_q] = {t}_T.SampleCmp({t}_S, {args});"));
+        self.line("}");
+        format!("{t}_values[{t}_xy.x + 2 * {t}_xy.y].xxxx")
+    }
+
     /// MIMG → SM 6.6 dynamic resources. XCL image descriptors (T#, 8 dwords) keep the GFX10
     /// layout, but BASE_ADDRESS (word 0) holds the index of the SRV in the CBV/SRV/UAV heap
     /// (UAV at +1); FORMAT (word 1 [28:20]) selects the typed view (float/uint/sint).

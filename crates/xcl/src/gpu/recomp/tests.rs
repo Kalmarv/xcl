@@ -2424,6 +2424,58 @@ fn draw_console_views(
     runner::draw_views(&vsb, &psb, &layout, &verts, 24, sgprs, &[], textures, samplers, 16, [-1.0; 4]).unwrap()
 }
 
+/// Both depth mips contain a checkerboard, in opposite phases. Check the comparison result at
+/// each pixel so that selecting a neighbor's coordinates is distinguishable from selecting its mip.
+fn check_ps_depth_mip(ps: &[u8], coord_scale: f32, mip_at: impl Fn(usize) -> u32) -> Result<(), String> {
+    use windows::Win32::Graphics::Direct3D12::*;
+    use windows::Win32::Graphics::Dxgi::Common::{DXGI_FORMAT_R32_FLOAT, DXGI_FORMAT_R32_TYPELESS, DXGI_SAMPLE_DESC};
+    let mut data = Vec::new();
+    for level in 0..2 {
+        let size = 8 >> level;
+        for y in 0..size {
+            for x in 0..size {
+                let depth = if (x + y + level) % 2 == 0 { 0.25f32 } else { 0.75f32 };
+                data.extend_from_slice(&depth.to_le_bytes());
+            }
+        }
+    }
+    let res = D3D12_RESOURCE_DESC {
+        Dimension: D3D12_RESOURCE_DIMENSION_TEXTURE2D, Width: 8, Height: 8, DepthOrArraySize: 1, MipLevels: 2,
+        Format: DXGI_FORMAT_R32_TYPELESS, SampleDesc: DXGI_SAMPLE_DESC { Count: 1, Quality: 0 },
+        Flags: D3D12_RESOURCE_FLAG_ALLOW_DEPTH_STENCIL, ..Default::default()
+    };
+    let mut srv = D3D12_SHADER_RESOURCE_VIEW_DESC {
+        Format: DXGI_FORMAT_R32_FLOAT, ViewDimension: D3D12_SRV_DIMENSION_TEXTURE2D,
+        Shader4ComponentMapping: D3D12_DEFAULT_SHADER_4_COMPONENT_MAPPING, ..Default::default()
+    };
+    srv.Anonymous.Texture2D = D3D12_TEX2D_SRV { MipLevels: 2, ..Default::default() };
+    let tex = runner::ViewTexture { res, srv, data, row_bytes: 8 * 4 };
+    // Clamp U/V/W, LESS_EQUAL, point min/mag/mip, LOD range 0..15.99.
+    let sampler = [2 | 2 << 3 | 2 << 6 | 3 << 12, 0xFFF << 12, 1 << 26, 0];
+    let mut sgprs = [0; 32];
+    sgprs[16..24].copy_from_slice(&tsharp(0, 77, 9));
+    sgprs[24..28].copy_from_slice(&sampler);
+    let samplers = [crate::gpu::desc::sampler_d3d12(&sampler, true)];
+    // The second triangle cuts through 2x2 quads. Its diagonal is 4*x + 3*y = 48;
+    // no pixel center lies exactly on it. Uncovered pixels must retain the clear value.
+    for (width, height) in [(32.0, 32.0), (12.0, 16.0)] {
+        let tri = [[0.0, 0.0], [0.0, height], [width, 0.0]];
+        let pixels = draw_console_views(None, Some(ps), &tri, &sgprs, std::slice::from_ref(&tex), &samplers);
+        for (i, pixel) in pixels.iter().enumerate() {
+            let (x, y) = (i % 16, i / 16);
+            let mip = mip_at(x);
+            let size = 8u32 >> mip;
+            let texel = |p: usize| (((p as f32 + 0.5) * coord_scale * size as f32) as u32).min(size - 1);
+            let covered = (x as f32 + 0.5) * height + (y as f32 + 0.5) * width < width * height;
+            let expected = if covered { ((texel(x) + texel(y) + mip) % 2) as f32 } else { -1.0 };
+            if pixel[0] != expected {
+                return Err(format!("{width}x{height} triangle, pixel ({x},{y}): {} instead of {expected} at mip {mip}", pixel[0]));
+            }
+        }
+    }
+    Ok(())
+}
+
 /// `image_sample_o` in a pixel shader, implicit LOD between two mips (trilinear): the console
 /// moves each mip's texel coordinate by the offset in that mip's texels. A 4-level texture
 /// (8², 4², 2², 1²; level k texel x holds 100·k + x), point min / mag, linear mip, clamp;
