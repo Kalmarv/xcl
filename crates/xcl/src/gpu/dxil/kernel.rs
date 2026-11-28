@@ -702,7 +702,7 @@ impl Lw {
                 slot = slot.max(w);
             }
         }
-        lw.static_samplers = crate::gpu::recomp::constant_samplers(insts, leaders, matches!(entry, Entry::Vertex(_) | Entry::Pixel(_)));
+        lw.static_samplers = crate::gpu::recomp::constant_samplers(insts, leaders, matches!(entry, Entry::Vertex(_) | Entry::Pixel(_)), lw.wave64);
         let group_threads: Option<u32> = match entry {
             Entry::Vertex(_) | Entry::Pixel(_) => None,
             Entry::Kernel => None,

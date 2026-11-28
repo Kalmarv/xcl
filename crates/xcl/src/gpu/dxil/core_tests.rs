@@ -697,6 +697,29 @@ fn multi_window_mem_format_and_bvh_validate() {
     }
 }
 
+/// Direct path of `recomp::tests::wave32_compare_mask_keeps_the_s_word_above_it`: a wave32
+/// VOP3 compare into `s[12:13]` writes s12 only, so the S# set around it in s[12:15] stays a
+/// static comparison sampler and not sampler-heap entry 0.
+#[test]
+fn cs_wave32_compare_mask_keeps_the_s_word_above_it() {
+    use crate::gpu::recomp::CsInterface;
+    const V: u64 = 256;
+    let shadow = [0x3092u32, 0x00C0_0000, 0x1850_0000, 0];
+    let code = prog(&[
+        ("S_MOV_B32", "ENC_SOP1", &[("SDST", 15), ("SSRC0", 128)], None),
+        ("S_MOV_B32", "ENC_SOP1", &[("SDST", 14), ("SSRC0", 255)], Some(shadow[2])),
+        ("S_MOV_B32", "ENC_SOP1", &[("SDST", 13), ("SSRC0", 255)], Some(shadow[1])),
+        ("V_CMP_EQ_U32", "ENC_VOP3", &[("VDST", 12), ("SRC0", 129), ("SRC1", V + 5)], None),
+        ("V_CNDMASK_B32", "ENC_VOP3", &[("VDST", 6), ("SRC0", V + 6), ("SRC1", V + 7), ("SRC2", 12)], None),
+        ("S_MOVK_I32", "ENC_SOPK", &[("SDST", 12), ("SIMM16", shadow[0] as u64)], None),
+        ("IMAGE_SAMPLE_C_LZ", "ENC_MIMG", &[("VDATA", 10), ("VADDR", 0), ("SRSRC", 5), ("SSAMP", 3), ("DMASK", 1), ("DIM", 1)], None),
+    ]);
+    let cs = CsInterface { threads: [32, 1, 1], user_sgprs: 0, tgid: [false; 3], tg_size: false, tid_components: 1, ..Default::default() };
+    let o = KernelOptions { wave64: false, split: false, mem_windows: 1, sampler_base: 0 };
+    let k = super::kernel::translate_compute(&code, o, &cs).unwrap_or_else(|e| panic!("{}", &e[..e.len().min(800)]));
+    assert_eq!(k.static_samplers, vec![(shadow, true)], "the S# is a static comparison sampler");
+}
+
 /// `image_get_lod` with a static sampler (an S# built from constants in the code) translates
 /// to `CalculateLevelOfDetail` on the sampler bound at `s<i>, space1`, shared with a sample of
 /// the same S#, and validates.
