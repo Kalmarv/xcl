@@ -9760,32 +9760,35 @@ unsafe extern "system" fn q_execute_command_lists(this: *mut c_void, n: u32, lis
     super::submit_cost::done(submit_t0);
 }
 
-/// `XCL_SERIAL_QUEUES=1` (a diagnostic, off by default): each title compute queue signals a fence
-/// of XCL's after its lists, and a direct queue's lists wait on the CPU (up to 100 ms in all) until
-/// what the compute queues were given before them is done. Work a compute queue holds back for a
-/// direct queue's later signal runs into the limit instead of a deadlock.
-fn serial_queues() -> bool {
-    static ON: OnceLock<bool> = OnceLock::new();
+/// `XCL_SERIAL_QUEUES=MS` (a diagnostic, off by default; 1 means 100): each title compute queue
+/// signals a fence of XCL's after its lists, and a direct queue's lists wait on the CPU until what
+/// the compute queues were given before them is done: up to MS, and while one of those fences
+/// still moves, up to 2 s. Work a compute queue holds back for a direct queue's later signal runs
+/// into the limit instead of a deadlock; the log counts those (no fence moved) apart from the
+/// slow ones (fences moved but not far enough).
+fn serial_queues() -> Option<std::time::Duration> {
+    static ON: OnceLock<Option<std::time::Duration>> = OnceLock::new();
     *ON.get_or_init(|| {
-        let on = std::env::var("XCL_SERIAL_QUEUES").is_ok_and(|v| v.trim() == "1");
-        if on {
-            crate::xlog_info!("D3D12.X: XCL_SERIAL_QUEUES=1: direct-queue submits wait (up to 100 ms) for the compute queues' earlier submits");
-        }
-        on
+        let ms = std::env::var("XCL_SERIAL_QUEUES").ok()?.trim().parse::<u64>().ok().filter(|&ms| ms > 0)?;
+        let ms = if ms == 1 { 100 } else { ms };
+        crate::xlog_info!("D3D12.X: XCL_SERIAL_QUEUES: direct-queue submits wait (up to {ms} ms, 2 s while the compute fences move) for the compute queues' earlier submits");
+        Some(std::time::Duration::from_millis(ms))
     })
 }
 
 /// compute queue → XCL's fence on it and the last value it was given
 static SERIAL_COMPUTE: Mutex<Option<HashMap<usize, (ID3D12Fence, u64)>>> = Mutex::new(None);
-/// direct-queue submits that waited, that ran into the limit, and the time they waited (µs)
-static SERIAL_STATS: [AtomicU64; 3] = [AtomicU64::new(0), AtomicU64::new(0), AtomicU64::new(0)];
+/// direct-queue submits that waited, that gave up with no compute fence moving (blocked), that
+/// gave up with fences moving (slow), and the time they waited (µs)
+static SERIAL_STATS: [AtomicU64; 4] = [AtomicU64::new(0), AtomicU64::new(0), AtomicU64::new(0), AtomicU64::new(0)];
 
 unsafe fn serial_queue_type(q: *mut c_void) -> Option<D3D12_COMMAND_LIST_TYPE> {
     Some(ID3D12CommandQueue::from_raw_borrowed(&q)?.GetDesc().Type)
 }
 
 unsafe fn serial_queues_before(q: *mut c_void) {
-    if !serial_queues() || serial_queue_type(q) != Some(D3D12_COMMAND_LIST_TYPE_DIRECT) {
+    let Some(limit) = serial_queues() else { return };
+    if serial_queue_type(q) != Some(D3D12_COMMAND_LIST_TYPE_DIRECT) {
         return;
     }
     let pending: Vec<(ID3D12Fence, u64)> = SERIAL_COMPUTE.lock().unwrap().as_ref().map_or_else(Vec::new, |m| m.values().filter(|(f, v)| fence_completed(f) < *v).cloned().collect());
@@ -9793,27 +9796,39 @@ unsafe fn serial_queues_before(q: *mut c_void) {
         return;
     }
     let t = std::time::Instant::now();
-    let limit = std::time::Duration::from_millis(100);
-    let mut late = false;
-    for (f, v) in &pending {
-        while fence_completed(f) < *v {
-            if t.elapsed() >= limit {
-                late = true;
-                break;
+    let mut seen: Vec<u64> = pending.iter().map(|(f, _)| fence_completed(f)).collect();
+    let (mut moved_at, mut moved) = (t, false);
+    // (0: done, 1: blocked, 2: slow)
+    let outcome = loop {
+        let mut done = true;
+        for (k, (f, v)) in pending.iter().enumerate() {
+            let c = fence_completed(f);
+            if c > seen[k] {
+                seen[k] = c;
+                moved_at = std::time::Instant::now();
+                moved = true;
             }
-            std::thread::sleep(std::time::Duration::from_micros(200));
+            done &= c >= *v;
         }
-    }
+        if done {
+            break 0;
+        }
+        if moved_at.elapsed() >= limit || t.elapsed() >= std::time::Duration::from_secs(2) {
+            break if moved { 2 } else { 1 };
+        }
+        std::thread::sleep(std::time::Duration::from_micros(200));
+    };
     let waited = SERIAL_STATS[0].fetch_add(1, Ordering::Relaxed) + 1;
-    let lates = SERIAL_STATS[1].fetch_add(late as u64, Ordering::Relaxed) + late as u64;
-    let us = SERIAL_STATS[2].fetch_add(t.elapsed().as_micros() as u64, Ordering::Relaxed) + t.elapsed().as_micros() as u64;
-    if waited.is_power_of_two() || (late && lates.is_power_of_two()) {
-        crate::xlog_info!("D3D12.X: XCL_SERIAL_QUEUES: {waited} direct submits waited for compute queues ({lates} ran into the 100 ms limit), {} ms in all", us / 1000);
+    let blocked = SERIAL_STATS[1].fetch_add((outcome == 1) as u64, Ordering::Relaxed) + (outcome == 1) as u64;
+    let slow = SERIAL_STATS[2].fetch_add((outcome == 2) as u64, Ordering::Relaxed) + (outcome == 2) as u64;
+    let us = SERIAL_STATS[3].fetch_add(t.elapsed().as_micros() as u64, Ordering::Relaxed) + t.elapsed().as_micros() as u64;
+    if waited.is_power_of_two() {
+        crate::xlog_info!("D3D12.X: XCL_SERIAL_QUEUES: {waited} direct submits waited for compute queues ({} done, {blocked} gave up with no compute fence moving, {slow} with fences moving but short), {} ms in all", waited - blocked - slow, us / 1000);
     }
 }
 
 unsafe fn serial_queues_after(q: *mut c_void) {
-    if !serial_queues() || serial_queue_type(q) != Some(D3D12_COMMAND_LIST_TYPE_COMPUTE) {
+    if serial_queues().is_none() || serial_queue_type(q) != Some(D3D12_COMMAND_LIST_TYPE_COMPUTE) {
         return;
     }
     let Some(queue) = ID3D12CommandQueue::from_raw_borrowed(&q) else { return };
