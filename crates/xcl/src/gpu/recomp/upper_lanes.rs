@@ -273,7 +273,7 @@ impl UpperLanes {
 fn reaches_upper(d: &Decoded) -> bool {
     match d.inst.name {
         "V_READLANE_B32" => !matches!(lane_operand(d), Lane::Const(l) if l < 32),
-        "DS_BPERMUTE_B32" | "DS_PERMUTE_B32" => true,
+        "DS_PERMUTE_B32" => true,
         _ => false,
     }
 }
@@ -703,10 +703,6 @@ fn classify(d: &Decoded, st: &State) -> Option<(Read, Option<(u64, u32)>)> {
                 Lane::Sgpr => Some((any_upper(v), None)),
             }
         }
-        "DS_BPERMUTE_B32" => {
-            // source lanes ≥ 32 inactive: 0, as `Em::ds` gives for them
-            Some((if st.s[127] == Word::Zero { Read::Native } else { any_upper(fv("DATA0")) }, None))
-        }
         "DS_PERMUTE_B32" => Some((Read::Unknown, None)),
         _ => None,
     }
@@ -980,7 +976,7 @@ mod tests {
             ("V_READLANE_B32", "ENC_VOP3", &[("VDST", 4), ("SRC0", V + 51), ("SRC1", 0)], None),
             ("DS_BPERMUTE_B32", "ENC_DS", &[("VDST", 1), ("ADDR", 2), ("DATA0", 51)], None),
         ]);
-        assert_eq!(r, vec![Read::Native, Read::Native]);
+        assert_eq!(r, vec![Read::Native]);
         // after s_mov_b64 exec, -1 (no saved copy) the same move writes the upper lanes
         let r = reads(&[
             ("S_MOV_B64", "ENC_SOP1", &[("SDST", 126), ("SSRC0", 193)], None),
@@ -988,7 +984,7 @@ mod tests {
             ("V_READLANE_B32", "ENC_VOP3", &[("VDST", 4), ("SRC0", V + 51), ("SRC1", 0)], None),
             ("DS_BPERMUTE_B32", "ENC_DS", &[("VDST", 1), ("ADDR", 2), ("DATA0", 51)], None),
         ]);
-        assert_eq!(r, vec![Read::Unknown, Read::Unknown]);
+        assert_eq!(r, vec![Read::Unknown]);
     }
 
     #[test]

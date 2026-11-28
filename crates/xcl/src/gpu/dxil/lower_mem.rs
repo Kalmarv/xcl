@@ -2198,13 +2198,20 @@ impl Lw {
                 return Ok(());
             }
             "ds_bpermute_b32" => {
+                // RDNA2 Wave64 executes ds_bpermute_b32 as two independent 32-lane halves:
+                // each half indexes 0..31 within its own half (lanes 0..31 or 32..63).
                 let (a, v) = (self.vreg(f("ADDR")), self.vreg(f("DATA0")));
-                let m = if self.wave64 { 63 } else { 31 };
                 let (el, eh) = self.exec_mask();
                 let x = self.addc(a, off16);
                 let x = self.lshrc(x, 2);
-                let l = self.andc(x, m);
-                let r = self.read_lane_any(v, l);
+                let l31 = self.andc(x, 31);
+                let l = if self.wave64 {
+                    let up = self.andc(self.lane, 0x20);
+                    self.or(up, l31)
+                } else {
+                    l31
+                };
+                let r = self.read_lane_half(v, l);
                 let on = self.lanebit_at(el, eh, l);
                 let z = self.c(0);
                 let t = self.sel(on, r, z);

@@ -3864,7 +3864,7 @@ fn gpu_format_stores_atomics_global_lds() {
         if l < 63 {
             assert_eq!(v[25], l as u32 + 1, "lane {l} ds_read2 (second; LDS is not zeroed past the written area)");
         }
-        assert_eq!(v[29], 63 - l as u32, "lane {l} ds_bpermute");
+        assert_eq!(v[29], ((l & 32) | ((63 - l) & 31)) as u32, "lane {l} ds_bpermute (half-local on RDNA2)");
         assert!(v[16] < 164, "lane {l} umax old value");
     }
     assert_eq!(r.mem[0x400 / 4], 64, "buffer_atomic_add");
@@ -8092,8 +8092,31 @@ fn gpu_split_wave64_cross_half_operations() {
         let v = &r.vgpr[l];
         assert_eq!(v[5], (l as u32).min(40), "lane {l}: v_mbcnt over vcc");
         assert_eq!(v[2], if l >= 48 { 1048 } else { 0x77 }, "lane {l}: write under exec of the upper half");
-        assert_eq!(v[6], 1000 + 63 - l as u32, "lane {l}: ds_bpermute from lane {}", 63 - l);
+        assert_eq!(v[6], 1000 + ((l & 32) | ((63 - l) & 31)) as u32, "lane {l}: ds_bpermute half-local");
     }
+}
+
+/// RDNA2 Wave64 `ds_bpermute_b32` runs as two independent 32-lane halves (0..31 and 32..63):
+/// split wave64 lowering uses half-local wave reads (`xcl_x_rla_half`, `& 31u`) with no
+/// cross-half LDS exchange (`xcl_x_rla_any`), and direct DXIL validates cleanly.
+#[test]
+fn ds_bpermute_wave64_is_half_local() {
+    let code = prog(&[
+        ("DS_BPERMUTE_B32", "ENC_DS", &[("VDST", 6), ("ADDR", 4), ("DATA0", 1)], None),
+    ]);
+    let opt = Options { wave64: true, split_wave64: true, ..Default::default() };
+    let t = translate(&code, &opt).unwrap();
+    assert!(t.complete(), "{:?}", t.unsupported_why);
+    assert!(t.hlsl.contains("xcl_x_rla_half"), "expected half-local read:\n{}", t.hlsl);
+    assert!(!t.hlsl.contains("xcl_x_rla_any"), "must not emit cross-half exchange:\n{}", t.hlsl);
+    assert!(t.hlsl.contains("((v4 + 0u) >> 2) & 31u"), "expected 32-lane mask:\n{}", t.hlsl);
+    // Direct DXIL must also lower cleanly without cross-half exchange.
+    let dxil = crate::gpu::dxil::kernel::translate(
+        &code,
+        crate::gpu::dxil::kernel::KernelOptions { wave64: true, split: true, mem_windows: 1, sampler_base: 0 },
+    )
+    .unwrap();
+    assert!(!dxil.is_empty());
 }
 
 /// Masks only read lane by lane (`x64_masks`): a v_cndmask selector and a 64-bit carry chain,
@@ -8583,7 +8606,7 @@ fn gpu_split_wave64_waves_diverge() {
                 let want: u32 = (0..2 * (w + 1)).map(|i| (5 * i + 3).min(64) as u32 + (w * 64 + 5 * i + 3) as u32).sum();
                 let at = (base + (g * 256 + tid) * 8) / 4;
                 assert_eq!(out[at], want, "{dims:?}, group {g} thread {tid}: loop of wave {w}");
-                assert_eq!(out[at + 1], (w * 64 + (l ^ 33)) as u32, "{dims:?}, group {g} thread {tid}: ds_bpermute");
+                assert_eq!(out[at + 1], (w * 64 + ((l & 32) | ((l ^ 33) & 31))) as u32, "{dims:?}, group {g} thread {tid}: ds_bpermute half-local");
             }
         }
     }

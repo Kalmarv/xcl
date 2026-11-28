@@ -688,9 +688,6 @@ impl Lw {
             if d.enc.name == "ENC_DS" && !matches!(n, "DS_SWIZZLE_B32" | "DS_BPERMUTE_B32" | "DS_PERMUTE_B32" | "DS_NOP") {
                 uses_lds = true;
             }
-            if n == "DS_BPERMUTE_B32" {
-                slot = slot.max(32);
-            }
             if d.enc.name == "ENC_SMEM" && ["GLC", "DLC"].iter().any(|f| crate::gpu::rdna2::field_value(d.enc, &d.words, f) == Some(1)) {
                 let w = match n.rsplit('_').next().unwrap_or("") {
                     "DWORDX2" => 2,

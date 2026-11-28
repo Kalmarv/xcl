@@ -4703,22 +4703,18 @@ impl Em {
                 return Ok(());
             }
             "ds_bpermute_b32" => {
+                // RDNA2 Wave64 executes ds_bpermute_b32 as two independent 32-lane halves.
                 let (a, v) = (self.vreg(f("ADDR")), self.vreg(f("DATA0")));
-                let m = if self.opt.wave64 { 63 } else { 31 };
                 let (el, eh) = (self.sreg(126), self.sreg(127));
                 let eh = if self.opt.wave64 { eh } else { "0u".into() };
-                self.line(&format!("uint {t}_l = (({a} + {off16}u) >> 2) & {m}u;"));
-                let rla = if self.x64() {
-                    self.x64_words = 32;
-                    "xcl_x_rla_any"
+                let l_expr = if self.opt.wave64 {
+                    format!("(lane_id & 0x20u) | ((({a} + {off16}u) >> 2) & 31u)")
                 } else {
-                    "rla"
+                    format!("(({a} + {off16}u) >> 2) & 31u")
                 };
+                self.line(&format!("uint {t}_l = {l_expr};"));
+                let rla = self.rla_half_fn();
                 self.line(&format!("uint {t} = {rla}({v}, {t}_l);"));
-                // a 32-lane wave of a wave64 VS / PS: lanes 32..63 hold a constant (`upper_lanes`)
-                if let Some(Read::Const(c)) = self.upper.as_ref().and_then(|u| u.reads.get(&d.pc)).copied() {
-                    self.line(&format!("{t} = select(and(xcl_hw32, {t}_l >= 32u), {c:#010x}u, {t});"));
-                }
                 self.line(&format!("{t} = select(lanebit_at({el}, {eh}, {t}_l), {t}, 0u);"));
                 let dst = Dst::V(f("VDST"));
                 self.write32(&dst, &t);
@@ -6540,13 +6536,6 @@ uint xcl_x_rla_uniform(uint v, uint l) {
     uint m = WaveReadLaneAt(v, l & 31u);
     xcl_x_put(0u, m);
     uint o = xcl_x_meet() ? xcl_x_get(0u) : 0u;
-    return (l >> 5) == xcl_half ? m : o;
-}
-// ds_bpermute: any lane of the wave
-uint xcl_x_rla_any(uint v, uint l) {
-    xcl_x_put(WaveGetLaneIndex(), v);
-    uint o = xcl_x_meet() ? xcl_x_get(l & 31u) : 0u;
-    uint m = WaveReadLaneAt(v, l & 31u);
     return (l >> 5) == xcl_half ? m : o;
 }
 // a mask only ever read lane by lane (v_cndmask, carry-ins; `x64_masks`): each half's own
