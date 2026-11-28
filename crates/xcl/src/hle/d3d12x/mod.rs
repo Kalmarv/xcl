@@ -38,6 +38,7 @@ pub mod null;
 mod placements;
 pub mod present;
 pub mod pso_async;
+mod quad_count;
 pub mod real;
 mod scatter;
 mod shader_cache_session;

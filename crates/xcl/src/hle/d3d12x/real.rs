@@ -1255,6 +1255,8 @@ fn console_slots(kind: Kind) -> Vec<(usize, usize)> {
                 // the newer layout's (called before anything tells the layouts apart)
                 (131, l::flush_cache_range_x as usize),
                 (132, l::flush_cache_range_x as usize),
+                // diagnostic (not for upstream): the quad sample mask's use, counted
+                (142, super::quad_count::set_quad_sample_mask_x as usize),
                 // console compute/BVH builder extensions (`XboxBvhBuilder.dll`)
                 (146, l::uav_barrier_x as usize),
                 (148, b::allocate_upload_memory as usize),

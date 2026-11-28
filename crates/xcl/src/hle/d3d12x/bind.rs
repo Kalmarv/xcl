@@ -879,6 +879,7 @@ pub(super) fn reset(list: *mut c_void, allocator: usize, initial_pso: usize) {
         untrack_two_pass_list(list as usize);
     }
     unmark_deferring(list);
+    super::quad_count::reset(list);
     console_list::hold_until_reset(old, blocks);
     retire_recording_res(old, res_bufs, res_marks, res_untracked);
 }
@@ -896,6 +897,7 @@ impl State {
 /// `ClearState(pso)`: resets pipeline and root-argument state back to creation defaults
 /// with `pso` bound, keeping the current recording's allocator and UMA arena intact.
 pub(super) fn clear_state(list: *mut c_void, pso: usize) {
+    super::quad_count::reset(list);
     with(list, |s| {
         s.heap_bound = false;
         s.pso = pso;
@@ -912,6 +914,7 @@ pub(super) fn clear_state(list: *mut c_void, pso: usize) {
 /// deferred mid-list split (`to` records into `allocator` with its own fresh UMA arena while
 /// `from` retains its previously allocated blocks until `allocator` resets).
 pub(super) fn inherit_for_split(from: *mut c_void, to: *mut c_void, allocator: usize) {
+    super::quad_count::inherit(from, to);
     let (layout, args, layout_gfx, args_gfx, rs_gfx, pso, heaps) = with(from, |s| {
         (s.layout.clone(), s.args.clone(), s.layout_gfx.clone(), s.args_gfx.clone(), s.rs_gfx, s.pso, s.heaps)
     });
@@ -3081,6 +3084,7 @@ fn note_no_root_signature() {
 
 pub(super) unsafe extern "system" fn dispatch_mesh(this: *mut c_void, x: u32, y: u32, z: u32) {
     let _t = crate::hle::api_cost::time_if(super::look_stats::deep(), crate::hle::api_cost::Call::DrawRecord);
+    super::quad_count::note(this, super::quad_count::Work::DispatchMesh);
     let _c = capture_work(this, || super::capture::WorkKind::DispatchMesh([x, y, z]), true);
     type PcDm = unsafe extern "system" fn(*mut c_void, u32, u32, u32);
     let pc_dm: PcDm = std::mem::transmute(super::real::orig_fn(this, 79));
@@ -3225,6 +3229,11 @@ pub(super) unsafe extern "system" fn execute_indirect(this: *mut c_void, sig: us
     });
     type F = unsafe extern "system" fn(*mut c_void, usize, u32, usize, u64, usize, u64);
     let pc: F = std::mem::transmute(super::real::orig_fn(this, 59));
+    if dispatch_mesh_sig_of(sig).is_some() {
+        super::quad_count::note(this, super::quad_count::Work::IndirectMesh);
+    } else if !signature_dispatches(sig) {
+        super::quad_count::note(this, super::quad_count::Work::IndirectDraw);
+    }
     let dispatches = super::capture::on() && signature_dispatches(sig);
     let _c = capture_work(this, || super::capture::indirect(sig, dispatches, max, args, args_off, count_buf, count_off), !dispatches);
     let raw_pso = with(this, |s| s.pso);
@@ -3680,6 +3689,7 @@ fn cpu_rect_expansion(pso: usize) -> bool {
 /// #12 DrawInstanced
 pub(super) unsafe extern "system" fn draw_instanced(this: *mut c_void, vertices: u32, instances: u32, first_vertex: u32, first_instance: u32) {
     let _t = crate::hle::api_cost::time_if(super::look_stats::deep(), crate::hle::api_cost::Call::DrawRecord);
+    super::quad_count::note(this, super::quad_count::Work::Draw);
     let _c = capture_work(this, || super::capture::WorkKind::Draw { vertices, instances, first_vertex, first_instance }, true);
     DRAW_ARGS.with(|d| d.set((false, vertices, instances, first_vertex, 0)));
     if let Some(list) = graphics_bound(this) {
@@ -3700,6 +3710,7 @@ thread_local! {
 /// #13 DrawIndexedInstanced
 pub(super) unsafe extern "system" fn draw_indexed_instanced(this: *mut c_void, indices: u32, instances: u32, first_index: u32, base_vertex: i32, first_instance: u32) {
     let _t = crate::hle::api_cost::time_if(super::look_stats::deep(), crate::hle::api_cost::Call::DrawRecord);
+    super::quad_count::note(this, super::quad_count::Work::Draw);
     let _c = capture_work(this, || super::capture::WorkKind::DrawIndexed { indices, instances, first_index, base_vertex, first_instance }, true);
     if let Some(list) = prepare_indexed_draw(this, indices, instances, first_index, base_vertex) {
         super::list_x::sync_title_buffers(this, Some((first_index, indices, base_vertex)), 0, 0, if first_instance != 0 { instances.max(2) } else { instances });
