@@ -112,7 +112,7 @@ fn scalar_load_compact_reload_comparison() {
     let code = repeated_scalar_loads(8192, 128);
     let cfg = Cfg::build(&code).unwrap();
     assert_eq!((cfg.insts.len(), cfg.rpo.len()), (32_775, 16_385));
-    let cs = CsInterface { threads: [64, 1, 1], user_sgprs: 8, tgid: [false; 3], tg_size: false, tid_components: 1 };
+    let cs = CsInterface { threads: [64, 1, 1], user_sgprs: 8, tgid: [false; 3], tg_size: false, tid_components: 1, lds_dwords: 0 };
     let leaders = cfg.blocks.iter().filter_map(|b| b.insts.first().map(|&i| cfg.insts[i].pc)).collect();
     let lw = Lw::new(&cfg.insts, &leaders, o, &Entry::Compute(cs.clone()));
     let plan = compact::automatic_plan(&cfg, &lw, true, compact::TABLE_WORDS_WAVE32)
