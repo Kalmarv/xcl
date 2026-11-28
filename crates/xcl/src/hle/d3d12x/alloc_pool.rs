@@ -298,23 +298,46 @@ pub fn in_flight(list: usize) -> bool {
 
 /// `lists` were just submitted to `queue`.
 pub unsafe fn executed(queue: *mut c_void, lists: &[*mut c_void]) {
-    if !enabled() || queue.is_null() {
+    if queue.is_null() {
+        return;
+    }
+    if !enabled() {
+        if !lists.is_empty() {
+            super::bind::two_pass_submitted(queue, None, 0, lists);
+        }
+        super::bind::poll_two_pass_feedback(queue);
         return;
     }
     // (every submit is marked, also of lists this module does not track – the PC lists behind
     // console lists – so note_resubmits sees them all)
     let mut g = STATE.lock().unwrap();
     let s = g.get_or_insert_with(State::default);
-    let Some(q) = ID3D12CommandQueue::from_raw_borrowed(&queue) else { return };
+    let Some(q) = ID3D12CommandQueue::from_raw_borrowed(&queue) else {
+        drop(g);
+        if !lists.is_empty() {
+            super::bind::two_pass_submitted(queue, None, 0, lists);
+        }
+        return;
+    };
     let key = queue as usize;
     if !s.fences.contains_key(&key) {
         let mut dev: Option<ID3D12Device> = None;
-        let Some(f) = q.GetDevice(&mut dev).ok().and(dev).and_then(|d| d.CreateFence::<ID3D12Fence>(0, D3D12_FENCE_FLAG_NONE).ok()) else { return };
+        let Some(f) = q.GetDevice(&mut dev).ok().and(dev).and_then(|d| d.CreateFence::<ID3D12Fence>(0, D3D12_FENCE_FLAG_NONE).ok()) else {
+            drop(g);
+            if !lists.is_empty() {
+                super::bind::two_pass_submitted(queue, None, 0, lists);
+            }
+            return;
+        };
         s.fences.insert(key, (f, 0));
     }
     let (fence, value) = {
         let (f, v) = s.fences.get_mut(&key).unwrap();
         if q.Signal(&*f, *v + 1).is_err() {
+            drop(g);
+            if !lists.is_empty() {
+                super::bind::two_pass_submitted(queue, None, 0, lists);
+            }
             return;
         }
         *v += 1;
@@ -327,6 +350,9 @@ pub unsafe fn executed(queue: *mut c_void, lists: &[*mut c_void]) {
         let recording = s.recordings.get(&(l as usize)).copied().unwrap_or(0);
         s.last_submit.insert(l as usize, LastSubmit { queue: key, fence: fence.clone(), value, recording });
     }
+    drop(g);
+    super::bind::two_pass_submitted(queue, Some(&fence), value, lists);
+    super::bind::poll_two_pass_feedback(queue);
 }
 
 /// The lists recording on the PC allocators of `alloc` hold them no more: the allocator a title

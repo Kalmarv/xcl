@@ -2305,6 +2305,7 @@ fn note_buffer_view() {
 /// shaders read buffers through `mem`. One in a GPU view of the title's memory asks for its
 /// tiles (`view_want`).
 unsafe extern "system" fn dev_create_cbv_x(this: *mut c_void, desc: *const D3D12_CONSTANT_BUFFER_VIEW_DESC, cpu: u64) {
+    let _t = crate::hle::api_cost::time_if(super::look_stats::deep(), crate::hle::api_cost::Call::ViewDescriptor);
     let Some(slot) = super::console_heap::slot(cpu).filter(|s| !s.sampler) else {
         let f: unsafe extern "system" fn(*mut c_void, *const D3D12_CONSTANT_BUFFER_VIEW_DESC, u64) = std::mem::transmute(orig_fn(this, 17));
         return f(this, desc, cpu);
@@ -2329,6 +2330,7 @@ fn cbv_at(u: Option<&crate::gpu::uma::Uma>, va: u64, size: u32) -> Option<[u32; 
 /// #22 CreateSampler: the PC sampler at the slot's index, the S# in XCL ABI form (word 3
 /// [11:0] = sampler heap index; the state lives in the PC sampler).
 pub(super) unsafe extern "system" fn dev_create_sampler_x(this: *mut c_void, desc: *const D3D12_SAMPLER_DESC, cpu: u64) {
+    let _t = crate::hle::api_cost::time_if(super::look_stats::deep(), crate::hle::api_cost::Call::ViewDescriptor);
     let f: unsafe extern "system" fn(*mut c_void, *const D3D12_SAMPLER_DESC, u64) = std::mem::transmute(orig_fn(this, 22));
     let Some(slot) = super::console_heap::slot(cpu).filter(|s| s.sampler) else { return f(this, desc, cpu) };
     f(this, desc, slot.pc_srv);
@@ -2378,6 +2380,7 @@ fn note_mixed_copy() {
 
 /// #24 CopyDescriptorsSimple(n, dst, src, type)
 unsafe extern "system" fn dev_copy_descriptors_simple_x(this: *mut c_void, n: u32, dst: u64, src: u64, ty: u32) {
+    let _t = crate::hle::api_cost::time_if(super::look_stats::deep(), crate::hle::api_cost::Call::ViewDescriptor);
     let ty = pc_heap_type(ty);
     note_copy_call("CopyDescriptorsSimple", n, dst, src);
     if copy_console_slots(this, n, dst, src, ty) {
@@ -2397,6 +2400,7 @@ unsafe extern "system" fn dev_copy_descriptors_simple_x(this: *mut c_void, n: u3
 /// #23 CopyDescriptors(dst ranges, src ranges, type): range by range over console slots.
 #[allow(clippy::too_many_arguments)]
 unsafe extern "system" fn dev_copy_descriptors_x(this: *mut c_void, nd: u32, dsts: *const u64, dsizes: *const u32, ns: u32, srcs: *const u64, ssizes: *const u32, ty: u32) {
+    let _t = crate::hle::api_cost::time_if(super::look_stats::deep(), crate::hle::api_cost::Call::ViewDescriptor);
     let ty = pc_heap_type(ty);
     note_copy_call("CopyDescriptors", nd, if dsts.is_null() { 0 } else { *dsts }, if srcs.is_null() { 0 } else { *srcs });
     use super::console_heap::{slot, SAMPLER_SLOT, SLOT};
@@ -2488,6 +2492,17 @@ unsafe extern "system" fn dev_create_uav_checked_x(
     desc: *const D3D12_UNORDERED_ACCESS_VIEW_DESC,
     cpu: u64,
 ) {
+    let _t = crate::hle::api_cost::time_if(super::look_stats::deep(), crate::hle::api_cost::Call::ViewDescriptor);
+    dev_create_uav_checked_inner(this, res, counter, desc, cpu);
+}
+
+unsafe fn dev_create_uav_checked_inner(
+    this: *mut c_void,
+    res: *mut c_void,
+    counter: *mut c_void,
+    desc: *const D3D12_UNORDERED_ACCESS_VIEW_DESC,
+    cpu: u64,
+) {
     if let Some(r) = ID3D12Resource::from_raw_borrowed(&res) {
         let rd = r.GetDesc();
         let is_tex = rd.Dimension != D3D12_RESOURCE_DIMENSION_BUFFER;
@@ -2532,6 +2547,7 @@ unsafe extern "system" fn dev_create_uav_checked_x(
 
 /// #21 CreateDepthStencilView: the console's view formats as the PC's (`pc_view_format`).
 unsafe extern "system" fn dev_create_dsv_x(this: *mut c_void, res: *mut c_void, desc: *const D3D12_DEPTH_STENCIL_VIEW_DESC, cpu: u64) {
+    let _t = crate::hle::api_cost::time_if(super::look_stats::deep(), crate::hle::api_cost::Call::ViewDescriptor);
     let f: unsafe extern "system" fn(*mut c_void, *mut c_void, *const D3D12_DEPTH_STENCIL_VIEW_DESC, u64) = std::mem::transmute(orig_fn(this, 21));
     let mut copy = desc.as_ref().copied();
     if let Some(c) = copy.as_mut() {
@@ -2659,6 +2675,11 @@ fn empty_bvh() -> Option<u64> {
 }
 
 unsafe extern "system" fn dev_create_srv_x(this: *mut c_void, res: *mut c_void, desc: *const D3D12_SHADER_RESOURCE_VIEW_DESC, cpu: u64) {
+    let _t = crate::hle::api_cost::time_if(super::look_stats::deep(), crate::hle::api_cost::Call::ViewDescriptor);
+    dev_create_srv_inner(this, res, desc, cpu);
+}
+
+unsafe fn dev_create_srv_inner(this: *mut c_void, res: *mut c_void, desc: *const D3D12_SHADER_RESOURCE_VIEW_DESC, cpu: u64) {
     let f: unsafe extern "system" fn(*mut c_void, *mut c_void, *const D3D12_SHADER_RESOURCE_VIEW_DESC, u64) = std::mem::transmute(orig_fn(this, 18));
     let mut copy = desc.as_ref().copied();
     if let Some(c) = copy.as_mut() {
@@ -2872,6 +2893,7 @@ unsafe extern "system" fn dev_create_srv_at_x(this: *mut c_void, rdesc: *const u
     let va = (view.add(0x28) as *const u64).read_unaligned();
     let v = (view as *const D3D12_SHADER_RESOURCE_VIEW_DESC).read_unaligned();
     if v.ViewDimension == D3D12_SRV_DIMENSION_BUFFER {
+        let _t = crate::hle::api_cost::time_if(super::look_stats::deep(), crate::hle::api_cost::Call::ViewDescriptor);
         let Some(slot) = super::console_heap::slot(cpu) else { return };
         let b = &v.Anonymous.Buffer;
         let raw = b.Flags.0 & D3D12_BUFFER_SRV_FLAG_RAW.0 != 0;
@@ -2879,7 +2901,9 @@ unsafe extern "system" fn dev_create_srv_at_x(this: *mut c_void, rdesc: *const u
         super::view_want::want(super::view_want::Path::ViewAt, at, len);
         return super::console_heap::write(&slot, &words);
     }
-    dev_create_srv_x(this, resource_at(this, rdesc, va), &v, cpu);
+    let r = resource_at(this, rdesc, va);
+    let _t = crate::hle::api_cost::time_if(super::look_stats::deep(), crate::hle::api_cost::Call::ViewDescriptor);
+    dev_create_srv_inner(this, r, &v, cpu);
 }
 
 /// device #71: the same for an unordered access view ({ the PC's UAV desc; GPU address @0x28;
@@ -2891,6 +2915,7 @@ unsafe extern "system" fn dev_create_uav_at_x(this: *mut c_void, rdesc: *const u
     let va = (view.add(0x28) as *const u64).read_unaligned();
     let v = (view as *const D3D12_UNORDERED_ACCESS_VIEW_DESC).read_unaligned();
     if v.ViewDimension == D3D12_UAV_DIMENSION_BUFFER {
+        let _t = crate::hle::api_cost::time_if(super::look_stats::deep(), crate::hle::api_cost::Call::ViewDescriptor);
         let Some(slot) = super::console_heap::slot(cpu) else { return };
         let b = &v.Anonymous.Buffer;
         let raw = b.Flags.0 & D3D12_BUFFER_UAV_FLAG_RAW.0 != 0;
@@ -2898,7 +2923,9 @@ unsafe extern "system" fn dev_create_uav_at_x(this: *mut c_void, rdesc: *const u
         super::view_want::want(super::view_want::Path::ViewAt, at, len);
         return super::console_heap::write(&slot, &words);
     }
-    dev_create_uav_x(this, resource_at(this, rdesc, va), std::ptr::null_mut(), &v, cpu);
+    let r = resource_at(this, rdesc, va);
+    let _t = crate::hle::api_cost::time_if(super::look_stats::deep(), crate::hle::api_cost::Call::ViewDescriptor);
+    dev_create_uav_x(this, r, std::ptr::null_mut(), &v, cpu);
 }
 
 /// V# of `n` elements from element `first` of the buffer at `va`, and the bytes it covers
@@ -3109,7 +3136,7 @@ unsafe extern "system" fn dev_create_uav_x(this: *mut c_void, res: *mut c_void, 
     // a UAV of the stencil plane of a depth buffer with unordered access: a view of its twin
     // (`depth_uav`), made the way a UAV of a texture with unordered access is
     let null_why = match super::depth_uav::resolve_uav(this, res, rd_opt.as_ref(), desc.as_ref()) {
-        super::depth_uav::Resolve::Twin(twin, view) => return dev_create_uav_checked_x(this, twin, std::ptr::null_mut(), &view, cpu),
+        super::depth_uav::Resolve::Twin(twin, view) => return dev_create_uav_checked_inner(this, twin, std::ptr::null_mut(), &view, cpu),
         super::depth_uav::Resolve::Null(why) => Some(why),
         super::depth_uav::Resolve::NotOurs => None,
     };
@@ -3487,6 +3514,10 @@ macro_rules! as_usize {
 /// command list's vtable pointer on Close; adopt the runtime's new state vtable so
 /// subsequent Reset and console calls dispatch through the current native table.
 unsafe extern "system" fn cl_close(this: *mut c_void) -> HRESULT {
+    let _t = crate::hle::api_cost::time_if(
+        super::look_stats::deep() && !super::title_textures::is_own_work() && !super::present::presenting(),
+        crate::hle::api_cost::Call::ListLifecycle,
+    );
     super::bind::flush_two_pass(this, super::bind::RunEnd::Close);
     super::list_x::before_close(this);
     super::gpu_times::before_close(this);
@@ -3494,6 +3525,14 @@ unsafe extern "system" fn cl_close(this: *mut c_void) -> HRESULT {
     let f: RefFn = std::mem::transmute(orig_fn(this, pc_slot!("ID3D12GraphicsCommandList", "Close")));
     let hr = f(this) as HRESULT;
     preserve_vtable(this, ext);
+    if hr >= 0
+        && !super::title_textures::is_own_work()
+        && !super::present::presenting()
+        && super::title_list::wrapper_of(this).is_none()
+        && !super::console_list::is_backing(this)
+    {
+        super::title_textures::note_list_closed(this as usize);
+    }
     if hr < 0 {
         let ty: RefFn = std::mem::transmute(orig_fn(this, pc_slot!("ID3D12GraphicsCommandList", "GetType")));
         crate::xlog_warn!("D3D12.X: command list {this:p} (type {}) Close → {:#x}", ty(this), hr as u32);
@@ -3503,6 +3542,10 @@ unsafe extern "system" fn cl_close(this: *mut c_void) -> HRESULT {
 
 /// Reset (PC path): re-adopt the runtime's new open-state vtable if Reset replaced it.
 unsafe extern "system" fn cl_reset(this: *mut c_void, allocator: *mut c_void, initial_state: *mut c_void) -> HRESULT {
+    let _t = crate::hle::api_cost::time_if(
+        super::look_stats::deep() && !super::title_textures::is_own_work() && !super::present::presenting(),
+        crate::hle::api_cost::Call::ListLifecycle,
+    );
     let ext = *(this as *const usize);
     let f: unsafe extern "system" fn(*mut c_void, *mut c_void, *mut c_void) -> HRESULT =
         std::mem::transmute(orig_fn(this, pc_slot!("ID3D12GraphicsCommandList", "Reset")));
@@ -3510,6 +3553,9 @@ unsafe extern "system" fn cl_reset(this: *mut c_void, allocator: *mut c_void, in
     let hr = f(this, allocator, resolved);
     preserve_vtable(this, ext);
     if hr >= 0 {
+        if !super::title_textures::is_own_work() && !super::present::presenting() {
+            super::title_textures::forget_list_closed(this as usize);
+        }
         super::list_x::on_pc_reset(this);
         super::dred::reset(this);
         if !initial_state.is_null() {
@@ -8697,6 +8743,10 @@ unsafe extern "system" fn dev_create_root_signature(this: *mut c_void, mask: u32
 // ---------------------------------------------------------------------------------------
 
 unsafe extern "system" fn dev_create_rtv(this: *mut c_void, res: *mut c_void, desc: *const c_void, handle: usize) {
+    let _t = crate::hle::api_cost::time_if(
+        super::look_stats::deep() && !super::title_textures::is_own_work() && !super::present::presenting(),
+        crate::hle::api_cost::Call::ViewDescriptor,
+    );
     type F = unsafe extern "system" fn(*mut c_void, *mut c_void, *const c_void, usize);
     let f: F = std::mem::transmute(orig_fn(this, slot_of(this, "CreateRenderTargetView")));
     // a view in a console-only format, or of a target made R8G8B8A8 (`device_x::pc_resource_desc`)
@@ -8726,6 +8776,10 @@ unsafe extern "system" fn dev_create_rtv(this: *mut c_void, res: *mut c_void, de
 
 /// ClearRenderTargetView: as on the PC (`XCL_TRACE_FRAME`: the colours logged)
 unsafe extern "system" fn cl_clear_rtv(this: *mut c_void, rtv: usize, color: *const [f32; 4], n: u32, rects: *const c_void) {
+    let _t = crate::hle::api_cost::time_if(
+        super::look_stats::deep() && !super::title_textures::is_own_work() && !super::present::presenting(),
+        crate::hle::api_cost::Call::ListCopy,
+    );
     type F = unsafe extern "system" fn(*mut c_void, usize, *const [f32; 4], u32, *const c_void);
     let f: F = std::mem::transmute(orig_fn(this, pc_slot!("ID3D12GraphicsCommandList", "ClearRenderTargetView")));
     let _c = super::capture::op(this, || Some(super::capture::clear("rtv", rtv as u64, None, color.as_ref().map_or([0; 4], |c| c.map(f32::to_bits)), 0, n)));
@@ -8747,6 +8801,10 @@ unsafe extern "system" fn cl_clear_rtv(this: *mut c_void, rtv: usize, color: *co
 }
 
 unsafe extern "system" fn cl_om_set_render_targets(this: *mut c_void, n: u32, rtvs: *const usize, single: i32, dsv: *const usize) {
+    let _t = crate::hle::api_cost::time_if(
+        super::look_stats::deep() && !super::title_textures::is_own_work() && !super::present::presenting(),
+        crate::hle::api_cost::Call::BindState,
+    );
     type F = unsafe extern "system" fn(*mut c_void, u32, *const usize, i32, *const usize);
     let f: F = std::mem::transmute(orig_fn(this, pc_slot!("ID3D12GraphicsCommandList", "OMSetRenderTargets")));
     f(this, n, rtvs, single, dsv);
@@ -8878,6 +8936,10 @@ pub(super) unsafe fn reset_pc_allocator(raw: *mut c_void) -> HRESULT {
 }
 
 unsafe extern "system" fn alloc_reset(this: *mut c_void) -> HRESULT {
+    let _t = crate::hle::api_cost::time_if(
+        super::look_stats::deep() && !super::title_textures::is_own_work() && !super::present::presenting(),
+        crate::hle::api_cost::Call::ListLifecycle,
+    );
     // (lists may still hold recordings on it that the title submits again: `alloc_pool`, which
     // also gives back what recordings on its PC allocators used once the GPU is done with them)
     let hr = match super::alloc_pool::title_reset(this) {
@@ -9204,7 +9266,13 @@ unsafe extern "system" fn fence_set_event_on_completion(this: *mut c_void, value
     use windows_sys::Win32::System::Threading::{CreateEventW, RegisterWaitForSingleObject, UnregisterWaitEx, INFINITE, WT_EXECUTEONLYONCE};
     let f: unsafe extern "system" fn(*mut c_void, u64, *mut c_void) -> HRESULT = std::mem::transmute(orig_fn(this, pc_slot!("ID3D12Fence", "SetEventOnCompletion")));
     if event.is_null() || !super::sparse::readbacks_async() {
-        let hr = f(this, value, event);
+        let hr = {
+            let _t = crate::hle::api_cost::time_if(
+                event.is_null() && super::look_stats::deep() && !super::title_textures::is_own_work() && !super::present::presenting(),
+                crate::hle::api_cost::Call::FenceWait,
+            );
+            f(this, value, event)
+        };
         if event.is_null() {
             super::sparse::settle_readbacks_try();
         }

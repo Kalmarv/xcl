@@ -2585,6 +2585,7 @@ pub(super) unsafe fn execute_with_waits(lists: &[*mut c_void], submit: impl FnMu
 
 /// command list #60 CopyMemoryToMemoryX(destination, source, size, flags)
 pub(super) unsafe extern "system" fn copy_memory_x(this: *mut c_void, dst: u64, src: u64, size: u64, _flags: u32) {
+    let _t = crate::hle::api_cost::time_if(super::look_stats::deep(), crate::hle::api_cost::Call::ListCopy);
     static N: AtomicU64 = AtomicU64::new(0);
     const W: &str = "CopyMemoryToMemoryX";
     let refused = size == 0 || !size.is_multiple_of(4);
@@ -2881,16 +2882,19 @@ fn pattern(bytes: &[u8]) -> [u8; 16] {
 
 /// command list #61 FillMemoryWith32BitValueX(address, size, value)
 pub(super) unsafe extern "system" fn fill32_x(this: *mut c_void, va: u64, size: u64, value: u32) {
+    let _t = crate::hle::api_cost::time_if(super::look_stats::deep(), crate::hle::api_cost::Call::ListCopy);
     fill(this, va, size, pattern(&value.to_le_bytes()), 4, "FillMemoryWith32BitValueX");
 }
 
 /// command list #62 FillMemoryWith64BitValueX(address, size, value)
 pub(super) unsafe extern "system" fn fill64_x(this: *mut c_void, va: u64, size: u64, value: u64) {
+    let _t = crate::hle::api_cost::time_if(super::look_stats::deep(), crate::hle::api_cost::Call::ListCopy);
     fill(this, va, size, pattern(&value.to_le_bytes()), 8, "FillMemoryWith64BitValueX");
 }
 
 /// command list #63 FillMemoryWith128BitValueX(address, size, value*)
 pub(super) unsafe extern "system" fn fill128_x(this: *mut c_void, va: u64, size: u64, value: *const [u8; 16]) {
+    let _t = crate::hle::api_cost::time_if(super::look_stats::deep(), crate::hle::api_cost::Call::ListCopy);
     if !value.is_null() {
         fill(this, va, size, value.read_unaligned(), 16, "FillMemoryWith128BitValueX");
     }
@@ -3054,12 +3058,14 @@ unsafe fn timestamp(list: *mut c_void, va: u64, what: &str) {
 /// # Safety
 /// `this` must be a valid adopted `ID3D12GraphicsCommandList` pointer.
 pub unsafe extern "system" fn write32_bottom_x(this: *mut c_void, va: u64, value: u32, _flush: u32, flags: u32) {
+    let _t = crate::hle::api_cost::time_if(super::look_stats::deep(), crate::hle::api_cost::Call::ListCopy);
     record_write_trace(this, va, value as u64, flags, "W32B");
     write(this, va, &[value], D3D12_WRITEBUFFERIMMEDIATE_MODE_MARKER_OUT, "Write32BitValueBottomOfPipeX");
 }
 
 /// command list #70 Write64BitValueBottomOfPipeX(address, value, flush, flags)
 pub(super) unsafe extern "system" fn write64_bottom_x(this: *mut c_void, va: u64, value: u64, _flush: u32, flags: u32) {
+    let _t = crate::hle::api_cost::time_if(super::look_stats::deep(), crate::hle::api_cost::Call::ListCopy);
     const W: &str = "Write64BitValueBottomOfPipeX";
     record_write_trace(this, va, value, flags, "W64B");
     if flags & BOTTOM_TIMESTAMPS != 0 {
@@ -3075,6 +3081,7 @@ pub(super) unsafe extern "system" fn write64_bottom_x(this: *mut c_void, va: u64
 /// NVIDIA removes the device). The new recording goes onto a spare PC list of the wrapper whose
 /// submits are done, or a new one, reset like `primary` would be. None: it could not be.
 pub(super) unsafe fn reset_stand_in(wrapper: *mut c_void, primary: *mut c_void, alloc: usize, pso: usize) -> Option<usize> {
+    let _t = crate::hle::api_cost::time_if(super::look_stats::deep(), crate::hle::api_cost::Call::ListLifecycle);
     let ty = list_type(primary);
     if ty == D3D12_COMMAND_LIST_TYPE_BUNDLE || alloc == 0 {
         return None;
@@ -3096,7 +3103,7 @@ pub(super) unsafe fn reset_stand_in(wrapper: *mut c_void, primary: *mut c_void, 
             made
         }
     };
-    if reset_pc(spare, alloc, pso) < 0 {
+    if reset_pc_inner(spare, alloc, pso) < 0 {
         super::title_list::put_spare(wrapper, spare);
         return None;
     }
@@ -3600,9 +3607,7 @@ pub(super) unsafe extern "system" fn dispatch_x(this: *mut c_void, x: u32, y: u3
     super::bind::dispatch_flags(this, x, y, z, flags);
 }
 
-/// command list #146 console compute/UAV barrier (used by `XboxBvhBuilder.dll` between BVH
-/// build passes): emits a global UAV barrier so UMA writes become visible to the next pass
-pub(super) unsafe extern "system" fn uav_barrier_x(this: *mut c_void, _n: u32, _barriers: *const c_void) {
+unsafe fn emit_uav_barrier_pc(this: *mut c_void) {
     let b = D3D12_RESOURCE_BARRIER {
         Type: D3D12_RESOURCE_BARRIER_TYPE_UAV,
         Flags: D3D12_RESOURCE_BARRIER_FLAG_NONE,
@@ -3613,12 +3618,19 @@ pub(super) unsafe extern "system" fn uav_barrier_x(this: *mut c_void, _n: u32, _
     pc::<unsafe extern "system" fn(*mut c_void, u32, *const D3D12_RESOURCE_BARRIER)>(this, PC_RESOURCE_BARRIER)(this, 1, &b);
 }
 
+/// command list #146 console compute/UAV barrier (used by `XboxBvhBuilder.dll` between BVH
+/// build passes): emits a global UAV barrier so UMA writes become visible to the next pass
+pub(super) unsafe extern "system" fn uav_barrier_x(this: *mut c_void, _n: u32, _barriers: *const c_void) {
+    let _t = crate::hle::api_cost::time_if(super::look_stats::deep(), crate::hle::api_cost::Call::ListBarrier);
+    emit_uav_barrier_pc(this);
+}
+
 /// A UAV barrier for all resources on `list`, where a list takes one (a copy list and a bundle
 /// do not).
 unsafe fn flush_barrier(list: *mut c_void) {
     let ty = list_type(list);
     if ty == D3D12_COMMAND_LIST_TYPE_DIRECT || ty == D3D12_COMMAND_LIST_TYPE_COMPUTE {
-        uav_barrier_x(list, 0, std::ptr::null());
+        emit_uav_barrier_pc(list);
     }
 }
 
@@ -3629,6 +3641,7 @@ unsafe fn flush_barrier(list: *mut c_void) {
 /// and answered with nothing its passes had no order there. The PC has no ranges of caches: a UAV
 /// barrier for everything.
 pub(super) unsafe extern "system" fn flush_cache_range_x(this: *mut c_void, flags: u32, wait: u32, _va: u64, bytes: u64) {
+    let _t = crate::hle::api_cost::time_if(super::look_stats::deep(), crate::hle::api_cost::Call::ListBarrier);
     if (flags != 0 || wait != 0) && bytes != 0 {
         flush_barrier(this);
     }
@@ -3636,6 +3649,7 @@ pub(super) unsafe extern "system" fn flush_cache_range_x(this: *mut c_void, flag
 
 /// command list #67 (newer layout: #69) FlushPipelineX(flags, address, bytes)
 pub(super) unsafe extern "system" fn flush_pipeline_x(this: *mut c_void, _flags: u32, _va: u64, _bytes: u64) {
+    let _t = crate::hle::api_cost::time_if(super::look_stats::deep(), crate::hle::api_cost::Call::ListBarrier);
     flush_barrier(this);
 }
 
@@ -3878,7 +3892,8 @@ pub unsafe extern "system" fn kickoff_x(this: *mut c_void) {
     if close_hr < 0 {
         return warn(&ERR, "KickoffX", format_args!("Close failed ({close_hr:#x})"));
     }
-    if let Some(wrapper) = super::title_list::wrapper_of(this) {
+    let kickoff_wrapper = super::title_list::wrapper_of(this);
+    if let Some(wrapper) = kickoff_wrapper {
         record_deferred(wrapper);
     }
     super::capture::kickoff(this, queue);
@@ -3924,6 +3939,9 @@ pub unsafe extern "system" fn kickoff_x(this: *mut c_void) {
     // what ran is in the textures' states; the list records anew after its Reset below
     super::title_textures::submitted(&one);
     super::title_textures::list_reset(this as usize);
+    if let Some(w) = kickoff_wrapper {
+        super::title_textures::forget_list_closed(w as usize);
+    }
     if !sparse_writes.0.is_empty() || !sparse_writes.1.is_empty() {
         if let Some(q) = ID3D12CommandQueue::from_raw_borrowed(&q_raw) {
             super::sparse::readback_after_execute(q, &sparse_writes.0, &sparse_writes.1);
@@ -4513,6 +4531,7 @@ pub(super) unsafe fn ensure_view_heap(this: *mut c_void) {
 
 /// console #32 SetDescriptorHeaps (PC #28)
 pub(super) unsafe extern "system" fn set_descriptor_heaps_x(this: *mut c_void, n: u32, heaps: *const usize) {
+    let _t = crate::hle::api_cost::time_if(super::look_stats::deep(), crate::hle::api_cost::Call::BindState);
     const PC_SET_DESCRIPTOR_HEAPS: usize = 28;
     let f = pc::<unsafe extern "system" fn(*mut c_void, u32, *const usize)>(this, PC_SET_DESCRIPTOR_HEAPS);
     let _c = super::capture::op(this, || {
@@ -4558,6 +4577,7 @@ const PC_IA_SET_VERTEX_BUFFERS: usize = 44;
 /// command list #48 IASetVertexBuffers(start slot, count, views) (PC #44): the addresses are
 /// the title's (its memory: the GPU address of that memory for the PC)
 pub(super) unsafe extern "system" fn ia_set_vertex_buffers_x(this: *mut c_void, start: u32, n: u32, views: *const D3D12_VERTEX_BUFFER_VIEW) {
+    let _t = crate::hle::api_cost::time_if(super::look_stats::deep(), crate::hle::api_cost::Call::BindState);
     let f = pc::<unsafe extern "system" fn(*mut c_void, u32, u32, *const D3D12_VERTEX_BUFFER_VIEW)>(this, PC_IA_SET_VERTEX_BUFFERS);
     if views.is_null() || n == 0 {
         return f(this, start, n, views);
@@ -4604,6 +4624,7 @@ pub(super) unsafe extern "system" fn ia_set_vertex_buffers_x(this: *mut c_void, 
 
 /// command list #47 IASetIndexBuffer(view) (PC #43): the address is the title's
 pub(super) unsafe extern "system" fn ia_set_index_buffer_x(this: *mut c_void, view: *const D3D12_INDEX_BUFFER_VIEW) {
+    let _t = crate::hle::api_cost::time_if(super::look_stats::deep(), crate::hle::api_cost::Call::BindState);
     let mut g = recording(this as usize).lock().unwrap();
     let s = g.get_or_insert_with(HashMap::new).entry(this as usize).or_default();
     if view.is_null() {
@@ -4626,6 +4647,7 @@ pub(super) unsafe extern "system" fn ia_set_index_buffer_x(this: *mut c_void, vi
 /// command list #81 DrawIndexedX(index address, index format, index count, flags): one
 /// instance of `count` indices read from that address; the bound index buffer stays
 pub(super) unsafe extern "system" fn draw_indexed_x(this: *mut c_void, va: u64, format: DXGI_FORMAT, count: u32, _flags: u32) {
+    let _t = crate::hle::api_cost::time_if(super::look_stats::deep(), crate::hle::api_cost::Call::DrawRecord);
     let _c = super::bind::capture_work(this, || super::capture::WorkKind::DrawIndexedX { va, format: format.0, indices: count }, true);
     static N: AtomicU64 = AtomicU64::new(0);
     let stride = match format {
@@ -4690,6 +4712,11 @@ pub unsafe extern "system" fn reset_x(this: *mut c_void, alloc: usize, pso: usiz
 /// # Safety
 /// `this` must be a valid adopted `ID3D12GraphicsCommandList` pointer.
 pub(super) unsafe fn reset_pc(this: *mut c_void, alloc: usize, pso: usize) -> i32 {
+    let _t = crate::hle::api_cost::time_if(super::look_stats::deep(), crate::hle::api_cost::Call::ListLifecycle);
+    reset_pc_inner(this, alloc, pso)
+}
+
+unsafe fn reset_pc_inner(this: *mut c_void, alloc: usize, pso: usize) -> i32 {
     // A failed native Reset leaves the old recording alive. Do not discard its tracked state or
     // transfer its allocations until the driver accepts the new recording.
     let ext = *(this as *const usize);
@@ -4753,6 +4780,7 @@ const PC_STATES: u32 = 0x1 | 0x2 | 0x4 | 0x8 | 0x10 | 0x20 | 0x40 | 0x80 | 0x100
 /// PC ones – state bits the PC does not know are dropped (logged: the console's own), a
 /// transition left with nothing to do goes, aliasing barriers name placed textures
 pub(super) unsafe extern "system" fn resource_barrier_x(this: *mut c_void, n: u32, barriers: *const [u32; 8]) {
+    let _t = crate::hle::api_cost::time_if(super::look_stats::deep(), crate::hle::api_cost::Call::ListBarrier);
     static N: AtomicU64 = AtomicU64::new(0);
     if barriers.is_null() || n == 0 {
         return;
@@ -4907,9 +4935,18 @@ unsafe fn is_buffer(res: usize) -> bool {
 
 /// DMA list #9 Close: as on the PC; a failure is logged (the title stops on it)
 pub(super) unsafe extern "system" fn dma_close_x(this: *mut c_void) -> i32 {
+    let _t = crate::hle::api_cost::time_if(super::look_stats::deep(), crate::hle::api_cost::Call::ListLifecycle);
     let ext = *(this as *const usize);
     let hr = pc::<unsafe extern "system" fn(*mut c_void) -> i32>(this, 9)(this);
     real::preserve_vtable(this, ext);
+    if hr >= 0
+        && !super::title_textures::is_own_work()
+        && !super::present::presenting()
+        && super::title_list::wrapper_of(this).is_none()
+        && !super::console_list::is_backing(this)
+    {
+        super::title_textures::note_list_closed(this as usize);
+    }
     if hr < 0 {
         let ty = pc::<unsafe extern "system" fn(*mut c_void) -> i32>(this, PC_GET_TYPE)(this);
         crate::xlog_warn!("D3D12.X: DMA list Close → {:#x} (PC list type {ty})", hr as u32);
@@ -4944,11 +4981,7 @@ fn note_gpu_write(what: &str, va: usize, n: u64) {
     }
 }
 
-pub(super) unsafe extern "system" fn copy_buffer_region_x(this: *mut c_void, dst: usize, dst_off: u64, src: usize, src_off: u64, n: u64) {
-    let _c = super::capture::op(this, || {
-        use super::capture as c;
-        Some(c::Op::Copy { kind: "buffer_region", dst: c::buffer(dst, dst_off), src: c::buffer(src, src_off), at: [0; 3], bx: None, bytes: Some(n), refused: false })
-    });
+unsafe fn copy_buffer_region_inner(this: *mut c_void, dst: usize, dst_off: u64, src: usize, src_off: u64, n: u64) {
     if super::present::trace_frame() {
         if let Some(a) = real::title_address(dst) {
             note_gpu_write("CopyBufferRegion", a + dst_off as usize, n);
@@ -4956,6 +4989,15 @@ pub(super) unsafe extern "system" fn copy_buffer_region_x(this: *mut c_void, dst
     }
     note_copy_into(this as usize, dst, dst_off, n);
     pc::<unsafe extern "system" fn(*mut c_void, usize, u64, usize, u64, u64)>(this, PC_COPY_BUFFER_REGION)(this, dst, dst_off + real::buffer_delta(dst), src, src_off + real::buffer_delta(src), n)
+}
+
+pub(super) unsafe extern "system" fn copy_buffer_region_x(this: *mut c_void, dst: usize, dst_off: u64, src: usize, src_off: u64, n: u64) {
+    let _t = crate::hle::api_cost::time_if(super::look_stats::deep(), crate::hle::api_cost::Call::ListCopy);
+    let _c = super::capture::op(this, || {
+        use super::capture as c;
+        Some(c::Op::Copy { kind: "buffer_region", dst: c::buffer(dst, dst_off), src: c::buffer(src, src_off), at: [0; 3], bx: None, bytes: Some(n), refused: false })
+    });
+    copy_buffer_region_inner(this, dst, dst_off, src, src_off, n);
 }
 
 /// `XCL_TRACE_FRAME` with a watched target (`present::watch_rt`): copies out of it – that
@@ -4984,6 +5026,7 @@ unsafe fn trace_watched_copy(what: &str, dst: usize, src: usize) {
 
 /// CopyTextureRegion(dst, x, y, z, src, box) (PC #16; DMA list #12)
 pub(super) unsafe extern "system" fn copy_texture_region_x(this: *mut c_void, dst: *const D3D12_TEXTURE_COPY_LOCATION, x: u32, y: u32, z: u32, src: *const D3D12_TEXTURE_COPY_LOCATION, bx: *const D3D12_BOX) {
+    let _t = crate::hle::api_cost::time_if(super::look_stats::deep(), crate::hle::api_cost::Call::ListCopy);
     let _c = super::capture::op(this, || {
         use super::capture as c;
         let b = bx.as_ref().map(|b| [b.left, b.top, b.front, b.right, b.bottom, b.back]);
@@ -5097,6 +5140,7 @@ const PC_CLEAR_DEPTH_STENCIL_VIEW: usize = 47;
 
 /// command list #51 ClearDepthStencilView(dsv, flags, depth, stencil, rects, rect list) (PC #47)
 pub(super) unsafe extern "system" fn clear_depth_stencil_x(this: *mut c_void, dsv: usize, flags: u32, depth: f32, stencil: u8, n: u32, rects: *const windows::Win32::Foundation::RECT) {
+    let _t = crate::hle::api_cost::time_if(super::look_stats::deep(), crate::hle::api_cost::Call::ListCopy);
     let _c = super::capture::op(this, || Some(super::capture::clear("dsv", dsv as u64, None, [depth.to_bits(), stencil as u32, 0, 0], flags, n)));
     if super::present::trace_frame() {
         static N: AtomicU64 = AtomicU64::new(0);
@@ -5156,6 +5200,7 @@ pub(super) fn uav_clear_resource(res: usize, gpu: Option<super::console_heap::Sl
 /// console heap slots (heap #9 / #10), not PC descriptors. A depth buffer whose UAV views are
 /// views of its twin (`depth_uav`) is cleared through the twin the GPU slot's view names.
 unsafe fn clear_uav(this: *mut c_void, slot: usize, gpu: u64, cpu: u64, res: usize, values: *const c_void, n: u32, rects: *const windows::Win32::Foundation::RECT) {
+    let _t = crate::hle::api_cost::time_if(super::look_stats::deep(), crate::hle::api_cost::Call::ListCopy);
     let capture = super::capture::op(this, || {
         let v = values.cast::<[u32; 4]>().as_ref().copied().unwrap_or_default();
         Some(super::capture::clear(if slot == PC_CLEAR_UAV_UINT { "uav_uint" } else { "uav_float" }, gpu, Some(res), v, 0, n))
@@ -5215,6 +5260,7 @@ unsafe fn trace_resolve(what: &str, dst: usize, src: usize, format: i32, extra: 
 
 /// command list #19 ResolveSubresource(dst, dst sub, src, src sub, format) (PC #19)
 pub(super) unsafe extern "system" fn resolve_subresource_x(this: *mut c_void, dst: usize, dst_sub: u32, src: usize, src_sub: u32, format: i32) {
+    let _t = crate::hle::api_cost::time_if(super::look_stats::deep(), crate::hle::api_cost::Call::ListCopy);
     let _c = super::capture::op(this, || {
         use super::capture as c;
         Some(c::Op::Resolve { dst: c::describe(dst), dst_sub, src: c::describe(src), src_sub, format, region: None })
@@ -5229,6 +5275,7 @@ pub(super) unsafe extern "system" fn resolve_subresource_x(this: *mut c_void, ds
 /// mode) (PC #64)
 #[allow(clippy::too_many_arguments)]
 pub(super) unsafe extern "system" fn resolve_subresource_region_x(this: *mut c_void, dst: usize, dst_sub: u32, x: u32, y: u32, src: usize, src_sub: u32, rect: *const windows::Win32::Foundation::RECT, format: i32, mode: i32) {
+    let _t = crate::hle::api_cost::time_if(super::look_stats::deep(), crate::hle::api_cost::Call::ListCopy);
     let _c = super::capture::op(this, || {
         use super::capture as c;
         let r = rect.as_ref().map(|r| [r.left, r.top, r.right, r.bottom]);
@@ -5245,6 +5292,7 @@ pub(super) unsafe extern "system" fn resolve_subresource_region_x(this: *mut c_v
 /// CopyResource(dst, src) (PC #17; DMA list #13): buffers placed below their console address
 /// are copied as their own bytes (the PC resources also hold what lies before them)
 pub(super) unsafe extern "system" fn copy_resource_x(this: *mut c_void, dst: usize, src: usize) {
+    let _t = crate::hle::api_cost::time_if(super::look_stats::deep(), crate::hle::api_cost::Call::ListCopy);
     let _c = super::capture::op(this, || {
         use super::capture as c;
         Some(c::Op::Copy { kind: "resource", dst: c::buffer(dst, 0), src: c::buffer(src, 0), at: [0; 3], bx: None, bytes: None, refused: false })
@@ -5263,7 +5311,7 @@ pub(super) unsafe extern "system" fn copy_resource_x(this: *mut c_void, dst: usi
         return pc::<unsafe extern "system" fn(*mut c_void, usize, usize)>(this, PC_COPY_RESOURCE)(this, dst, src);
     }
     let n = real::console_buffer(dst).or(real::console_buffer(src)).map_or(0, |b| b.1 as u64);
-    copy_buffer_region_x(this, dst, 0, src, 0, n);
+    copy_buffer_region_inner(this, dst, 0, src, 0, n);
 }
 
 /// command list #28 BeginQuery(heap, type, index) (PC #52)

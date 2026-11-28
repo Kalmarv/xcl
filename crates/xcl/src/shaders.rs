@@ -1813,17 +1813,23 @@ mod claim_tests {
 /// when that list exists (the title builds another when it first uses it). Their records count
 /// into `progress`. A worker that fails is noted and the title starts all the same: it builds
 /// what is missing itself.
+fn pipeline_worker_command(me: &Path, pack: &Path, windows: u32, used_only: bool, slice: &str, series_s: bool) -> std::process::Command {
+    let mut c = worker_command(me);
+    c.arg("shaders").arg(pack).args(["--precompile", "--only", "cs", "--pipelines", "--windows"]).arg((windows & !recomp::HEAP_WINDOWS).to_string());
+    if used_only { c.arg("--used-only"); }
+    c.env("XCL_PRECOMPILE_SLICE", slice);
+    c.env("XCL_DEVICE_TYPE", if series_s { "lockhart" } else { "anaconda" });
+    c
+}
+
 fn pipelines_in_workers(pack: &Path, windows: u32, workers: usize, records: usize, progress: &LaunchPreparation) -> Result<(), String> {
     let me = std::env::current_exe().map_err(|e| e.to_string())?;
+    let series_s = crate::hle::d3d12x::pso_async::profile_is_series_s();
     let used_only = !crate::hle::d3d12x::pso_async::earlier_used_keys().is_empty();
     let t0 = std::time::Instant::now();
     crate::xlog_info!("Shader preparation: compute pipelines in {workers} worker processes{}", if used_only { ", those an earlier run used" } else { "" });
     let (cancelled, failed, _) = in_workers(workers, records, progress, |i| {
-        let mut c = worker_command(&me);
-        c.arg("shaders").arg(pack).args(["--precompile", "--only", "cs", "--pipelines", "--windows"]).arg((windows & !recomp::HEAP_WINDOWS).to_string());
-        if used_only { c.arg("--used-only"); }
-        c.env("XCL_PRECOMPILE_SLICE", format!("{i}/{workers}"));
-        c
+        pipeline_worker_command(&me, pack, windows, used_only, &format!("{i}/{workers}"), series_s)
     });
     if cancelled { return Err("Shader preparation cancelled".into()); }
     crate::xlog_info!("Shader preparation: compute pipelines done in {:.0} s ({failed} of {workers} workers failed)", t0.elapsed().as_secs_f64());
@@ -2110,7 +2116,11 @@ fn precompile(input: &Input, limit: usize, windows: u32, split: Option<bool>, on
     let errors: Mutex<Vec<String>> = Mutex::new(Vec::new());
     let unused = AtomicUsize::new(0);
     if let Some(u) = used {
-        println!("--used-only: {} pipelines earlier runs used (used-pipelines.txt); compute programs of other pipelines are passed over", u.len());
+        println!(
+            "--used-only: {} pipelines earlier runs used ({}); compute programs of other pipelines are passed over",
+            u.len(),
+            crate::hle::d3d12x::pso_async::used_pipelines_name()
+        );
     }
     // the compiles run on the DXC pool; these threads translate and keep it fed
     let threads = recomp::dxc::compile_threads() + 2;
@@ -2704,6 +2714,18 @@ mod tests {
 ", crate::hle::d3d12x::real::shaders_key(&[b.clone()]));
         let keys: std::collections::HashSet<u64> = text.lines().filter_map(|l| u64::from_str_radix(l.trim(), 16).ok()).collect();
         assert!(super::used_compute(&b, &keys));
+    }
+
+    #[test]
+    fn pipeline_worker_command_forwards_console_profile() {
+        let dev_env = |series_s| {
+            let cmd = super::pipeline_worker_command(Path::new("xcl.exe"), Path::new("shaders.rpf"), 4, true, "0/2", series_s);
+            cmd.get_envs()
+                .find_map(|(k, v)| (k == std::ffi::OsStr::new("XCL_DEVICE_TYPE")).then(|| v.map(|s| s.to_string_lossy().into_owned())))
+                .flatten()
+        };
+        assert_eq!(dev_env(true).as_deref(), Some("lockhart"));
+        assert_eq!(dev_env(false).as_deref(), Some("anaconda"));
     }
 
     use super::*;
