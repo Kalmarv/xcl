@@ -36,7 +36,8 @@ pub const XBOX_TYPE_DMA: u32 = 0x10;
 const IID_XBOX_DMA_COMMAND_LIST: GUID = GUID::from_u128(0x30bc77b9_8379_4b25_95de_b8588c42275d);
 const IID_GRAPHICS_COMMAND_LIST: GUID = GUID::from_u128(0x5b160d0f_ac1b_4185_8ba8_b3ae42a5a455);
 const IID_PIPELINE_STATE: GUID = GUID::from_u128(0x765a30f3_f624_4c6f_a828_ace948622445);
-/// D3D12_INDIRECT_ARGUMENT_TYPE of the console's DispatchX
+/// D3D12_INDIRECT_ARGUMENT_TYPE of the console's DispatchX (104) and DispatchL2/Single (105)
+const XBOX_ARG_DISPATCH_X_FULL: u32 = 104;
 const XBOX_ARG_DISPATCH_X: u32 = 105;
 /// D3D12_INDIRECT_ARGUMENT_TYPE of the console's DispatchMesh (a UE5 title's mesh dispatch
 /// signature: this one argument, stride 16)
@@ -508,15 +509,16 @@ pub(super) unsafe fn depth_bias_pso(dev: *mut c_void, base: usize, bias: DepthBi
 }
 
 /// Apply one CreateDerivedPipelineStateX patch to a desc: part 0 = depth-stencil state, 1 =
-/// rasterizer state, 2 = blend state, 3 = sample mask. Ok(false): part 5 (seen on Fortnite,
-/// 0x30 bytes, meaning unknown) – not applied. Err: an unknown part.
+/// rasterizer state, 2 = blend state, 3 = sample mask. Ok(false): console-only option/limit
+/// parts (4 = pixel shader options, 5 = depth-stencil options, 6 = graphics shader limits,
+/// 7 = tessellation parameters) – not modelled on PC. Err: an unknown part.
 fn apply_patch(d: &mut [u8; GFX_DESC], patch: &[u8; PATCH]) -> Result<bool, u32> {
     let (at, n) = match rd32(patch, 0) {
         0 => (0x1F0, 0x34),
         1 => (0x1C4, 0x2C),
         2 => (0x78, 0x148),
         3 => (0x1C0, 4),
-        5 => return Ok(false),
+        4..=7 => return Ok(false),
         t => return Err(t),
     };
     d[at..at + n].copy_from_slice(&patch[4..4 + n]);
@@ -631,11 +633,14 @@ pub(super) unsafe extern "system" fn unregister_page_pool_x(_this: *mut c_void, 
 
 /// PC filter of a console sampler desc. The fields are numbered as in an S#: magnification and
 /// minification 1 bilinear, 2 anisotropic point, 3 anisotropic bilinear, mip 2 linear; the filter
-/// mode 1 takes the minimum of the footprint, 2 its maximum (the PC's reduction 2 / 3).
-fn sampler_x_filter(mag: u32, min: u32, mip: u32, mode: u32, max_anisotropy: u32) -> D3D12_FILTER {
+/// mode 1 takes the minimum of the footprint, 2 its maximum (the PC's reduction 2 / 3). With the
+/// filter mode 0 and an active comparison (`cmp_func` 2..=7, LESS..GREATER_EQUAL) the filter is a
+/// comparison one (reduction 1).
+fn sampler_x_filter(mag: u32, min: u32, mip: u32, mode: u32, max_anisotropy: u32, cmp_func: u32) -> D3D12_FILTER {
     let reduction = match mode {
         1 => 2u32,
         2 => 3,
+        _ if (2..=7).contains(&cmp_func) => 1,
         _ => 0,
     };
     if max_anisotropy > 1 && (mag == 3 || min == 3) {
@@ -646,20 +651,32 @@ fn sampler_x_filter(mag: u32, min: u32, mip: u32, mode: u32, max_anisotropy: u32
     D3D12_FILTER(((min & 1) << 4 | (mag & 1) << 2 | (mip == 2) as u32 | reduction << 7) as i32)
 }
 
+/// Console address modes 6..=8 (half border, mirror once border, mirror once half border) have
+/// no PC mode: the nearest of the PC's 1..=5.
+fn pc_address_mode(m: u32) -> D3D12_TEXTURE_ADDRESS_MODE {
+    D3D12_TEXTURE_ADDRESS_MODE(match m {
+        1..=5 => m as i32,
+        6 => 4,     // BORDER
+        7 | 8 => 5, // MIRROR_ONCE
+        _ => 3,     // CLAMP
+    })
+}
+
 /// PC sampler desc of a console one (0x6C bytes; `u`: the dword at an offset). It carries the PC
 /// fields at other offsets (+0 flags, +4 / +8 / +0xC magnification / minification / mip filter,
 /// +0x10 z filter, +0x14 filter mode, +0x18 address U / V / W, +0x24 / +0x28 min / max LOD,
 /// +0x2C bias, +0x34 max anisotropy, +0x40 comparison, +0x44 border colour); the flags, the z
 /// filter and the further anisotropy fields are not modelled.
 fn pc_sampler_desc(u: impl Fn(usize) -> u32) -> D3D12_SAMPLER_DESC {
+    let cmp_func = u(0x40);
     D3D12_SAMPLER_DESC {
-        Filter: sampler_x_filter(u(4), u(8), u(0xC), u(0x14), u(0x34)),
-        AddressU: D3D12_TEXTURE_ADDRESS_MODE(u(0x18) as i32),
-        AddressV: D3D12_TEXTURE_ADDRESS_MODE(u(0x1C) as i32),
-        AddressW: D3D12_TEXTURE_ADDRESS_MODE(u(0x20) as i32),
+        Filter: sampler_x_filter(u(4), u(8), u(0xC), u(0x14), u(0x34), cmp_func),
+        AddressU: pc_address_mode(u(0x18)),
+        AddressV: pc_address_mode(u(0x1C)),
+        AddressW: pc_address_mode(u(0x20)),
         MipLODBias: f32::from_bits(u(0x2C)),
         MaxAnisotropy: u(0x34).clamp(1, 16),
-        ComparisonFunc: D3D12_COMPARISON_FUNC(u(0x40) as i32),
+        ComparisonFunc: D3D12_COMPARISON_FUNC(cmp_func as i32),
         BorderColor: [0x44, 0x48, 0x4C, 0x50].map(|o| f32::from_bits(u(o))),
         MinLOD: f32::from_bits(u(0x24)),
         MaxLOD: f32::from_bits(u(0x28)),
@@ -668,7 +685,7 @@ fn pc_sampler_desc(u: impl Fn(usize) -> u32) -> D3D12_SAMPLER_DESC {
 
 /// device #61 CreateSamplerX(desc, destination)
 pub(super) unsafe extern "system" fn create_sampler_x(this: *mut c_void, x: *const u8, dest: u64) {
-    if x.is_null() || !crate::gpu::shader::readable(x as usize, 0x6C) {
+    if x.is_null() || !crate::gpu::shader::readable(x as usize, 0x54) {
         return;
     }
     let u = |o: usize| (x.add(o) as *const u32).read_unaligned();
@@ -1356,7 +1373,7 @@ pub(super) unsafe extern "system" fn get_copyable_footprints_x(
 /// parameter type"); the others are the PC's own.
 fn pc_argument_type(t: u32) -> u32 {
     match t {
-        XBOX_ARG_DISPATCH_X => D3D12_INDIRECT_ARGUMENT_TYPE_DISPATCH.0 as u32,
+        XBOX_ARG_DISPATCH_X_FULL | XBOX_ARG_DISPATCH_X => D3D12_INDIRECT_ARGUMENT_TYPE_DISPATCH.0 as u32,
         XBOX_ARG_DISPATCH_MESH_X => D3D12_INDIRECT_ARGUMENT_TYPE_DISPATCH_MESH.0 as u32,
         t => t,
     }
@@ -1460,6 +1477,21 @@ mod tests {
         assert_eq!(pc([1, 1, 1, 2], 1).Filter, D3D12_FILTER_MIN_MAG_LINEAR_MIP_POINT);
         assert_eq!(pc([1, 1, 2, 1], 1).Filter, D3D12_FILTER_MIN_MAG_MIP_LINEAR);
         assert_eq!(pc([1, 2, 1, 1], 1).Filter, D3D12_FILTER_MIN_POINT_MAG_LINEAR_MIP_POINT);
+        // an active comparison (2..=7) with the filter mode 0 is a comparison filter; console
+        // address modes 6..=8 become the PC's border / mirror once
+        let mut dcmp = console_sampler([1, 1, 1, 0], [6, 7, 8], 1);
+        dcmp[0x40 / 4] = 4; // LESS_EQUAL
+        let dcmp_pc = pc_sampler_desc(|o| dcmp[o / 4]);
+        assert_eq!(dcmp_pc.Filter, D3D12_FILTER_COMPARISON_MIN_MAG_LINEAR_MIP_POINT);
+        assert_eq!((dcmp_pc.AddressU.0, dcmp_pc.AddressV.0, dcmp_pc.AddressW.0), (4, 5, 5));
+        // derived PSO patch types 4..=7 are skipped, not refused
+        let mut desc = [0u8; GFX_DESC];
+        for t in [4u32, 5, 6, 7] {
+            let mut p = [0u8; PATCH];
+            p[0..4].copy_from_slice(&t.to_le_bytes());
+            assert_eq!(apply_patch(&mut desc, &p), Ok(false));
+        }
+        assert_eq!(pc_argument_type(104), D3D12_INDIRECT_ARGUMENT_TYPE_DISPATCH.0 as u32);
         let d = pc([3, 3, 2, 2], 8);
         assert_eq!((d.Filter, d.MaxAnisotropy), (D3D12_FILTER_ANISOTROPIC, 8));
         // a maximum of 1 is trilinear, and anisotropic point is point
@@ -1710,10 +1742,12 @@ mod tests {
         }
         let mut d = [0u8; GFX_DESC];
         let mut patch = [0u8; PATCH];
-        patch[0] = 5;
-        assert_eq!(apply_patch(&mut d, &patch), Ok(false));
-        patch[0] = 4;
-        assert_eq!(apply_patch(&mut d, &patch), Err(4));
+        for t in [4u8, 5, 6, 7] {
+            patch[0] = t;
+            assert_eq!(apply_patch(&mut d, &patch), Ok(false));
+        }
+        patch[0] = 8;
+        assert_eq!(apply_patch(&mut d, &patch), Err(8));
     }
 
     #[test]
