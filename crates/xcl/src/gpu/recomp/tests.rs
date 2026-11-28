@@ -3660,6 +3660,32 @@ fn static_sampler_set_before_a_branch_is_a_constant_after_it() {
     assert!(t.static_samplers.is_empty(), "{:?}", t.static_samplers);
 }
 
+/// A wave32 program builds an S# in s[12:15], then a VOP3 compare writes its lane mask to
+/// `s[12:13]` (one SGPR, s12, in wave32) and the program sets s12 again before the sample, as
+/// a retail title's shadow lookups do. s13 still holds its constant, so the S# is a static
+/// sampler. Before, the compare counted as writing s13 too, and the shadow lookups sampled
+/// through sampler-heap entry 0 (`s3 & 0x7FF`), which is not a comparison sampler.
+#[test]
+fn wave32_compare_mask_keeps_the_s_word_above_it() {
+    let shadow = [0x3092u32, 0x00C0_0000, 0x1850_0000, 0];
+    let code = prog(&[
+        ("S_MOV_B32", "ENC_SOP1", &[("SDST", 15), ("SSRC0", 128)], None),
+        ("S_MOV_B32", "ENC_SOP1", &[("SDST", 14), ("SSRC0", 255)], Some(shadow[2])),
+        ("S_MOV_B32", "ENC_SOP1", &[("SDST", 13), ("SSRC0", 255)], Some(shadow[1])),
+        ("V_CMP_EQ_U32", "ENC_VOP3", &[("VDST", 12), ("SRC0", 129), ("SRC1", V + 5)], None),
+        ("V_CNDMASK_B32", "ENC_VOP3", &[("VDST", 6), ("SRC0", V + 6), ("SRC1", V + 7), ("SRC2", 12)], None),
+        ("S_MOVK_I32", "ENC_SOPK", &[("SDST", 12), ("SIMM16", shadow[0] as u64)], None),
+        ("IMAGE_SAMPLE_C_LZ", "ENC_MIMG", &[("VDATA", 10), ("VADDR", 0), ("SRSRC", 5), ("SSAMP", 3), ("DMASK", 1), ("DIM", 1)], None),
+    ]);
+    let t = translate(&code, &Options { wave64: false, ..Default::default() }).unwrap();
+    assert!(t.complete(), "{:?}", t.unsupported_why);
+    assert_eq!(t.static_samplers, vec![(shadow, true)], "the S# is a static comparison sampler");
+    assert!(!t.hlsl.contains("SamplerDescriptorHeap"), "no sampler heap lookup left");
+    // in wave64 the compare writes s13 too: the S# is no constant
+    let t = translate(&code, &Options::default()).unwrap();
+    assert!(t.static_samplers.is_empty(), "{:?}", t.static_samplers);
+}
+
 /// Two ways into a block that leave different words in an S# register: not a constant there,
 /// the sampler is looked up as before.
 #[test]
