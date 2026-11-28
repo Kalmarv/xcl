@@ -204,7 +204,7 @@ impl TwoPassBuf {
     /// A new buffer of `bytes`, if the two-pass buffers alive stay within `two_pass_cap` with it
     /// (the free ones in `FREE_RES` go first to make room, when they are enough). Past it: an
     /// error, and the draw that asked is skipped.
-    #[cfg(test)]
+    /// (main-best's shared two-pass buffers use it outside tests too: `XCL_TWO_PASS_SHARED`)
     unsafe fn make(dev: &ID3D12Device, bytes: u64, what: &str) -> Result<Self, String> {
         let cap = two_pass_cap();
         match Self::try_make_with_cap(dev, bytes, what, cap)? {
