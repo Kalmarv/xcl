@@ -268,6 +268,7 @@ impl Table {
                     pending_delta -= 1;
                 }
                 if old.placed && !old.unmapped {
+                    shadow_record(ores, &old, va, end, None);
                     to_unmap.push(ores);
                 }
                 retired += 1;
@@ -277,6 +278,7 @@ impl Table {
             self.shadowed_by_va.remove(&(sva, sres));
             if let Some(old) = self.shadowed.remove(&sres) {
                 if old.placed && !old.unmapped {
+                    shadow_record(sres, &old, va, end, None);
                     to_unmap.push(sres);
                 }
                 retired += 1;
@@ -320,6 +322,7 @@ impl Table {
                 }
                 if old.placed && !old.unmapped && (ova != va || oend != end) {
                     old.unmapped = true;
+                    shadow_record(ores, &old, va, end, Some(&*entry.tex));
                     to_unmap.push(ores);
                 }
                 if old.placed && entry.placed {
@@ -337,6 +340,7 @@ impl Table {
                 if let Some(old) = self.shadowed.get_mut(&sres) {
                     if old.placed && !old.unmapped {
                         old.unmapped = true;
+                        shadow_record(sres, old, va, end, Some(&*entry.tex));
                         to_unmap.push(sres);
                     }
                 }
@@ -540,6 +544,7 @@ pub(super) unsafe fn register(device: *mut c_void, res: *mut c_void, va: usize, 
     for r in &to_unmap {
         super::vram::unmap_superseded(r);
     }
+    shadow_unmapped(&to_unmap);
     TEXTURES_GEN.fetch_add(1, Ordering::Release);
     // the data the title is about to write there is for the next submit
     mark_hot(hot_src, hot_bytes);
@@ -874,13 +879,180 @@ pub(super) unsafe fn retire_overlapping(va: usize, len: usize) {
     for r in &to_unmap {
         super::vram::unmap_superseded(r);
     }
+    shadow_unmapped(&to_unmap);
     if retired > 0 {
         TEXTURES_GEN.fetch_add(1, Ordering::Release);
     }
 }
 
+/// `XCL_SHADOW_CHECK=1` (diagnostic): the log says which sampled textures lose their tiles to
+/// another placement over a different range of their memory, what took it, and whether the title
+/// goes on viewing them. A texture that is still read then reads zero.
+pub(super) fn shadow_check() -> bool {
+    static ON: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
+    *ON.get_or_init(|| std::env::var("XCL_SHADOW_CHECK").is_ok_and(|v| v.trim() == "1"))
+}
+
+/// A sampled texture whose tiles went to a placement over another range (`shadow_check`).
+struct Superseded {
+    va: usize,
+    end: usize,
+    shape: String,
+    /// the range that took its memory and what was placed there (a GPU-owned placement: not known)
+    by_va: usize,
+    by_end: usize,
+    by: Option<String>,
+    gpu_written: bool,
+    /// views of it written to the shared heap since
+    views_after: u32,
+}
+
+static SUPERSEDED: Mutex<BTreeMap<usize, Superseded>> = Mutex::new(BTreeMap::new());
+/// `SUPERSEDED` has entries (the shared heap asks at every view it writes)
+static SUPERSEDED_ANY: std::sync::atomic::AtomicBool = std::sync::atomic::AtomicBool::new(false);
+/// `shadow_check` so far: tiles taken by a sampled texture at the same address, by one at another
+/// address, by a GPU-owned placement; of all those the ones with a view in the shared heap then;
+/// views written for one afterwards; ones released or mapped again
+static SHADOW_COUNTS: [AtomicU64; 6] = [AtomicU64::new(0), AtomicU64::new(0), AtomicU64::new(0), AtomicU64::new(0), AtomicU64::new(0), AtomicU64::new(0)];
+
+fn shadow_shape(tex: &xg::Texture) -> String {
+    match tex.texels() {
+        Some(s) => format!("{}x{}x{} {} mips {} bits {} bytes", s.width, s.height, s.array.max(1), tex.mips, s.bpe, tex.size()),
+        None => format!("no texels, {} bytes", tex.size()),
+    }
+}
+
+/// `old` (PC texture `res`) is about to lose its tiles to what was placed at `[by_va, by_end)`
+/// (`by`: that sampled texture; None: a GPU-owned placement). Called with `TEXTURES` held.
+fn shadow_record(res: usize, old: &Entry, by_va: usize, by_end: usize, by: Option<&xg::Texture>) {
+    if !shadow_check() {
+        return;
+    }
+    let kind = match by {
+        Some(_) if by_va == old.va => 0,
+        Some(_) => 1,
+        None => 2,
+    };
+    SHADOW_COUNTS[kind].fetch_add(1, Ordering::Relaxed);
+    let s = Superseded {
+        va: old.va,
+        end: old.va.saturating_add(old.tex.size() as usize),
+        shape: shadow_shape(&old.tex),
+        by_va,
+        by_end,
+        by: by.map(shadow_shape),
+        gpu_written: old.gpu_written,
+        views_after: 0,
+    };
+    SUPERSEDED.lock().unwrap().insert(res, s);
+    SUPERSEDED_ANY.store(true, Ordering::Relaxed);
+}
+
+fn shadow_text(s: &Superseded) -> String {
+    format!(
+        "{} at {:#x}..{:#x}{} under {} at {:#x}..{:#x}",
+        s.shape,
+        s.va,
+        s.end,
+        if s.gpu_written { " (the GPU wrote it)" } else { "" },
+        s.by.as_deref().unwrap_or("a GPU-owned placement"),
+        s.by_va,
+        s.by_end
+    )
+}
+
+/// The tiles of `res` were unmapped (`shadow_record` named each): whether the shared heap holds a
+/// view of it. Called without `TEXTURES`.
+fn shadow_unmapped(res: &[ID3D12Resource]) {
+    if !shadow_check() {
+        return;
+    }
+    for r in res {
+        let key = r.as_raw() as usize;
+        let live = super::console_heap::has_live_view(key);
+        if live {
+            SHADOW_COUNTS[3].fetch_add(1, Ordering::Relaxed);
+        }
+        static N: AtomicU64 = AtomicU64::new(0);
+        let n = N.fetch_add(1, Ordering::Relaxed) + 1;
+        if n <= 64 || n.is_power_of_two() || (live && n % 16 == 0) {
+            if let Some(s) = SUPERSEDED.lock().unwrap().get(&key) {
+                crate::xlog_info!("D3D12.X: XCL_SHADOW_CHECK: a sampled texture lost its tiles: {}; a view of it in the shared heap: {} ({n} so far)", shadow_text(s), if live { "yes" } else { "no" });
+            }
+        }
+    }
+}
+
+/// `SUPERSEDED` has entries.
+pub(super) fn shadow_any() -> bool {
+    SUPERSEDED_ANY.load(Ordering::Relaxed)
+}
+
+/// A view of `res` was written to the shared heap.
+pub(super) fn shadow_viewed(res: usize) {
+    if !shadow_any() {
+        return;
+    }
+    let mut g = SUPERSEDED.lock().unwrap();
+    let Some(s) = g.get_mut(&res) else { return };
+    s.views_after += 1;
+    let n = SHADOW_COUNTS[4].fetch_add(1, Ordering::Relaxed) + 1;
+    if n <= 48 || n.is_power_of_two() {
+        crate::xlog_info!("D3D12.X: XCL_SHADOW_CHECK: a view was written for a sampled texture without tiles: {} (view {} of it since; {n} such views so far)", shadow_text(s), s.views_after);
+    }
+}
+
+/// `res` was released, or has its tiles again.
+fn shadow_gone(res: usize) {
+    if shadow_any() && SUPERSEDED.lock().unwrap().remove(&res).is_some() {
+        SHADOW_COUNTS[5].fetch_add(1, Ordering::Relaxed);
+    }
+}
+
+/// Every ten seconds with `shadow_check`: how many sampled textures are without tiles under
+/// another placement, and how many of them the shared heap holds a view of.
+pub(super) fn shadow_census() {
+    if !shadow_check() {
+        return;
+    }
+    static LAST: AtomicU64 = AtomicU64::new(0);
+    let now = now_us() / 1_000_000;
+    let last = LAST.load(Ordering::Relaxed);
+    if now < last + 10 || LAST.compare_exchange(last, now, Ordering::Relaxed, Ordering::Relaxed).is_err() {
+        return;
+    }
+    // (the views are asked without `SUPERSEDED` held)
+    let all: Vec<(usize, String, bool)> = SUPERSEDED.lock().unwrap().iter().map(|(&r, s)| (r, s.shape.clone(), s.views_after > 0)).collect();
+    let mut shapes: BTreeMap<String, (u32, u32)> = BTreeMap::new();
+    let (mut live, mut again) = (0u32, 0u32);
+    for (r, shape, viewed) in &all {
+        let l = super::console_heap::has_live_view(*r);
+        live += l as u32;
+        again += *viewed as u32;
+        let e = shapes.entry(shape.clone()).or_default();
+        e.0 += 1;
+        e.1 += l as u32;
+    }
+    let mut top: Vec<(String, (u32, u32))> = shapes.into_iter().collect();
+    top.sort_by_key(|(_, (n, l))| (std::cmp::Reverse(*l), std::cmp::Reverse(*n)));
+    let top: Vec<String> = top.iter().take(10).map(|(s, (n, l))| format!("{l} of {n} {s}")).collect();
+    let c = SHADOW_COUNTS.each_ref().map(|c| c.load(Ordering::Relaxed));
+    crate::xlog_info!(
+        "D3D12.X: XCL_SHADOW_CHECK: {} sampled textures are without tiles under another placement, {live} of them with a view in the shared heap, {again} viewed again since; so far tiles taken by a sampled texture at the same address {}, at another address {}, by a GPU-owned placement {}; {} had a view then; {} views written afterwards; {} released or mapped again; with a view, by shape: {}",
+        all.len(),
+        c[0],
+        c[1],
+        c[2],
+        c[3],
+        c[4],
+        c[5],
+        top.join("; ")
+    );
+}
+
 /// The PC texture was released for good.
 pub fn forget(res: usize) {
+    shadow_gone(res);
     STREAM_RECHECK.lock().unwrap().remove(&res);
     let (removed, to_remap) = {
         let mut t = TEXTURES.lock().unwrap();
@@ -890,6 +1062,7 @@ pub fn forget(res: usize) {
         (removed, unsafe { clone_resources(&remap_ptrs) })
     };
     for r in &to_remap {
+        shadow_gone(r.as_raw() as usize);
         unsafe {
             super::vram::remap_if_unmapped(r);
             // (lazy levels: one the GPU wrote is not uploaded again, so all of it has pages)

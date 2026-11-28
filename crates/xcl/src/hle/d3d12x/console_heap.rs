@@ -810,6 +810,7 @@ pub unsafe fn publish(s: &Slot, uav: bool, res: usize) {
         copy_views(&dev, 1, dst, src);
         names().note(s.index + uav as u32, res);
     }
+    super::title_textures::shadow_viewed(res);
     super::vram::note_viewed(res);
 }
 
@@ -858,7 +859,7 @@ pub unsafe fn publish_range(first: &Slot, n: u32, names: &[(usize, usize)]) {
                     );
                 }
             } else if let Some(dev) = &dev {
-                let check_evicted = super::vram::has_evicted_unviewed();
+                let check_evicted = super::vram::has_evicted_unviewed() || super::title_textures::shadow_any();
                 let mut viewed: Vec<usize> = Vec::new();
                 {
                     let _w = SLOT_WRITES.lock().unwrap();
@@ -878,6 +879,7 @@ pub unsafe fn publish_range(first: &Slot, n: u32, names: &[(usize, usize)]) {
                     }
                 }
                 for res in viewed {
+                    super::title_textures::shadow_viewed(res);
                     super::vram::note_viewed(res);
                 }
             }
