@@ -1644,6 +1644,9 @@ fn early_depth_pixel_shaders_test_depth_first_on_both_paths() {
             let direct = super::kernel::translate_pixel(code, ko, &psi).unwrap_or_else(|e| panic!("{name}, early {early_depth}: {}", &e[..e.len().min(800)]));
             assert_eq!(early_flag(&direct.dxil), early_depth, "{name}, early {early_depth}: direct path's shader flags");
         }
+    }
+}
+
 #[test]
 fn s_barrier_emits_all_sync_when_shader_writes_uav_or_uses_glc() {
     let ko = KernelOptions { wave64: false, split: false, mem_windows: 1, sampler_base: 0 };
