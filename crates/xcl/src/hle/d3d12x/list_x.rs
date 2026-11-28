@@ -3694,6 +3694,18 @@ pub(super) unsafe extern "system" fn uav_barrier_x(this: *mut c_void, n: u32, ba
             super::depth_uav_sync::on_global_uav_barrier();
         }
     }
+    // (`XCL_FORMAT_ALIAS=1`) a GPU-written texture the title moves out of write access: its
+    // texels into the sampled textures of another format family at its address
+    if super::format_alias::enabled() {
+        let mut alias_writers = Vec::new();
+        super::format_alias::filter_enhanced_barriers(n, barriers, &mut alias_writers);
+        if !alias_writers.is_empty() {
+            super::format_alias::sync_title_writers(this, &alias_writers);
+        }
+        if super::format_alias::every_barrier() {
+            super::format_alias::sync_all(this);
+        }
+    }
 }
 
 /// A UAV barrier for all resources on `list`, where a list takes one (a copy list and a bundle
@@ -4865,6 +4877,9 @@ pub(super) unsafe extern "system" fn resource_barrier_x(this: *mut c_void, n: u3
     let sync_direct = sync_twins && tracked_list_type(this).is_none_or(|t| t == D3D12_COMMAND_LIST_TYPE_DIRECT);
     let mut depth_syncs: Vec<super::depth_uav_sync::SyncOp> = Vec::new();
     let mut global_uav_barrier = false;
+    // (`XCL_FORMAT_ALIAS=1`) GPU-written textures leaving write states, with the state they are left in
+    let alias_on = super::format_alias::enabled();
+    let mut alias_writers: Vec<(usize, u32)> = Vec::new();
     for k in 0..n as usize {
         let mut b = barriers.add(k).read_unaligned();
         let (ty, flags) = (b[0], b[1]);
@@ -4943,6 +4958,9 @@ pub(super) unsafe extern "system" fn resource_barrier_x(this: *mut c_void, n: u3
                     continue;
                 }
             }
+            if alias_on {
+                super::format_alias::note_title_transition((b[2] as u64 | (b[3] as u64) << 32) as usize, b[4], b[5], b[6], flags, &mut alias_writers);
+            }
             // UAV writes before (or after) the transition: the same holds for the window buffers
             uav_transition |= (b[5] | b[6]) & UNORDERED_ACCESS != 0;
         }
@@ -4989,6 +5007,9 @@ pub(super) unsafe extern "system" fn resource_barrier_x(this: *mut c_void, n: u3
     }
     if !depth_syncs.is_empty() {
         super::depth_uav_sync::execute_syncs(this, &depth_syncs);
+    }
+    if !alias_writers.is_empty() {
+        super::format_alias::sync_title_writers(this, &alias_writers);
     }
     if global_uav_barrier && (any_uav || uav_transition) {
         super::depth_uav_sync::on_global_uav_barrier();

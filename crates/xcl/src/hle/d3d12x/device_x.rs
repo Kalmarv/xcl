@@ -1215,6 +1215,7 @@ pub(super) unsafe extern "system" fn create_placed_resource_x(this: *mut c_void,
                     real::note_title_address(*ppv as usize, va as usize);
                     super::depth_uav::note_created(*ppv, &x, Some(va as usize), state);
                     super::depth_uav_sync::register_if_depth_uav(this, *ppv, &x, state, console_state);
+                    super::format_alias::register_title_texture(this as usize, *ppv as usize, va as usize, &pc, flags, state);
                     super::lut3d::created("CreatePlacedResourceX (GPU-owned: on the title's pages / an arena)", *ppv, Some(&x), Some(va as usize), false, state);
                 }
                 return hr;
@@ -1232,7 +1233,13 @@ pub(super) unsafe extern "system" fn create_placed_resource_x(this: *mut c_void,
             real::dev_create_committed_resource(this, &heap as *const _ as usize, 0, d.as_ptr() as usize, state as usize, clear as usize, riid, ppv)
         }
     };
-    if hr >= 0 && !buffer && !(*ppv).is_null() {
+    // (`XCL_FORMAT_ALIAS=1`) a sampled texture at the address of a GPU-written one of another
+    // format family gets that one's texels by copy: the title's memory is not its source
+    let aliased_to_gpu = hr >= 0
+        && !buffer
+        && !(*ppv).is_null()
+        && super::format_alias::register_title_texture(this as usize, *ppv as usize, va as usize, &std::ptr::read_unaligned(d.as_ptr() as *const D3D12_RESOURCE_DESC), flags, state);
+    if hr >= 0 && !buffer && !(*ppv).is_null() && !aliased_to_gpu {
         static M: AtomicU64 = AtomicU64::new(0);
         match super::title_textures::register(this, *ppv, va as usize, &x, D3D12_RESOURCE_STATES(state as i32)) {
             Ok(()) => {
