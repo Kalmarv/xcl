@@ -3320,6 +3320,35 @@ fn gpu_cube_array_slices() {
     }
 }
 
+/// Explicit-LOD gathers (`image_gather4_l`, `_l_o`, `_c_l_o`; 2D and 2D array) read the mip their
+/// LOD selects: four `Load`s at it, not HLSL's `Gather`, which has no LOD and reads the most
+/// detailed mip (a retail title's pyramid walks fell back to HLSL and read mip 0 throughout).
+#[test]
+fn gather4_l_reads_the_mip_its_lod_selects() {
+    let cases: &[(&str, &[(&str, u64)])] = &[
+        ("IMAGE_GATHER4_L", &[("VDATA", 10), ("VADDR", 0), ("SRSRC", 4), ("SSAMP", 6), ("DMASK", 0x1), ("DIM", 1)]),
+        ("IMAGE_GATHER4_L_O", &[("VDATA", 10), ("VADDR", 0), ("SRSRC", 4), ("SSAMP", 6), ("DMASK", 0x2), ("DIM", 1)]),
+        ("IMAGE_GATHER4_L", &[("VDATA", 10), ("VADDR", 0), ("SRSRC", 4), ("SSAMP", 6), ("DMASK", 0x8), ("DIM", 5)]),
+        ("IMAGE_GATHER4_C_L_O", &[("VDATA", 10), ("VADDR", 0), ("SRSRC", 4), ("SSAMP", 6), ("DMASK", 0x1), ("DIM", 1)]),
+    ];
+    for (name, fields) in cases {
+        let code = prog(&[(name, "ENC_MIMG", fields, None)]);
+        let t = translate(&code, &Options::default()).unwrap();
+        assert!(t.complete(), "{name}: {:?}
+{}", t.unsupported_why, t.hlsl);
+        assert!(!t.hlsl.contains(".Gather"), "{name}: an explicit-LOD gather must not use Gather
+{}", t.hlsl);
+        assert!(t.hlsl.contains("_T.Load(int") && t.hlsl.contains("(int)t") && t.hlsl.contains("_gm)"), "{name}: four Loads at the selected mip
+{}", t.hlsl);
+        assert!(t.hlsl.contains("0.501953125f"), "{name}: RDNA2 rounds the LOD half up
+{}", t.hlsl);
+        if super::dxc::location().is_ok() {
+            super::dxc::compile(&t.hlsl, "main", "cs_6_6", &[]).unwrap_or_else(|e| panic!("{name}: {e}
+{}", t.hlsl));
+        }
+    }
+}
+
 /// image_get_resinfo on a 1D array (DIM 4) gives the layers in y, as RDNA does (GFX9, which
 /// binds 1D arrays as 2D arrays, gives them in z and Mesa moves them to y there only).
 #[test]

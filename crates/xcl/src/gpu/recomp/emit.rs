@@ -2096,6 +2096,93 @@ impl Em {
     /// The sampler of the MIMG instruction at `pc`: a static sampler when its S# is constant
     /// (register `static_sampler_base + i`, space 1), else the sampler heap entry S# word 3
     /// [11:0] names (XCL shader ABI).
+    /// `image_gather4_l(_o)` (and `_c_l`) on a 2D / 2D array view: the four texels of the bilinear
+    /// footprint at the mip the explicit LOD selects, read with `Load` (HLSL's `Gather` has no
+    /// LOD and reads the most detailed mip). As the direct path's `mimg_gather4_lod`: the S#'s
+    /// LOD bias and min / max LOD and the T#'s MIN_LOD clamp the LOD, RDNA2 rounds it half up
+    /// (no mip filter: the T#'s MIN_LOD), the S#'s address modes and border colour apply per
+    /// texel, `FORCE_UNORMALIZED` takes texel coordinates, and a comparison compares each texel.
+    /// Returns the float4 variable holding the texels in gather order.
+    #[allow(clippy::too_many_arguments)]
+    fn gather_lod(&mut self, t: &str, dim: u64, pc: u64, ssamp: u64, tw1: &str, coords: &[String], lod: &str, cl: Option<&str>, cmp: Option<&str>, offset: Option<&str>, ch: usize) -> String {
+        let w: [String; 4] = match self.static_ss.get(&pc) {
+            Some(w) => w.map(|x| format!("{x}u")),
+            None => [0, 1, 2, 3].map(|k| self.sreg(ssamp + k)),
+        };
+        let arr = dim == 5;
+        let size = |s: &mut Self, mip: &str, out: &str| {
+            let e = if arr { format!(", {out}e") } else { String::new() };
+            s.line(&format!("uint {out}w = 1u, {out}h = 1u{}, {out}n = 1u; {t}_T.GetDimensions({mip}, {out}w, {out}h{e}, {out}n); {out}w = max({out}w, 1u); {out}h = max({out}h, 1u);", if arr { format!(", {out}e = 1u") } else { String::new() }));
+        };
+        size(self, "0u", &format!("{t}_g0"));
+        self.line(&format!("float {t}_gl = {lod} + (float)(((int)(({}) << 18u)) >> 18) / 256.0f;", w[2]));
+        if let Some(c) = cl {
+            self.line(&format!("{t}_gl = max({t}_gl, {c});"));
+        }
+        self.line(&format!("float {t}_gtmin = (float)((({tw1}) >> 8u) & 0xFFFu) / 256.0f;"));
+        self.line(&format!(
+            "{t}_gl = max(min(max({t}_gl, (float)(({}) & 0xFFFu) / 256.0f), (float)((({}) >> 12u) & 0xFFFu) / 256.0f), {t}_gtmin);",
+            w[1], w[1]
+        ));
+        self.line(&format!(
+            "uint {t}_gm = min((uint)max(((({}) >> 26u) & 3u) == 0u ? floor({t}_gtmin) : floor({t}_gl + 0.501953125f), 0.0f), max({t}_g0n, 1u) - 1u);",
+            w[2]
+        ));
+        size(self, &format!("{t}_gm"), &format!("{t}_g"));
+        self.line(&format!("bool {t}_gu = ((({}) >> 15u) & 1u) != 0u;", w[0]));
+        self.line(&format!("float {t}_gx = ({t}_gu ? {} : {} * (float){t}_gw) - 0.5f;", coords[0], coords[0]));
+        self.line(&format!("float {t}_gy = ({t}_gu ? {} : {} * (float){t}_gh) - 0.5f;", coords[1], coords[1]));
+        let (ox, oy) = match offset {
+            Some(o) => (format!(" + (((int)(({o}) << 26u)) >> 26)"), format!(" + (((int)(({o}) << 18u)) >> 26)")),
+            None => (String::new(), String::new()),
+        };
+        self.line(&format!("int {t}_gx0 = (int)floor({t}_gx){ox}, {t}_gy0 = (int)floor({t}_gy){oy};"));
+        // the address mode of an axis (S# word 0: x [2:0], y [5:3]): wrap, mirror, clamp (2, 4, 6),
+        // mirror once (3, 5, 7); border texels (6: outside, 7: mirrored outside) take the border colour
+        let addr = |s: &mut Self, c: &str, n: &str, mode: &str, out: &str| {
+            s.line(&format!(
+                "int {out}m = ((({c}) % (2 * (int){n})) + 2 * (int){n}) % (2 * (int){n}); int {out}o = ({c}) < 0 ? ~({c}) : ({c});                  int {out} = {mode} == 0u ? (((({c}) % (int){n}) + (int){n}) % (int){n}) : {mode} == 1u ? ({out}m >= (int){n} ? 2 * (int){n} - 1 - {out}m : {out}m) :                  ({mode} == 3u || {mode} == 5u || {mode} == 7u) ? min({out}o, (int){n} - 1) : clamp({c}, 0, (int){n} - 1);                  bool {out}b = ({mode} == 6u && (({c}) < 0 || ({c}) >= (int){n})) || ({mode} == 7u && (uint){out}o >= {n});"
+            ));
+        };
+        let (mx, my) = (format!("{t}_gmx"), format!("{t}_gmy"));
+        self.line(&format!("uint {mx} = ({}) & 7u, {my} = (({}) >> 3u) & 7u;", w[0], w[0]));
+        for (k, axis) in [("x0", "x"), ("x1", "x"), ("y0", "y"), ("y1", "y")] {
+            let c = if k.ends_with('0') { format!("{t}_g{axis}0") } else { format!("({t}_g{axis}0 + 1)") };
+            let (n, m) = if axis == "x" { (format!("{t}_gw"), mx.clone()) } else { (format!("{t}_gh"), my.clone()) };
+            addr(self, &c, &n, &m, &format!("{t}_ga{k}"));
+        }
+        let slice = if arr {
+            self.line(&format!("int {t}_gs = clamp((int)round({}), 0, (int)max({t}_ge, 1u) - 1);", coords[2]));
+            format!("{t}_gs, ")
+        } else {
+            String::new()
+        };
+        let border = match ch {
+            3 => format!("((({}) >> 30u) == 1u || (({}) >> 30u) == 2u ? 1.0f : 0.0f)", w[3], w[3]),
+            _ => format!("((({}) >> 30u) == 2u ? 1.0f : 0.0f)", w[3]),
+        };
+        let lane = ["x", "y", "z", "w"][ch];
+        // gather order: (-, +), (+, +), (+, -), (-, -)
+        let taps = [("x0", "y1"), ("x1", "y1"), ("x1", "y0"), ("x0", "y0")];
+        let mut vals = Vec::new();
+        for (k, (x, y)) in taps.iter().enumerate() {
+            let v = format!("{t}_gv{k}");
+            let load = if arr { format!("int4({t}_ga{x}, {t}_ga{y}, {slice}(int){t}_gm)") } else { format!("int3({t}_ga{x}, {t}_ga{y}, (int){t}_gm)") };
+            self.line(&format!("float {v} = ({t}_ga{x}b || {t}_ga{y}b) ? {border} : {t}_T.Load({load}).{lane};"));
+            if let Some(z) = cmp {
+                // SQ_TEX_DEPTH_COMPARE: never, <, ==, <=, >, !=, >=, always (reference against texel)
+                let f = format!("((({}) >> 12u) & 7u)", w[0]);
+                self.line(&format!(
+                    "{v} = ({f} == 1u ? {z} < {v} : {f} == 2u ? {z} == {v} : {f} == 3u ? {z} <= {v} : {f} == 4u ? {z} > {v} : {f} == 5u ? {z} != {v} : {f} == 6u ? {z} >= {v} : {f} == 7u) ? 1.0f : 0.0f;"
+                ));
+            }
+            vals.push(v);
+        }
+        let out = format!("{t}_gt");
+        self.line(&format!("float4 {out} = float4({});", vals.join(", ")));
+        out
+    }
+
     fn sampler_ref(&mut self, pc: u64, comparison: bool, s3: &str) -> String {
         let Some(&w) = self.static_ss.get(&pc) else { return format!("SamplerDescriptorHeap[NonUniformResourceIndex({s3} & 0x7FFu)]") };
         let i = match self.static_used.iter().position(|&x| x == (w, comparison)) {
@@ -2873,7 +2960,12 @@ impl Em {
                 };
                 self.texel_offset(&t, dim, o, &level, "");
             }
-            let call = if gather {
+            let call = if gather && matches!(dim, 1 | 5) && lod.is_some() {
+                if comps.len() != 1 {
+                    return Err("gather4 dmask");
+                }
+                self.gather_lod(&t, dim, d.pc, ssamp, &tw1, &coords_unmoved, lod.as_deref().unwrap_or("0.0f"), cl.as_deref(), cmp.as_deref(), offset.as_deref(), comps[0] as usize)
+            } else if gather {
                 if comps.len() != 1 {
                     return Err("gather4 dmask");
                 }
