@@ -1622,10 +1622,13 @@ fn scalar_constant(d: &Decoded, code: u64) -> Option<u32> {
 /// `follow`: the stages that draw (vertex and pixel programs). The other programs are read
 /// block by block as before: on a retail title, compute programs read this way gave garbage
 /// counts to `ExecuteIndirect` (2 055 in 75 s, none before) and the device hung.
-pub(crate) fn constant_samplers(insts: &[Decoded], leaders: &BTreeSet<u64>, follow: bool) -> BTreeMap<u64, [u32; 4]> {
+///
+/// `wave64`: the program's wave size. A wave32 vector instruction's lane mask
+/// (`v_cmp_eq_u32 s[12:13], …` in VOP3, a carry out) is one SGPR, as the translators write it.
+pub(crate) fn constant_samplers(insts: &[Decoded], leaders: &BTreeSet<u64>, follow: bool, wave64: bool) -> BTreeMap<u64, [u32; 4]> {
     type Known = std::collections::HashMap<u64, u32>;
     // one block's instructions on `known`; the S# of its MIMG instructions into `out`
-    fn run(block: &[Decoded], known: &mut Known, mut out: Option<&mut BTreeMap<u64, [u32; 4]>>) {
+    fn run(block: &[Decoded], known: &mut Known, mut out: Option<&mut BTreeMap<u64, [u32; 4]>>, wave64: bool) {
         for d in block {
             let f = |n: &str| rdna2::field_value(d.enc, &d.words, n);
             if d.enc.name == "ENC_MIMG" {
@@ -1657,7 +1660,12 @@ pub(crate) fn constant_samplers(insts: &[Decoded], leaders: &BTreeSet<u64>, foll
                 },
                 _ => Vec::new(),
             };
-            for w in rdna2::sgpr_uses(d).1 {
+            let mut written = rdna2::sgpr_uses(d).1;
+            // a vector instruction writes SGPRs only as a lane mask (or one `v_readlane` word)
+            if !wave64 && d.enc.name.starts_with("ENC_VOP") {
+                written.truncate(1);
+            }
+            for w in written {
                 known.remove(&w);
             }
             for (r, v) in set {
@@ -1692,7 +1700,7 @@ pub(crate) fn constant_samplers(insts: &[Decoded], leaders: &BTreeSet<u64>, foll
     let mut out = BTreeMap::new();
     let Some(next) = next.filter(|_| follow) else {
         for b in &blocks {
-            run(b, &mut Known::new(), Some(&mut out));
+            run(b, &mut Known::new(), Some(&mut out), wave64);
         }
         return out;
     };
@@ -1705,7 +1713,7 @@ pub(crate) fn constant_samplers(insts: &[Decoded], leaders: &BTreeSet<u64>, foll
     }
     while let Some(k) = work.pop() {
         let mut known = start[k].clone().unwrap_or_default();
-        run(blocks[k], &mut known, None);
+        run(blocks[k], &mut known, None, wave64);
         for &n in &next[k] {
             let changed = match &mut start[n] {
                 slot @ None => {
@@ -1725,7 +1733,7 @@ pub(crate) fn constant_samplers(insts: &[Decoded], leaders: &BTreeSet<u64>, foll
     }
     for (k, b) in blocks.iter().enumerate() {
         // (a block nothing leads to: nothing known at its start)
-        run(b, &mut start[k].clone().unwrap_or_default(), Some(&mut out));
+        run(b, &mut start[k].clone().unwrap_or_default(), Some(&mut out), wave64);
     }
     out
 }
@@ -1811,7 +1819,7 @@ pub fn translate(code: &[u8], opt: &Options) -> Result<Translation, String> {
     em.coherent_mem = matches!(opt.mode, Mode::Compute(_)) && needs_coherent_mem(&insts);
     em.configure_round_modes(&insts, branches == 0);
     em.writes_lds = emit::lds_order_wanted() && emit::writes_lds(&insts);
-    em.static_ss = constant_samplers(&insts, &leaders, matches!(opt.mode, Mode::Vertex(_) | Mode::Pixel(_)));
+    em.static_ss = constant_samplers(&insts, &leaders, matches!(opt.mode, Mode::Vertex(_) | Mode::Pixel(_)), opt.wave64);
     // split wave64: masks only read lane by lane skip the halves' exchange (geometry mode
     // continues from the ES into the GS through s_setpc: left as it is); pixel shaders: they
     // skip the quad reads that give the helper lanes' bits
