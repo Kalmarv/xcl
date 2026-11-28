@@ -4268,14 +4268,33 @@ pub fn end_title(code: u32) -> ! {
         // the title's threads stop first: with its fences at the maximum a running title thinks
         // the GPU is done and resets command allocators the GPU still runs (Fortnite: a device
         // hang at the end of a run)
+        // (each step logged and flushed: the end watchdog's TerminateProcess flushes nothing)
+        let t0 = std::time::Instant::now();
         suspend_other_threads(watchdog);
+        crate::xlog_info!("D3D12.X: end: the other threads suspended ({} ms)", t0.elapsed().as_millis());
+        crate::log::flush();
+        super::list_x::log_pending_waits_at_end();
+        crate::log::flush();
+        let (mut all, mut below) = (0usize, 0usize);
         for &f in FENCES.read().unwrap_or_else(|e| e.into_inner()).iter() {
             let fr = f as *mut c_void;
             if let Some(f) = ID3D12Fence::from_raw_borrowed(&fr) {
+                let before = f.GetCompletedValue();
+                if before != u64::MAX {
+                    below += 1;
+                    if below <= 32 {
+                        crate::xlog_info!("D3D12.X: end: title fence {fr:p} at {before:#x}: signalled to the maximum");
+                        crate::log::flush();
+                    }
+                }
+                all += 1;
                 let _ = f.Signal(u64::MAX);
             }
         }
+        crate::xlog_info!("D3D12.X: end: {all} title fences signalled to the maximum ({below} were below it; {} ms)", t0.elapsed().as_millis());
+        crate::log::flush();
         drain_gpu();
+        crate::xlog_info!("D3D12.X: end: queues drained ({} ms)", t0.elapsed().as_millis());
         crate::log::flush();
         windows_sys::Win32::System::Threading::TerminateProcess(windows_sys::Win32::System::Threading::GetCurrentProcess(), code);
     }
@@ -9984,7 +10003,7 @@ pub fn drain_gpu() {
                 Ok(f)
             };
             match submit() {
-                Ok(f) => fences.push(f),
+                Ok(f) => fences.push((qr as usize, f)),
                 Err(e) => {
                     crate::xlog_error!("D3D12 queue drain: {e}");
                     if matches!(e, FenceError::Removed(_)) {
@@ -9994,11 +10013,18 @@ pub fn drain_gpu() {
             }
         }
         let start = std::time::Instant::now();
+        let mut named = false;
         loop {
             let mut pending = false;
-            for f in &fences {
+            let mut left = Vec::new();
+            for (q, f) in &fences {
                 match fence::completed_value(f, dev) {
-                    Ok(value) => pending |= value < 1,
+                    Ok(value) => {
+                        pending |= value < 1;
+                        if value < 1 {
+                            left.push(super::list_x::queue_name(*q));
+                        }
+                    }
                     Err(e) => {
                         crate::xlog_error!("D3D12 queue drain: {e}");
                         return;
@@ -10007,6 +10033,13 @@ pub fn drain_gpu() {
             }
             if !pending {
                 return;
+            }
+            // (the queues not drained after 1 s, named once: the end watchdog may end the process
+            // before the 10 s below)
+            if !named && start.elapsed().as_secs() >= 1 {
+                named = true;
+                crate::xlog_warn!("D3D12 queue drain: {} of {} queues not drained after 1 s: {}", left.len(), fences.len(), left.join(", "));
+                crate::log::flush();
             }
             if start.elapsed().as_secs() >= 10 {
                 crate::xlog_warn!("D3D12 queue drain: GPU fences still pending after 10 s");

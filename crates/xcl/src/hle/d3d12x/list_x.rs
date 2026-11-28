@@ -1659,6 +1659,15 @@ fn dump_sync_trace(why: &str, n: &AtomicU64, times: u64) {
     }
 }
 
+/// `queue_id`'s name for `q` ("q<n>") without waiting for its lock (a thread suspended at the
+/// end may hold it): the queue's address when the lock is taken or the queue has no id yet.
+pub(super) fn queue_name(q: usize) -> String {
+    match QUEUE_IDS.try_lock().ok().and_then(|g| g.iter().position(|&x| x == q)) {
+        Some(n) => format!("q{n}"),
+        None => format!("queue {q:#x}"),
+    }
+}
+
 fn queue_id(q: usize) -> usize {
     let mut g = QUEUE_IDS.lock().unwrap();
     if let Some(pos) = g.iter().position(|&x| x == q) {
@@ -1820,6 +1829,43 @@ pub(super) unsafe fn note_title_queue_wait(queue: usize, fence: usize, value: u6
     let tf = graph.title_fences.entry(fence).or_default();
     prune_title_fence(fence, tf);
     tf.waits.push((value, queue, seq));
+}
+
+/// At the end of the title (`real::end_title`, its threads suspended): each queue Wait on a title
+/// fence, or on a `Write64BitValue` address, that its fence has not reached, as log lines (32 at
+/// most, then a count). A suspended thread may hold the graph's lock: then that is said instead.
+pub(super) unsafe fn log_pending_waits_at_end() {
+    let Ok(g) = SYNC_GRAPH.try_lock() else {
+        crate::xlog_warn!("D3D12.X: end: the GPU wait graph is locked by a suspended thread: pending waits not listed");
+        return;
+    };
+    let Some(graph) = g.as_ref() else { return };
+    let (mut pending, mut shown) = (0usize, 0usize);
+    for (&f, tf) in &graph.title_fences {
+        let fr = f as *mut c_void;
+        let Some(fence) = ID3D12Fence::from_raw_borrowed(&fr) else { continue };
+        let done = fence.GetCompletedValue();
+        let signalled = tf.signals.iter().map(|s| s.val).max();
+        for &(val, queue, _) in tf.waits.iter().filter(|w| w.0 > done) {
+            pending += 1;
+            if shown < 32 {
+                shown += 1;
+                crate::xlog_info!("D3D12.X: end: {} waits for title fence {f:#x} to reach {val:#x} (at {done:#x}; highest Signal submitted: {signalled:#x?})", queue_name(queue));
+            }
+        }
+    }
+    for (&va, cell) in &graph.cells {
+        let Some(fence) = cell.fence.as_ref() else { continue };
+        let done = fence.GetCompletedValue();
+        for w in cell.armed_waits.iter().filter(|w| w.val > done) {
+            pending += 1;
+            if shown < 32 {
+                shown += 1;
+                crate::xlog_info!("D3D12.X: end: {} waits for the value at {va:#x} to reach {:#x} (at {done:#x}; highest submitted: {:#x})", queue_name(w.waiting_queue), w.val, cell.submitted_max);
+            }
+        }
+    }
+    crate::xlog_info!("D3D12.X: end: {pending} GPU waits on fences not reached ({shown} listed)");
 }
 
 /// Record a title `ID3D12CommandQueue::Signal(fence, value)` in the exact sync graph.
@@ -8613,6 +8659,19 @@ mod tests {
             assert_eq!(fourth, vec![primary], "{how}: once the GPU is done the list records on its own PC list");
             assert!(removed.is_ok());
         }
+    }
+
+    /// The end's queue names: a queue with an id by it, one without by its address, and the
+    /// address too while another thread holds the ids' lock.
+    #[test]
+    fn a_queue_is_named_by_its_id_without_waiting_for_the_lock() {
+        let q = 0x7e57_0000_2000usize;
+        let n = queue_id(q);
+        assert_eq!(queue_name(q), format!("q{n}"));
+        assert_eq!(queue_name(q + 0x1000), format!("queue {:#x}", q + 0x1000));
+        let held = QUEUE_IDS.lock().unwrap();
+        assert_eq!(queue_name(q), format!("queue {q:#x}"));
+        drop(held);
     }
 
     #[test]
