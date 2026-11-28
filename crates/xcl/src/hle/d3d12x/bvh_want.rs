@@ -157,6 +157,33 @@ pub fn frame() {
     for va in with(due) {
         walk(va);
     }
+    probe_headers();
+}
+
+/// Diagnostic: now and then (frames 256, 512, 1024, …, then every 4096th) the header of each top
+/// level known (4 at most) as the title's CPU memory holds it and as the GPU's copy does – a
+/// root (@0x30) on the GPU side only is a top level built by the GPU that the walk never sees.
+fn probe_headers() {
+    let (frame, tops) = with(|r| (r.frame, r.tops.iter().take(4).map(|t| t.va).collect::<Vec<u64>>()));
+    if frame < 256 || !(frame.is_power_of_two() || frame % 4096 == 0) {
+        return;
+    }
+    let words = |b: &[u8]| {
+        let w = |at: usize| u32::from_le_bytes(b[at..at + 4].try_into().unwrap());
+        format!("@0 {:#x} @30 {:#x} @34 {:#x} @38 {:#x} @3c {:#x}", w(0), w(0x30), w(0x34), w(0x38), w(0x3C))
+    };
+    if tops.is_empty() {
+        crate::xlog_info!("D3D12.X: BVH probe frame {frame}: no top level known");
+    }
+    for va in tops {
+        let mut cpu = [0u8; 256];
+        let cpu_line = if read_title(va, &mut cpu) { words(&cpu) } else { "not readable".to_string() };
+        let gpu_line = match unsafe { super::sparse::peek_gpu(va as usize, 256) } {
+            Ok(b) => format!("{}{}", words(&b), if b[..] == cpu[..] { " (same 256 B)" } else { " (differs)" }),
+            Err(e) => e.to_string(),
+        };
+        crate::xlog_info!("D3D12.X: BVH probe frame {frame}: top level {va:#x}: title {cpu_line}; GPU {gpu_line}");
+    }
 }
 
 /// `frame` with the registry locked: the top levels to walk again

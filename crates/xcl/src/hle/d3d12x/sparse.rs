@@ -2245,6 +2245,37 @@ impl State {
     /// Copy `ranges` (address, bytes) from sparse VRAM back into the CPU view and refresh
     /// `sent` hashes. Caller has already ordered `self.queue` after any GPU writes if needed.
     /// Returns any excess recycled `RbJob`s for the caller to drop outside `STATE`.
+    /// Diagnostic (`peek_gpu`): `len` bytes at `va` (within one tile) as its video memory holds
+    /// them, copied out without touching the CPU's copy.
+    unsafe fn peek(&mut self, va: usize, len: usize) -> Result<Vec<u8>, &'static str> {
+        let tile = va & !(TILE - 1);
+        if len == 0 || va + len > tile + TILE {
+            return Err("crosses a tile");
+        }
+        let wi = self.window_index(va).ok_or("not in a sparse window")?;
+        self.mapped.get(&tile).filter(|e| e.pool != LAZY).ok_or("its tile has no video memory")?;
+        self.flush_pending();
+        let (rb, p) = self.readback_buf().ok_or("no readback buffer")?;
+        let b = self.windows[wi].0;
+        self.wait_for(self.rb_last_fence);
+        let _ = self.rb_alloc.Reset();
+        let _ = self.rb_list.Reset(&self.rb_alloc, None);
+        self.rb_list.CopyBufferRegion(&rb, 0, &self.windows[wi].1, (va - b) as u64, len as u64);
+        if self.rb_list.Close().is_err() {
+            return Err("the copy list did not close");
+        }
+        if let Ok(l) = self.rb_list.cast::<ID3D12CommandList>() {
+            super::title_textures::own_work(|| {
+                self.queue.ExecuteCommandLists(&[Some(l)]);
+            });
+        }
+        self.signal();
+        self.rb_last_fence = self.value;
+        self.wait_for(self.value);
+        self.reclaim_ring();
+        Ok(std::slice::from_raw_parts(p, len).to_vec())
+    }
+
     unsafe fn readback_ranges(&mut self, ranges: &[(usize, usize)]) -> Vec<RbJob> {
         self.flush_pending();
         // copies back of earlier submissions first: their data is older than this one's
@@ -3206,6 +3237,15 @@ pub(super) fn chunk_note(va: usize) -> Option<String> {
     let k = (va - pg) / CHUNK;
     let chunk = unsafe { std::slice::from_raw_parts((entry.cpu(t) + (pg - t) + k * CHUNK) as *const u8, CHUNK) };
     Some(format!("{}; {tile}", chunk_state(entry.sent[idx].as_deref(), k, chunk)))
+}
+
+/// Diagnostic: `len` bytes at `va` (within one 64 KiB tile) as the GPU holds them, read from the
+/// window's video memory; the CPU's copy is left as it is. Gives up when the state is busy.
+pub unsafe fn peek_gpu(va: usize, len: usize) -> Result<Vec<u8>, &'static str> {
+    let Ok(mut g) = STATE.try_lock() else { return Err("the sparse state is busy") };
+    forget_released(&mut g);
+    let _held = holding(Holder::CpuRead);
+    g.as_mut().ok_or("no sparse windows")?.peek(va, len)
 }
 
 /// Synchronize `[va, va + len)` in a sparse window for a CPU read (`ID3D12Resource::Map` with
