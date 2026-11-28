@@ -2220,7 +2220,8 @@ impl<I: Ir> Lower<'_, I> {
         if writes_scc {
             outputs.push(Var::Scc);
         }
-        let old_exec = if cmpx { Some(self.read_bit(b, EXEC)?) } else { None };
+        let cmp = name.starts_with("V_CMP");
+        let old_exec = if cmp && !in_guarded_run { Some(self.read_bit(b, EXEC)?) } else { None };
         let guard = if cmpx || in_guarded_run || !self.guarded.contains(&d.pc) { self.ir.boolean(true) } else { self.read_bit(b, EXEC)? };
         let mask = if matches!(d.variant, Variant::Dpp16 | Variant::Dpp8) {
             Some(self.exec_words(b, true)?)
@@ -2262,7 +2263,7 @@ impl<I: Ir> Lower<'_, I> {
             let x = self.ir.bin(Bin::And, x, one);
             let z = self.ir.int(0);
             let bit = self.ir.icmp(Cmp::Ne, x, z);
-            // `v_cmpx`: the new EXEC is the compare in the lanes that were in EXEC (#1426's
+            // `v_cmp*` / `v_cmpx*`: inactive lanes always clear their result bit (#1426's
             // lowering ran with the guard `true`, so its result is the compare alone)
             let bit = match old_exec {
                 Some(e) => self.ir.bin(Bin::And, bit, e),
@@ -3307,7 +3308,8 @@ pub(crate) mod tests {
     }
 
     pub(crate) fn check_f32_three_source(_: &[u32], v: &[Vec<u32>]) {
-        let med3 = |a: f32, b: f32, c: f32| a.min(b).max(a.max(b).min(c));
+        // with a NaN operand v_med3_f32 gives the smaller of the other two (#686)
+        let med3 = |a: f32, b: f32, c: f32| if a.is_nan() || b.is_nan() || c.is_nan() { a.min(b).min(c) } else { a.min(b).max(a.max(b).min(c)) };
         for (l, r) in v.iter().enumerate() {
             let f = |i: usize| f32::from_bits(r[i]);
             let (x, y) = (l as f32, l as f32 - 16.0);

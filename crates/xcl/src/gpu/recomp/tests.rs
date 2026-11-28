@@ -1235,6 +1235,59 @@ fn gpu_valu_float_and_int() {
     }
 }
 
+/// ABS / NEG source modifiers on the VOP3 forms of the untyped move and select (applied on
+/// the sign bit: NaN payloads, -0 and denormals pass bit-exact) and of the f16 → f32 and
+/// f32 → f64 conversions (RDNA 2 ISA, V_CNDMASK_B32 / V_MOV_B32: "suitable for negating or
+/// taking the absolute value"; LLVM `VOPSelectModsPat`, MC `gfx10_asm_vop2.s` / `gfx10_asm_vop1.s`).
+#[test]
+fn gpu_abs_neg_on_move_select_and_conversions() {
+    if !gpu_ready() {
+        return;
+    }
+    let code = prog(&[
+        // v_cndmask_b32_e64 v5, -v1, |v2|, vcc
+        ("V_CNDMASK_B32", "ENC_VOP3", &[("VDST", 5), ("SRC0", V + 1), ("SRC1", V + 2), ("SRC2", 106), ("NEG", 1), ("ABS", 2)], None),
+        ("V_MOV_B32", "ENC_VOP3", &[("VDST", 6), ("SRC0", V + 1), ("NEG", 1)], None), // -v1
+        ("V_MOV_B32", "ENC_VOP3", &[("VDST", 7), ("SRC0", V + 2), ("ABS", 1), ("NEG", 1)], None), // -|v2|
+        ("V_CVT_F32_F16", "ENC_VOP3", &[("VDST", 8), ("SRC0", V + 3), ("NEG", 1)], None), // -v3.h
+        ("V_CVT_F32_F16", "ENC_VOP3", &[("VDST", 9), ("SRC0", V + 3), ("ABS", 1)], None), // |v3.h|
+        ("V_CVT_F64_F32", "ENC_VOP3", &[("VDST", 10), ("SRC0", V + 4), ("NEG", 1)], None), // -v4
+        ("V_CVT_F64_F32", "ENC_VOP3", &[("VDST", 12), ("SRC0", V + 4), ("ABS", 1)], None), // |v4|
+    ]);
+    // (v1, v2): ordinary, a quiet NaN with a payload against a negative signalling NaN, -0 against
+    // -0, and denormals
+    let pairs: [(u32, u32); 4] =
+        [(f(1.0), f(-2.0)), (0x7FC1_2345, 0xFFA0_0001), (0x8000_0000, 0x8000_0000), (0x0000_0001, 0x8000_0001)];
+    // v3 (f16) with -v3 / |v3| as f32
+    let halves: [(u32, f32, f32); 4] = [(0x3C00, -1.0, 1.0), (0x8000, 0.0, 0.0), (0xC000, 2.0, 2.0), (0x3800, -0.5, 0.5)];
+    let singles: [f32; 4] = [1.0, -0.0, -3.5, 0.25];
+    let mut st = KernelState::default();
+    st.sgpr[106] = 0x5555_5555; // vcc: even lanes take src1
+    st.sgpr[107] = 0x5555_5555;
+    for (l, r) in st.vgpr.iter_mut().enumerate() {
+        let k = (l / 2) % 4; // each input in a VCC-set and a VCC-clear lane
+        (r[1], r[2]) = pairs[k];
+        r[3] = 0xDEAD_0000 | halves[k].0;
+        r[4] = f(singles[k]);
+    }
+    let r = runner::run_code(&code, &st, &[]).unwrap();
+    for l in 0..64 {
+        let v = &r.vgpr[l];
+        let k = (l / 2) % 4;
+        let (a, b) = pairs[k];
+        let want = if l % 2 == 0 { b & 0x7FFF_FFFF } else { a ^ 0x8000_0000 };
+        assert_eq!(v[5], want, "lane {l} v_cndmask_b32 -v1, |v2| ({a:#010X}, {b:#010X})");
+        assert_eq!(v[6], a ^ 0x8000_0000, "lane {l} v_mov_b32 -v1 ({a:#010X})");
+        assert_eq!(v[7], b | 0x8000_0000, "lane {l} v_mov_b32 -|v2| ({b:#010X})");
+        assert_eq!(v[8], f(halves[k].1), "lane {l} v_cvt_f32_f16 -v3 ({:#06X})", halves[k].0);
+        assert_eq!(v[9], f(halves[k].2), "lane {l} v_cvt_f32_f16 |v3| ({:#06X})", halves[k].0);
+        let x = singles[k] as f64;
+        let d = |i: usize| ((v[i + 1] as u64) << 32) | v[i] as u64;
+        assert_eq!(d(10), (-x).to_bits(), "lane {l} v_cvt_f64_f32 -v4 ({x})");
+        assert_eq!(d(12), x.abs().to_bits(), "lane {l} v_cvt_f64_f32 |v4| ({x})");
+    }
+}
+
 /// Output modifiers each instruction kind applies: omod on f64 (clamp stays in double
 /// precision) and on the f64 → f32 / f32 → f16 conversions, and the integer clamp (saturation) of the
 /// unsigned adds, the packed 16-bit adds and the integer dot products.
@@ -3670,6 +3723,46 @@ fn gpu_images_a16_d16() {
         let (x, y) = ((l % 4) as f32, (l / 4 % 4) as f32);
         assert_eq!((v[10], v[11]), (h(x) | h(y) << 16, h(x + 4.0 * y) | h(1.0) << 16), "lane {l} a16+d16 sample");
         assert_eq!([f32::from_bits(v[12]), f32::from_bits(v[13])], [x, x + 4.0 * y], "lane {l} a16 load");
+    }
+}
+
+/// v_med3_f32 / v_med3_f16 with a quiet NaN operand: the hardware returns
+/// v_min(v_min(s0, s1), s2), the smaller of the other two (LLVM's amdgcn_fmed3 folding,
+/// AMDGPUInstCombineIntrinsic.cpp), wherever the NaN is; without a NaN, the median (#678).
+#[test]
+fn gpu_med3_with_a_nan_operand_is_the_min_of_the_others() {
+    for wave64 in gpu_waves() {
+        let p = prog(&[
+            ("V_MED3_F32", "ENC_VOP3", &[("VDST", 10), ("SRC0", V), ("SRC1", V + 1), ("SRC2", V + 2)], None),
+            ("V_MED3_F16", "ENC_VOP3", &[("VDST", 11), ("SRC0", V + 3), ("SRC1", V + 4), ("SRC2", V + 5)], None),
+        ]);
+        let (dxil, mem) = kernel_wave(&p, wave64);
+        let n = f32::NAN;
+        let h = |x: f32| if x.is_nan() { 0x7E00 } else { half_bits(x) };
+        // (s0, s1, s2, want)
+        let cases: [(f32, f32, f32, f32); 10] = [
+            (n, 2.0, 1.0, 1.0), (n, 1.0, 2.0, 1.0), (2.0, n, 1.0, 1.0), (1.0, n, 2.0, 1.0),
+            (2.0, 1.0, n, 1.0), (1.0, 2.0, n, 1.0), (n, 0.0, 1.0, 0.0), (-3.0, n, 5.0, -3.0),
+            (3.0, 1.0, 2.0, 2.0), (n, n, 4.0, 4.0),
+        ];
+        let mut st = KernelState::default();
+        for (l, r) in st.vgpr.iter_mut().enumerate() {
+            let (a, b, c, _) = cases[l % cases.len()];
+            (r[0], r[1], r[2]) = (a.to_bits(), b.to_bits(), c.to_bits());
+            (r[3], r[4], r[5]) = (h(a), h(b), h(c));
+        }
+        let r = runner::run(&dxil, &st, &mem).unwrap();
+        let mut bad = Vec::new();
+        for (l, (a, b, c, want)) in cases.iter().enumerate() {
+            let (g32, g16) = (r.vgpr[l][10], r.vgpr[l][11] & 0xFFFF);
+            if g32 != want.to_bits() {
+                bad.push(format!("med3_f32({a}, {b}, {c}) = {}, want {want}", f32::from_bits(g32)));
+            }
+            if g16 != h(*want) {
+                bad.push(format!("med3_f16({a}, {b}, {c}) = {g16:#06x}, want {:#06x}", h(*want)));
+            }
+        }
+        assert!(bad.is_empty(), "wave{}: {} wrong\n{}", if wave64 { 64 } else { 32 }, bad.len(), bad.join("\n"));
     }
 }
 
